@@ -35,6 +35,11 @@ TRACE = {
     '00670C10': 'renderer init callee',
     '00671560': 'renderer init callee',
     '006A9430': 'renderer init callee',
+    '0076C534': 'fios scheduler ctor (builds m_objectLock..m_workerLock)',
+    '0076CDF4': 'fios createSchedulerForMedia',
+    '0077A088': 'fios Mutex::lock',
+    '00779C18': 'fios Mutex ctor (this, name) -> sys_lwmutex_create',
+    '0076CB00': 'fios worker setup (writes the object that is never constructed)',
 }
 
 RECOMP = 'src/recomp'

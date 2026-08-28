@@ -322,37 +322,56 @@ And it is failing because **no file is ever opened**. With the runtime's
 filesystem tracing on, a whole boot logs zero opens, reads or seeks. The
 renderer fails because its first font load gets nothing back.
 
-### The actual blocker: a zeroed FIOS object
+### The actual blocker: FIOS workers are never constructed
 
-Which puts the two loose ends from earlier at the centre. FIOS creates a
-scheduler, spawns its media threads, hits
+FIOS creates a scheduler, spawns its media threads, hits
 
 ```
 attempt to lock invalid mutex '(null)'
-[ppu] bctr to NULL ... r12(opd)=0x00000000 (r3=0x4009AA30 ...)
+[ppu] bctr to NULL ... r12(opd)=0x00000000 (r3=0x400163B0 ...)
 ```
 
-and tears the scheduler down again — three times over, never servicing a
-single read.
+and tears the scheduler down again — three times over, never servicing a read.
 
-FIOS's `Mutex::lock` is guest `0x0077A088`. Its wrapper has the same shape as
-the condvar one (`+0x00` vtable, `+0x08` name, `+0x10` `sys_lwmutex_t`), and it
-validates with
+`Mutex::lock` is guest `0x0077A088`. Its wrapper has the same shape as the
+condvar's (`+0x00` vtable, `+0x08` name, `+0x10` `sys_lwmutex_t`) and validates
+with `lwmutex.attribute == *(u32*)(0x00CDA388+0x10)` — that word is `0`, so the
+test is `attribute == 0`. The name prints `(null)`, so `+0x08` is zero too.
 
-```c
-if (lwmutex.attribute == *(u32*)(0x00CDA388 + 0x10))   /* that word is 0 */
-    printf("attempt to lock invalid mutex '%s'", name);
+Tracing the FIOS `Mutex` constructor (guest `0x00779C18`, which calls
+`sys_lwmutex_create`) prints every lock the engine builds. A whole boot builds
+**38**, and the scheduler contributes six:
+
+```
+scheduler.m_objectLock     0x40001700
+scheduler.m_opLock         0x40001728
+scheduler.m_completedLock  0x40001768     <- 0x40 after m_opLock, not 0x28
+scheduler.m_ioLock         0x400017D0
+scheduler.m_fhLock         0x40001828
+scheduler.m_workerLock     0x40001878
 ```
 
-so the test is `attribute == 0`. The name prints as `(null)`, so `+0x08` is zero
-too: the whole wrapper is zeroed memory, never constructed — matching the
-`bctr to NULL`, which is a virtual call through a zero vtable pointer on an
-object in the same family. Finding what should have constructed it is the next
-step, and it is the one thing between here and the game reading its own data.
+Two things stand out. `scheduler.m_opCallbackLock` — which exists in the
+binary's string table between `m_opLock` and `m_completedLock` — is never
+constructed, and the address gap is exactly the wrapper it should occupy. And
+across all 38, **not one is in the worker region** (`0x400163xx`).
 
-(Ruled out along the way: it is not a lifter boundary error. `0x0077A088` is a
-heuristic split of a larger function, but the fragment before it trampolines in
-with the same `ppu_context`, so r10/r11 carry across correctly.)
+A store watch (`LBP_WW=0x400163B0 LBP_WW_LEN=0x50`) confirms it from the other
+side: over the whole run that 80-byte block receives writes at `+0x04` and
+`+0x08` (from guest `0x0076CB00`) and `+0x34` (from the scheduler ctor's
+0x40-stride loop) — and nothing else. Never `+0x00`, the vtable; never
+`+0x10..0x28`, the mutex.
+
+So FIOS allocates its worker objects, writes a few fields, and spawns threads on
+them, but their constructors never run. That is both symptoms at once: the
+invalid mutex is the unconstructed `+0x10`, and the `bctr to NULL` is a virtual
+call through the zero vtable at `+0x00`. The scheduler ctor
+(guest `0x0076C534`) does not return — it tail-jumps into `0x0076CB00`, which is
+where the worker setup continues and where the missing construction lives.
+
+(Ruled out: not a lifter boundary error. `0x0077A088` is a heuristic split of a
+larger function, but the fragment before it trampolines in with the same
+`ppu_context`, so r10/r11 carry across correctly.)
 
 ### Video modes
 

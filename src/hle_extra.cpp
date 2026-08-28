@@ -418,6 +418,19 @@ static void tm_trace(const char* name, void (*body)(ppu_context*), ppu_context* 
     fflush(stderr);
 }
 
+/* FIOS Mutex ctor: r4 is the name, which is the whole point of watching it. */
+void func_00779C18(ppu_context* ctx)
+{
+    char nm[64];
+    if (tm_trace_on())
+        fprintf(stderr, "[trace] Mutex::ctor(this=0x%08X, name='%s')\n",
+                (uint32_t)ctx->gpr[3], tm_gstr((uint32_t)ctx->gpr[4], nm, sizeof nm));
+    func_00779C18_lifted(ctx);
+}
+void func_0076CB00(ppu_context* ctx) { tm_trace("fiosWorkerSetup", func_0076CB00_lifted, ctx); }
+void func_0076C534(ppu_context* ctx) { tm_trace("fiosSchedCtor", func_0076C534_lifted, ctx); }
+void func_0076CDF4(ppu_context* ctx) { tm_trace("createSchedForMedia", func_0076CDF4_lifted, ctx); }
+void func_0077A088(ppu_context* ctx) { tm_trace("Mutex::lock", func_0077A088_lifted, ctx); }
 void func_00671698(ppu_context* ctx) { tm_trace("renderInit", func_00671698_lifted, ctx); }
 void func_00670C10(ppu_context* ctx) { tm_trace("f_00670C10", func_00670C10_lifted, ctx); }
 void func_00671560(ppu_context* ctx) { tm_trace("f_00671560", func_00671560_lifted, ctx); }
