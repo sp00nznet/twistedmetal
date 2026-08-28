@@ -45,6 +45,14 @@ def parse_keys(text):
     return entries
 
 
+def find_other_key(entries, name):
+    """A bare `key=` entry such as NP_klic_key / NP_klic_free."""
+    for e in entries:
+        if e.get('name') == name and e.get('key'):
+            return bytes.fromhex(e['key'])
+    raise KeyError(f'no [{name}] entry in the key file')
+
+
 def find_self_key(entries, revision, self_type):
     """The erk/riv for a given key revision and SELF type. Duplicate blocks
     differ only by firmware `version`; the key material is the same."""
@@ -96,10 +104,27 @@ class Self:
                 f'  ELF entry={self.e_entry:#x} phnum={self.e_phnum} shnum={self.e_shnum} '
                 f'shoff={self.e_shoff:#x}')
 
-    def metadata(self, erk, riv):
-        """Decrypt metadata_info and the metadata headers that follow it."""
+    def npdrm_license(self):
+        """License type from the NPD block in control info, or None if not NPDRM.
+        1 = network, 2 = local (needs a RAP), 3 = free."""
+        ctrl = self.d[self.ctrl_off:self.ctrl_off + self.ctrl_size]
+        i = ctrl.find(b'NPD\x00')
+        if i < 0:
+            return None
+        return struct.unpack('>I', ctrl[i + 8:i + 12])[0]
+
+    def metadata(self, erk, riv, klic=None, klic_key=None):
+        """Decrypt metadata_info and the metadata headers that follow it.
+
+        An NPDRM SELF wraps metadata_info in one more layer: the content key
+        (free titles use the published NP_klic_free) unwrapped with NP_klic_key,
+        then AES-128-CBC with a zero IV."""
         info_off = self.metadata_offset + 0x20
-        info = AES.new(erk, AES.MODE_CBC, riv).decrypt(self.d[info_off:info_off + 0x40])
+        info = self.d[info_off:info_off + 0x40]
+        if klic is not None:
+            npdrm_key = AES.new(klic_key, AES.MODE_ECB).decrypt(klic)
+            info = AES.new(npdrm_key, AES.MODE_CBC, bytes(16)).decrypt(info)
+        info = AES.new(erk, AES.MODE_CBC, riv).decrypt(info)
         key, key_pad, iv, iv_pad = info[0:16], info[16:32], info[32:48], info[48:64]
         if key_pad != bytes(16) or iv_pad != bytes(16):
             raise ValueError('metadata_info padding is not zero — wrong key revision or key file')
@@ -118,8 +143,8 @@ class Self:
         keys = [hdrs[keys_off + i * 0x10:keys_off + (i + 1) * 0x10] for i in range(key_count)]
         return sections, keys
 
-    def to_elf(self, erk, riv, log=print):
-        sections, keys = self.metadata(erk, riv)
+    def to_elf(self, erk, riv, log=print, klic=None, klic_key=None):
+        sections, keys = self.metadata(erk, riv, klic, klic_key)
         out = bytearray()
 
         def put(off, blob):
@@ -235,9 +260,20 @@ def main():
 
     if not os.path.exists(args.keys):
         ap.error(f'key file {args.keys} not found; pass --keys or set PS3_KEYS')
-    erk, riv = find_self_key(parse_keys(open(args.keys).read()),
-                             sf.key_revision, SELF_TYPES.get(sf.self_type, ''))
-    elf = sf.to_elf(erk, riv)
+    entries = parse_keys(open(args.keys).read())
+    erk, riv = find_self_key(entries, sf.key_revision, SELF_TYPES.get(sf.self_type, ''))
+
+    klic = klic_key = None
+    license = sf.npdrm_license()
+    if license is not None:
+        names = {3: 'NP_klic_free'}
+        if license not in names:
+            ap.error(f'NPDRM license type {license} needs a RAP/klicensee this tool does not handle')
+        print(f'  NPDRM, license type {license} ({names[license]})')
+        klic = find_other_key(entries, names[license])
+        klic_key = find_other_key(entries, 'NP_klic_key')
+
+    elf = sf.to_elf(erk, riv, klic=klic, klic_key=klic_key)
 
     if not check_elf(elf, sf.e_entry):
         print('decryption produced a bad ELF — wrong keys?', file=sys.stderr)

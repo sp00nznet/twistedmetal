@@ -67,3 +67,6 @@ frames/
 *.bmp
 *.png
 !docs/images/*.png
+
+# Scratch: other copies of the game staged for comparison
+_demo/

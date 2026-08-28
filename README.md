@@ -20,7 +20,10 @@ libraries that stand in for the PS3 operating system. Same approach as
 
 ## Status
 
-The binary is decrypted, analysed and lifted. First build is running.
+It builds, and it boots real game code — through the CRT, memory setup,
+`cellGcmInit`, video-out configuration and display-buffer registration, into
+the RSX command stream, with a D3D12 window open. It then stalls in the
+engine's file-I/O scheduler. Nothing is rendered yet.
 
 | Phase | State |
 |---|---|
@@ -31,9 +34,9 @@ The binary is decrypted, analysed and lifted. First build is running.
 | Function boundary detection | **done** — 31,032 functions, every `.opd` address verified |
 | SPU image extraction | **done** — 11 embedded SPU ELFs, 1.17 MB |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
-| Build & link | in progress |
-| Boot | not started |
-| Graphics (RSX → D3D12) | not started |
+| Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
+| Boot | **runs** — reaches RSX submission, then stalls on a FIOS condvar |
+| Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
 ### The binary
@@ -121,6 +124,77 @@ The gap is where the porting work is:
 Everything else is one or two functions short. Roughly half the missing count
 is online plumbing for servers that were shut down, which can return an error
 and be done with.
+
+### First boot
+
+```
+[ppu] loaded 2 PT_LOAD segments, entry OPD 0x00F030D0
+[crt] sys_initialize_tls: block 0x0E000000, r13=0x0E007000
+[sys_memory] allocate(size=0xF00000) -> 0x40000000
+gSysMemInfo.available_user_memory: 201326592
+Available Main Ram at start of RTApp::initHardware 192(201326592)
+IoMem: 0x11000000 167MB
+[HLE] _cellGcmInitBody(cmdSize=0x10000, ioSize=0xA700000, ioAddr=0x11000000)
+[cellVideoOut] Configure: resId=4 -> 720x480, pitch=5120
+[cellGcmSys] SetDisplayBuffer(id=0/1) / SetTile / BindTile / SetFlipMode(1)
+[cellGcmSys] SetVBlankHandler / SetUserHandler
+[rsx] backend init OK -- window open
+[RSX] CLEAR_SURFACE x12,  50 unknown methods
+[SYS] sys_ppu_thread_create name="fios mediathread 0/1"
+```
+
+The game gets its own engine up: `RTApp::initHardware` runs, GCM is initialised
+with a 167 MB IO region, the video mode is negotiated, both display buffers and
+a tile are registered, vblank and user handlers are installed, and the D3D12
+backend opens a window and receives real RSX commands.
+
+It then hangs: the FIOS worker thread spins on
+`wait for invalid cond 'fios worker cond'`, with one
+`attempt to lock invalid mutex '(null)'` just before. A condition variable the
+engine's file scheduler waits on was never created, so nothing loads.
+
+Seven imports are actually reached at runtime with no handler — a much shorter
+list than the 208 that are merely absent:
+
+| NID | Library | Function |
+|---|---|---|
+| `0x42B23552` | `sysPrxForUser` | `sys_prx_register_library` |
+| `0xA3E3BE68` | `sysPrxForUser` | `sys_ppu_thread_once` |
+| `0x626E8518` | `cellGcmSys` | `cellGcmMapEaIoAddressWithFlags` |
+| `0x9DCBCB5D` | `cellSpurs` | `cellSpursAttributeEnableSystemWorkload` |
+| `0xF244E799` | `cellSpursJq` | `_cellSpursCreateJobQueue` |
+| `0x1686957E` | `cellSpursJq` | `cellSpursJobQueueAttributeSetMaxSizeJobDescriptor` |
+| `0x3D1294FC` | `cellSpursJq` | *(not in the NID database)* |
+
+Plus `lv2_syscall 144` (×6) and `254`, both stubbed. `sys_ppu_thread_once` is
+the prime suspect for the missing condvar: a no-op there silently skips
+one-time initialisers.
+
+### Names, without a symbol table
+
+The binary is stripped, but it kept its assert and log strings — **731
+`Class::method` names** and **359 source paths**. That is a partial symbol
+table hiding in `.rodata`, and it names the engine outright:
+
+| Evidence | Component |
+|---|---|
+| `hkaAnimation.inl`, `hkGsk.h`, `hkgpConvexHull*`, `hkgpMesh.h` | Havok physics + animation |
+| `job/src/ppu/jobapi/jobarraycontainer.cpp`, `commandlistchecker.cpp` | Sony SPU job API (the 11 SPU images) |
+| `audio_sys/boomrang/plugin_sdk/`, `dsp/`, `modules/dynamics/compressor.cpp` | Boomrang, Eat Sleep Play's own audio DSP |
+| `AiChar::update`, `AiRagdollManager::initContainers`, `Boss1Truck::updateSuperCrushConstraint`, `Campaign::waitForPager` | the game itself |
+
+Attributing each string back to the function that references it would name a
+useful fraction of the 35,635 lifted functions. Not done yet.
+
+### The demo disc
+
+`BCET70046`, the PSN demo, was checked for a debug build. It is not one — same
+39 sections, no `.symtab`, 14,361 OPD descriptors against retail's 14,372, the
+same 34 libraries and 435 imports against 439. Nothing to recover from it.
+
+It is still useful as a second target: near-identical code, 1.4 GB of assets
+instead of 13 GB. Decrypting it needed the NPDRM path (free license, so the
+published `NP_klic_free`), which `tools/decrypt_self.py` now handles.
 
 ## Reproducing the analysis
 
