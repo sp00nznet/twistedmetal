@@ -428,6 +428,7 @@ void func_00779C18(ppu_context* ctx)
     func_00779C18_lifted(ctx);
 }
 void func_0076CB00(ppu_context* ctx) { tm_trace("fiosWorkerSetup", func_0076CB00_lifted, ctx); }
+void func_0076756C(ppu_context* ctx) { tm_trace("elemCtor?", func_0076756C_lifted, ctx); }
 void func_0076C534(ppu_context* ctx) { tm_trace("fiosSchedCtor", func_0076C534_lifted, ctx); }
 void func_0076CDF4(ppu_context* ctx) { tm_trace("createSchedForMedia", func_0076CDF4_lifted, ctx); }
 void func_0077A088(ppu_context* ctx) { tm_trace("Mutex::lock", func_0077A088_lifted, ctx); }

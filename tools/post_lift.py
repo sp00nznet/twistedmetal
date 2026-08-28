@@ -40,6 +40,7 @@ TRACE = {
     '0077A088': 'fios Mutex::lock',
     '00779C18': 'fios Mutex ctor (this, name) -> sys_lwmutex_create',
     '0076CB00': 'fios worker setup (writes the object that is never constructed)',
+    '0076756C': 'candidate element ctor (copies a vtable to +0x00)',
 }
 
 RECOMP = 'src/recomp'

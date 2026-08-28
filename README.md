@@ -402,12 +402,34 @@ reports it invalid. Neither offset is ever written by anything, so both are
 still the allocator's zeroes. The engine builds a worker's sub-objects and links
 them in, but never constructs the worker itself.
 
-What is still open is why. `0x0076C534`'s tail has three allocate-then-construct
-blocks; the first (`loc_0076C858`) is the right shape — `func_0076756C` followed
-by `vm_write32(r26 + 0x0, r9)`, copying a vtable pointer out of a template — but
-it walks a 232-byte stride, so it serves a different array. Either an equivalent
-step for this array is being branch-skipped, or the vtable and mutex are meant
-to be filled by a path the recompilation is not reaching.
+That they are unconstructed — rather than the wrong objects being addressed —
+is settled by a detail of the watch. Every FIOS object this engine builds gets
+an ASCII tag written by its constructor: `"FIOS"`, `"obj "`, then a four-byte
+type code. A Cond carries it at `+0x08` (after its 8-byte `sys_lwcond_t`), a
+Thread at `+0x00`:
+
+```
+0x400163F0 <- "FIOS" "obj " "cond"   fn 0x00779AF4   cond[0]
+0x40016420 <- "FIOS" "obj " "thrd"   fn 0x0077A4E0   thread[0]
+0x40016370 <-  nothing                               worker[0]
+0x400163B0 <-  nothing                               worker[1]
+```
+
+The two workers never receive a tag, so they are genuinely unbuilt FIOS objects,
+not correctly-built objects being addressed at the wrong offset.
+
+The obvious candidate for their constructor is ruled out too. `0x0076C534`'s
+first allocate-then-construct block has exactly the right shape —
+`func_0076756C` followed by `vm_write32(r26 + 0x0, r9)`, copying a vtable
+pointer out of a template — but tracing `func_0076756C` shows it is only ever
+called on a 232-byte stride (`0x40008C68`, `0x40008B80`, …, 0xE8 apart) and
+returns `this`. It serves a different array and is never applied to the 0x40
+workers. So this is not a constructor being branch-skipped; there is no worker
+constructor call in the path at all.
+
+What remains is to find the constructor that writes the `"FIOS obj ...."` tag
+for a worker — the same base constructor the Cond and Thread paths reach — and
+work out why the scheduler's worker loop never calls it.
 
 (Ruled out: not a lifter boundary error. `0x0077A088` is a heuristic split of a
 larger function, but the fragment before it trampolines in with the same
