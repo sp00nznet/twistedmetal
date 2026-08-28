@@ -155,6 +155,15 @@ static void sys_lwcond_create(ppu_context* ctx)
  * ------------------------------------------------------------------------- */
 extern "C" int32_t cellSpursCreateTaskset(void* spurs, void* taskset, uint64_t args,
                                           const void* priority, uint32_t maxContention);
+extern "C" uint64_t vm_read64(uint64_t a);
+
+/* CellSpursTasksetAttribute2, 512 bytes:
+ *   +0x00 revision  +0x04 name  +0x08 args  +0x10 priority[8]
+ *   +0x18 max_contention  +0x1C enable_clear_ls  +0x20 task_name_buffer */
+#define TSA2_SIZE      512
+#define TSA2_ARGS      0x08
+#define TSA2_PRIORITY  0x10
+#define TSA2_MAXCONT   0x18
 
 /* _cellSpursTasksetAttribute2Initialize(attr, revision) */
 static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx)
@@ -162,10 +171,11 @@ static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx)
     const uint32_t attr = (uint32_t)ctx->gpr[3];
     const uint32_t revision = (uint32_t)ctx->gpr[4];
     if (!attr) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80410901; return; }
-    /* Only revision/sdkVersion are read back, and CreateTaskset2 below ignores
-     * the rest — so set those two rather than guessing the struct's length. */
-    vm_write32(attr + 0x00, revision ? revision : 1);
-    vm_write32(attr + 0x04, 0);
+    for (uint32_t o = 0; o < TSA2_SIZE; o += 4) vm_write32(attr + o, 0);
+    vm_write32(attr + 0x00, revision);
+    vm_write32(attr + TSA2_PRIORITY + 0, 0x01010101);   /* priority[0..7] = 1 */
+    vm_write32(attr + TSA2_PRIORITY + 4, 0x01010101);
+    vm_write32(attr + TSA2_MAXCONT, 8);
     fprintf(stderr, "[cellSpurs] TasksetAttribute2Initialize(attr=0x%08X, rev=%u)\n",
             attr, revision);
     ctx->gpr[3] = 0;
@@ -175,11 +185,15 @@ static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx)
 static void cellSpursCreateTaskset2(ppu_context* ctx)
 {
     const uint32_t spurs = (uint32_t)ctx->gpr[3], taskset = (uint32_t)ctx->gpr[4];
-    fprintf(stderr, "[cellSpurs] CreateTaskset2(spurs=0x%08X, taskset=0x%08X) "
-                    "-> v1 CreateTaskset\n", spurs, taskset);
-    const int32_t rc = cellSpursCreateTaskset((void*)(uintptr_t)spurs,
-                                              (void*)(uintptr_t)taskset,
-                                              0, nullptr, 0);
+    const uint32_t attr = (uint32_t)ctx->gpr[5];
+    const uint64_t args = attr ? vm_read64(attr + TSA2_ARGS) : 0;
+    const uint32_t maxcont = attr ? vm_read32(attr + TSA2_MAXCONT) : 8;
+    fprintf(stderr, "[cellSpurs] CreateTaskset2(spurs=0x%08X, taskset=0x%08X, attr=0x%08X) "
+                    "args=0x%llX maxContention=%u -> v1 CreateTaskset\n",
+            spurs, taskset, attr, (unsigned long long)args, maxcont);
+    const int32_t rc = cellSpursCreateTaskset(
+        (void*)(uintptr_t)spurs, (void*)(uintptr_t)taskset, args,
+        attr ? (const void*)(uintptr_t)(attr + TSA2_PRIORITY) : nullptr, maxcont);
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
 
