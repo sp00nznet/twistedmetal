@@ -19,6 +19,8 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include <mutex>
 
 extern "C" {
@@ -210,4 +212,98 @@ static void cellSpursAttributeEnableSystemWorkload(ppu_context* ctx)
 static void sys_spu_printf_initialize(ppu_context* ctx)
 {
     ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * The game's own logger, on the host.
+ *
+ * Twisted Metal routes its boot trace through one function, guest 0x0034ACAC,
+ * as log(level, fmt, ...). Its output never reaches the console here, so the
+ * whole boot is invisible past the handful of lines that go through printf
+ * directly — and this binary kept 731 Class::method strings and 359 source
+ * paths, so that trace is the best instrument available for finding where boot
+ * gives up.
+ *
+ * ppu_register_function overrides a guest address with a host implementation,
+ * so replace it: read the format string out of guest memory and render it with
+ * the PPC64 argument registers. Enabled with TM_GAMELOG=1.
+ * ------------------------------------------------------------------------- */
+
+static const char* tm_gstr(uint32_t ea, char* buf, size_t cap)
+{
+    if (!ea) return "(null)";
+    size_t i = 0;
+    for (; i + 1 < cap; i++) {
+        uint32_t w = vm_read32((ea + i) & ~3u);
+        char c = (char)((w >> ((3 - ((ea + i) & 3)) * 8)) & 0xFF);
+        if (!c) break;
+        buf[i] = c;
+    }
+    buf[i] = 0;
+    return buf;
+}
+
+/* Render the guest's printf-style call. Only the conversions this title's log
+ * strings actually use are handled; anything else prints its own spec back so
+ * the line stays readable rather than silently losing an argument. */
+static void tm_game_log(ppu_context* ctx)
+{
+    char fmt[512], sbuf[256];
+    tm_gstr((uint32_t)ctx->gpr[4], fmt, sizeof fmt);
+
+    int argi = 5;                       /* r5..r10 hold the varargs */
+    fprintf(stderr, "[game] ");
+    for (const char* p = fmt; *p; p++) {
+        if (*p != '%') { fputc(*p, stderr); continue; }
+        const char* spec = p++;
+        while (*p && !strchr("diouxXeEfgGcspn%", *p)) p++;
+        if (*p == '%') { fputc('%', stderr); continue; }
+        uint64_t a = (argi <= 10) ? ctx->gpr[argi++] : 0;
+        switch (*p) {
+        case 's': fprintf(stderr, "%s", tm_gstr((uint32_t)a, sbuf, sizeof sbuf)); break;
+        case 'p': fprintf(stderr, "0x%08X", (uint32_t)a); break;
+        case 'c': fprintf(stderr, "%c", (char)a); break;
+        case 'e': case 'E': case 'f': case 'g': case 'G':
+            fprintf(stderr, "<float>"); break;   /* varargs floats are in f1.. */
+        case 'd': case 'i': fprintf(stderr, "%d", (int32_t)a); break;
+        case 'u': fprintf(stderr, "%u", (uint32_t)a); break;
+        case 'o': fprintf(stderr, "%o", (uint32_t)a); break;
+        case 'x': fprintf(stderr, "%x", (uint32_t)a); break;
+        case 'X': fprintf(stderr, "%X", (uint32_t)a); break;
+        default:  fwrite(spec, 1, (size_t)(p - spec + 1), stderr); break;
+        }
+    }
+    fflush(stderr);
+    ctx->gpr[3] = 0;
+}
+
+/* Replaces the lifted body, which tools/post_lift.py renames to _lifted. The
+ * lifter emits direct C++ calls, so a rename is the only way to intercept one;
+ * ppu_register_function redirects indirect dispatch only. */
+void func_0034ACAC(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Title metadata from PARAM.SFO.
+ *
+ * ps3recomp's cellGame defaults to the placeholder id "BLES00000" and exposes
+ * cellGame_init_from_paramsfo() for the harness to call -- but nothing calls
+ * it, so the title reported itself as "Unknown Title" / BLES00000 and built its
+ * game-data and patch-overlay paths under /dev_hdd0/game/BLES00000. Point it at
+ * the disc's own PARAM.SFO so the id, title and versions are the real ones.
+ * ------------------------------------------------------------------------- */
+extern "C" void cellGame_init_from_paramsfo(const char* sfo_path);
+extern "C" const char* ppu_vfs_root;
+
+extern "C" void tm_init_title_metadata(void)
+{
+    char path[1024];
+    snprintf(path, sizeof path, "%s/PS3_GAME/PARAM.SFO",
+             ppu_vfs_root && *ppu_vfs_root ? ppu_vfs_root : ".");
+    cellGame_init_from_paramsfo(path);
 }

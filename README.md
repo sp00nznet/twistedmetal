@@ -36,7 +36,7 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **runs to a clean exit** — FIOS, SPURS tasksets and SPU jobs run |
+| Boot | **runs to a clean exit** — blocked on renderer init at 1280x720 |
 | Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
@@ -261,38 +261,64 @@ were short; re-carving them at the runtime's own extent makes
 `spu_0001_at_00D53C00` fingerprint to `0xCE95F52496B4AE31`, exactly what the
 miss reported. `tools/recarve_spu.py` does this and is idempotent.
 
-### Why it still exits
+### The game's own log
 
-Not missing assets — the full 13 GB disc tree is staged under `input/PS3_GAME/`
-and the run has the same shape without it. The game's boot trace stops before
-its first timing print (`init: %.2f`, then `GameRT::startup`,
-`WorldLoader::loadUi`) and goes to
-`Twisted app terminated! ReceivedExitGameRequest(False)` — terminated, with no
-exit request received.
+The binary routes its boot trace through one function, guest `0x0034ACAC`,
+`log(level, fmt, ...)`, whose output goes nowhere in this port — so most of the
+boot was invisible. `tools/post_lift.py` renames the lifted body and
+`src/hle_extra.cpp` implements it against host stderr, rendering the format
+string with the PPC64 argument registers. `TM_GAMELOG=1` turns it on.
 
-It is a timeout, and both halves of it are now visible. The SPU task starts and
-immediately issues SPURS taskset syscall 2, `WAIT_SIGNAL`, parking until the PPU
-delivers `_cellSpursSendSignal` or sets the event flag. The PPU meanwhile makes
-three `sys_event_flag_wait` calls (lv2 syscall 100, mode AND) with
-`timeout=0x01930000` µs — **26 seconds each** — and then main returns:
+(`ppu_register_function` cannot do this: the lifter emits direct C++ calls, so
+only indirect dispatch goes through the address table. Renaming the definition
+is the way in — the same post-lift patch pattern rubberducky uses.)
+
+It immediately paid for itself. The title was reporting:
 
 ```
-[spu_workload] WAIT_SIGNAL#1 enter task=0 taskset=0x11ECF180 ran=0ms
-...
-[sc-caller] flag=100 syscall from func_0064AD40+0x1918 (r5/mode=0x1 r7/timeout=0x01930000 ...)
-Twisted app terminated! ReceivedExitGameRequest(False)
+[game] GameContent::getBootParameters() ~ title: Unknown Title
+[game] GameContent::getBootParameters() ~ titleId: BLES00000
+[game] GameContent::bootCheck() ~ cellGameDataCheck(patchData) OK [data exists]
 ```
 
-Neither side moves. The likeliest culprit is the job-queue layer between them:
-the game creates five job queues at boot through `_cellSpursCreateJobQueue` and
-friends, all of which return a faked `CELL_OK` without creating anything.
+ps3recomp's `cellGame` defaults to the placeholder id `BLES00000` and exposes
+`cellGame_init_from_paramsfo()` for the harness to call — but nothing called
+it, so the game built its game-data and patch-overlay paths under
+`/dev_hdd0/game/BLES00000` and believed patch data was present. The harness now
+points it at the disc's own `PARAM.SFO`:
 
-That is not a small gap. RPCS3's entire `cellSpursJq` module is 63
-`UNIMPLEMENTED_FUNC` stubs returning `CELL_OK`, so there is no reference
-implementation to port and `_cellSpursCreateJobQueue`'s argument order is
-undocumented — its call site passes eight register arguments with `r3=2`.
-Implementing it means reverse-engineering the job-queue protocol from this
-binary. That is the next real piece of work.
+```
+[game]   title: Twisted Metal      titleId: BCUS98106
+[game]   cellGameDataCheck(patchData) OK [data DOES NOT exist]
+[game]   usrdirPath:[/dev_hdd0/game/BCUS98106/USRDIR]
+```
+
+### Why it exits: the renderer
+
+`RTApp::initHardware` (guest `0x0064AD40` — it prints the three `Available Main
+Ram` / `IoMem` lines) runs its whole sequence, then calls
+
+```
+func_00671698(this, 0x500, 0x2D0)      // 1280 x 720, at guest 0x0064B060
+```
+
+and that returns **0**. The failure branch clears the run flag for its
+`RTApp::backgroundSwap` thread, spins on `sys_timer_usleep(100)` until that
+thread acknowledges, and returns failure — after which `main` prints
+`Twisted app terminated! ReceivedExitGameRequest(False)` and exits cleanly. The
+runtime's stray `[sc-caller] ... lr=0x0064B064` line pins the call site exactly:
+it is the instruction after that call.
+
+So the exit is a **display/renderer init failure**, not FIOS, not SPURS, not
+missing assets. FIOS brings up and tears down its schedulers, SPURS builds its
+taskset and dispatches into lifted SPU code, and `GameContent` completes — all
+before this.
+
+The visible oddity is the video mode. The game negotiates
+`[cellVideoOut] Configure: resId=4 -> 720x480` — standard definition — and then
+initialises its renderer at 1280x720. ps3recomp's `cellVideoOutGetDeviceInfo`
+does advertise 720p among four modes, so the next question is whether the mode
+table survives the trip into guest memory in big-endian order.
 
 Two smaller things also survive and are not yet understood: six
 `attempt to lock invalid mutex '(null)'` pairs around FIOS scheduler teardown,
@@ -380,7 +406,9 @@ twistedmetal/
 ├── CMakeLists.txt          # links the runtime + the boot harness
 ├── tools/
 │   ├── decrypt_iso.py      # raw PS3 disc image -> plain image (bring your own key)
-│   └── decrypt_self.py     # retail SELF -> plain ELF (bring your own key file)
+│   ├── decrypt_self.py     # retail SELF -> plain ELF (bring your own key file)
+│   ├── recarve_spu.py      # size SPU images the way the runtime fingerprints them
+│   └── post_lift.py        # idempotent post-lift patches (the title's logger)
 ├── src/
 │   ├── boot_main.cpp       # ps3recomp boot harness, rebranded for this title
 │   ├── hle_extra.cpp       # imports this title reaches that the runtime lacks

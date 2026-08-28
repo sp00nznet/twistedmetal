@@ -30,6 +30,7 @@ void     ppu_hle_init(void);
 void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
 void     tm_hle_register_extra(void);   /* src/hle_extra.cpp */
+void     tm_init_title_metadata(void);  /* src/hle_extra.cpp */
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
@@ -423,6 +424,7 @@ int main(int argc, char** argv)
     tm_hle_register_extra(); /* first registration wins the ctx lookup */
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
     ppu_fs_register();       /* cellFs VFS over the real game directory */
+    tm_init_title_metadata();/* real TITLE_ID/TITLE from the disc PARAM.SFO */
     fprintf(stderr,"[boot-dbg] before lv2_init_syscalls\n"); fflush(stderr);
     lv2_init_syscalls();     /* real lv2 syscall table (semaphore/memory/fs/...) */
     fprintf(stderr,"[boot-dbg] after lv2_init_syscalls\n"); fflush(stderr);
