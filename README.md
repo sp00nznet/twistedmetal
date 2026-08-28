@@ -320,7 +320,7 @@ And it is failing because **no file is ever opened**. With the runtime's
 filesystem tracing on, a whole boot logs zero opens, reads or seeks. The
 renderer fails because its first font load gets nothing back.
 
-### The actual blocker: a FIOS worker field nothing writes
+### The actual blocker: FIOS workers are allocated but never constructed
 
 FIOS creates a scheduler, spawns its media threads, hits
 
@@ -378,12 +378,36 @@ Identifying the construction step that should fill those two — and why it does
 not run — is the next move, and the one thing between here and the game reading
 its own data.
 
-Two honest limits on the above. The exact geometry of this structure is not
-pinned down: `0x400163B0`, `0x400163A0` and `0x400163F0` all receive writes on a
-0x40 grid and the region also holds the two condvars, so which address is the
-array base is inferred, not measured. And the thread names (`fios mediathread
-2`, `3`, then `5`, `6`, then `8`, `9`, `10` across three schedulers) follow a
-running counter with gaps, not an array index, so they do not settle it either.
+The region's layout is measured rather than guessed: the allocation's own
+zeroing (`fn 0x0097422C`, a w1/w2/w4 burst at `0x40016370`) marks the base, and
+the two `+0x34` stores 0x40 apart fix the stride.
+
+```
+0x40016370  worker[0]   0x40 bytes
+0x400163B0  worker[1]   0x40 bytes
+0x400163F0  cond[0]     0x18        <- base + 2*0x40, exactly where
+0x40016408  cond[1]     0x18           count*0x40 + count*0x18 puts them
+0x40016420  thread[0]   0x40        <- separate allocation
+0x40016460  thread[1]   0x40
+```
+
+Two workers, and the whole block is memset to zero at allocation. Across the
+run each worker then receives exactly three stores — `+0x04` its `Thread*`,
+`+0x08` its `Cond*`, `+0x34` a pointer — while the Thread and Cond objects
+themselves are fully constructed by `0x0077A4E0` and `0x00779AF4`.
+
+The failing accesses are both on `worker[1]`: the null indirect call reads
+`0x400163B0 + 0x00`, and `Mutex::lock` is called on `0x400163B0 + 0x10` and
+reports it invalid. Neither offset is ever written by anything, so both are
+still the allocator's zeroes. The engine builds a worker's sub-objects and links
+them in, but never constructs the worker itself.
+
+What is still open is why. `0x0076C534`'s tail has three allocate-then-construct
+blocks; the first (`loc_0076C858`) is the right shape — `func_0076756C` followed
+by `vm_write32(r26 + 0x0, r9)`, copying a vtable pointer out of a template — but
+it walks a 232-byte stride, so it serves a different array. Either an equivalent
+step for this array is being branch-skipped, or the vtable and mutex are meant
+to be filled by a path the recompilation is not reaching.
 
 (Ruled out: not a lifter boundary error. `0x0077A088` is a heuristic split of a
 larger function, but the fragment before it trampolines in with the same
