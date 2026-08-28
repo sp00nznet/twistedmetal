@@ -81,6 +81,10 @@ static void cellGcmMapEaIoAddressWithFlags(ppu_context* ctx)
 }
 
 static void sys_lwcond_create(ppu_context* ctx);
+static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx);
+static void cellSpursCreateTaskset2(ppu_context* ctx);
+static void cellSpursAttributeEnableSystemWorkload(ppu_context* ctx);
+static void sys_spu_printf_initialize(ppu_context* ctx);
 
 extern "C" void tm_hle_register_extra(void)
 {
@@ -89,6 +93,13 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x626E8518u, "cellGcmMapEaIoAddressWithFlags",
                          cellGcmMapEaIoAddressWithFlags);
     ps3_hle_register_ctx(0xDA0EB71Au, "sys_lwcond_create", sys_lwcond_create);
+
+    ps3_hle_register_ctx(0xC2ACDF43u, "_cellSpursTasksetAttribute2Initialize",
+                         cellSpursTasksetAttribute2Initialize);
+    ps3_hle_register_ctx(0x4A6465E3u, "cellSpursCreateTaskset2", cellSpursCreateTaskset2);
+    ps3_hle_register_ctx(0x9DCBCB5Du, "cellSpursAttributeEnableSystemWorkload",
+                         cellSpursAttributeEnableSystemWorkload);
+    ps3_hle_register_ctx(0x45FE2FCEu, "_sys_spu_printf_initialize", sys_spu_printf_initialize);
 }
 
 /* ---------------------------------------------------------------------------
@@ -125,5 +136,64 @@ static void sys_lwcond_create(ppu_context* ctx)
     const uint32_t lwmutex = (uint32_t)ctx->gpr[4];
     vm_write32(lwcond + 0x00, lwmutex);   /* guest ABI: 32-bit lwmutex pointer */
     vm_write32(lwcond + 0x04, lwmutex);   /* lwcond_queue; keeps the be64 read valid */
+    ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cellSpurs "2" taskset API.
+ *
+ * The runtime implements the v1 taskset path (cellSpursCreateTaskset), which
+ * builds the real big-endian CellSpursTaskset the lifted SPU side reads and
+ * sets the init flag cellSpursCreateTask gates on. This game uses the v2 API
+ * instead, so that flag was never set and every task creation came back
+ *
+ *     [cellSpurs] CreateTask REJECT no-init (taskset=... elf=...)
+ *
+ * The v2 entry points differ from v1 only in carrying their options in an
+ * attribute struct rather than as arguments, and the runtime's v1 ignores
+ * those options anyway — so forward to it.
+ * ------------------------------------------------------------------------- */
+extern "C" int32_t cellSpursCreateTaskset(void* spurs, void* taskset, uint64_t args,
+                                          const void* priority, uint32_t maxContention);
+
+/* _cellSpursTasksetAttribute2Initialize(attr, revision) */
+static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx)
+{
+    const uint32_t attr = (uint32_t)ctx->gpr[3];
+    const uint32_t revision = (uint32_t)ctx->gpr[4];
+    if (!attr) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80410901; return; }
+    /* Only revision/sdkVersion are read back, and CreateTaskset2 below ignores
+     * the rest — so set those two rather than guessing the struct's length. */
+    vm_write32(attr + 0x00, revision ? revision : 1);
+    vm_write32(attr + 0x04, 0);
+    fprintf(stderr, "[cellSpurs] TasksetAttribute2Initialize(attr=0x%08X, rev=%u)\n",
+            attr, revision);
+    ctx->gpr[3] = 0;
+}
+
+/* cellSpursCreateTaskset2(spurs, taskset, attr) */
+static void cellSpursCreateTaskset2(ppu_context* ctx)
+{
+    const uint32_t spurs = (uint32_t)ctx->gpr[3], taskset = (uint32_t)ctx->gpr[4];
+    fprintf(stderr, "[cellSpurs] CreateTaskset2(spurs=0x%08X, taskset=0x%08X) "
+                    "-> v1 CreateTaskset\n", spurs, taskset);
+    const int32_t rc = cellSpursCreateTaskset((void*)(uintptr_t)spurs,
+                                              (void*)(uintptr_t)taskset,
+                                              0, nullptr, 0);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
+/* cellSpursAttributeEnableSystemWorkload(attr, priority[8], maxSpu, isPreemptible[8]).
+ * Reserves an SPU for the system workload. The runtime schedules workloads on
+ * the host, so there is nothing to reserve — acknowledging is the whole job. */
+static void cellSpursAttributeEnableSystemWorkload(ppu_context* ctx)
+{
+    ctx->gpr[3] = 0;
+}
+
+/* _sys_spu_printf_initialize(agent, ...): registers the SPU printf relay. SPU
+ * printf output has nowhere to arrive from here; succeed so the CRT continues. */
+static void sys_spu_printf_initialize(ppu_context* ctx)
+{
     ctx->gpr[3] = 0;
 }

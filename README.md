@@ -35,7 +35,7 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | SPU image extraction | **done** — 11 embedded SPU ELFs, 1.17 MB |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **runs to a clean exit** — FIOS works; blocked on SPURS tasksets |
+| Boot | **runs to a clean exit** — FIOS + SPURS tasksets up; needs game data |
 | Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
@@ -202,24 +202,53 @@ Result: 2,186,074 log lines and a hang became 279 lines and
 `sys_process_exit(code=0)`. FIOS now brings up seven media threads across three
 scheduler generations, runs them, and joins them.
 
-### Next blocker: SPURS
+### SPURS
 
-The game stops at `cellSpurs CreateTask REJECT no-init` — the taskset was never
-initialised, because the calls that would have done it are unimplemented:
+The next wall was `cellSpurs CreateTask REJECT no-init`. ps3recomp implements
+the v1 taskset path — `cellSpursCreateTaskset` builds the real big-endian
+`CellSpursTaskset` the SPU side reads and sets the flag `cellSpursCreateTask`
+gates on — but this game uses the v2 API, which was not registered, so that
+flag was never set. The v2 entry points differ only in carrying their options
+in an attribute struct that the v1 implementation ignores anyway, so
+`src/hle_extra.cpp` forwards them:
 
-| NID | Library | Function |
+| NID | Function | Handling |
 |---|---|---|
-| `0x9DCBCB5D` | `cellSpurs` | `cellSpursAttributeEnableSystemWorkload` |
-| `0xC2ACDF43` | `cellSpurs` | `_cellSpursTasksetAttribute2Initialize` |
-| `0x4A6465E3` | `cellSpurs` | `cellSpursCreateTaskset2` |
-| `0x011EE38B` | `cellSpurs` | `_cellSpursLFQueueInitialize` |
-| `0x1656D49F` | `cellSpurs` | `cellSpursLFQueueAttachLv2EventQueue` |
-| `0xF244E799` | `cellSpursJq` | `_cellSpursCreateJobQueue` |
-| `0x1686957E` | `cellSpursJq` | `cellSpursJobQueueAttributeSetMaxSizeJobDescriptor` |
-| `0x3D1294FC` | `cellSpursJq` | *(not in the NID database)* |
-| `0x45FE2FCE` | `sysPrxForUser` | `_sys_spu_printf_initialize` |
+| `0xC2ACDF43` | `_cellSpursTasksetAttribute2Initialize` | set revision/sdkVersion |
+| `0x4A6465E3` | `cellSpursCreateTaskset2` | forward to v1 `cellSpursCreateTaskset` |
+| `0x9DCBCB5D` | `cellSpursAttributeEnableSystemWorkload` | acknowledge; workloads run on the host |
+| `0x45FE2FCE` | `_sys_spu_printf_initialize` | acknowledge |
 
-Two smaller things also survive and are not yet understood: six
+The taskset is now built and the first SPU task is accepted:
+
+```
+[cellSpurs] CreateTaskset2(spurs=0x11010080, taskset=0x11ECF180) -> v1 CreateTaskset
+[cellSpurs] CreateTaskset() ea=0x11ECF180 spurs=0x11010080 (real BE layout)
+[cellSpurs] CreateTask(id=0, entry=0x00D63C00, ctx=0x40083100)
+[spu_workload] async dispatch MISS fp=0xCE95F52496B4AE31 size=36564
+```
+
+The dispatch miss is expected — no SPU image is lifted yet.
+
+Five job-queue imports are still faked: `_cellSpursCreateJobQueue`
+(`0xF244E799`), `cellSpursJobQueueAttributeSetMaxSizeJobDescriptor`
+(`0x1686957E`), an undocumented `cellSpursJq` NID (`0x3D1294FC`),
+`_cellSpursLFQueueInitialize` (`0x011EE38B`) and
+`cellSpursLFQueueAttachLv2EventQueue` (`0x1656D49F`). The runtime has a
+`cellSpursCreateJobQueue`, but the game calls the versioned underscore form
+whose argument order has not been confirmed, so nothing is bridged on guesswork
+yet.
+
+### Why it still exits
+
+Not SPURS. The game's own boot trace stops before its first timing print
+(`init: %.2f`, then `GameRT::startup`, `WorldLoader::loadUi`) and goes straight
+to `Twisted app terminated! ReceivedExitGameRequest(False)` — terminated, with
+no exit request received. `input/` holds only the EBOOT, so every asset open
+under `/dev_bdvd/PS3_GAME/USRDIR` fails and the boot gives up. Staging the disc
+tree there is the next step.
+
+Two things also survive and are not yet understood: six
 `attempt to lock invalid mutex '(null)'` pairs around FIOS scheduler teardown,
 and one `bctr to NULL` per scheduler with the scheduler object in `r3`.
 
