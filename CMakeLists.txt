@@ -23,7 +23,10 @@ set(PS3RECOMP_RUNTIME_LIB "${PS3RECOMP_DIR}/build/ps3recomp_runtime.lib"
 
 # Lifted game code (8 chunks, ~295 MB) + the generated HLE NID table.
 file(GLOB RECOMP_SOURCES "src/recomp/*.cpp")
-file(GLOB GEN_SOURCES    "src/gen/*.cpp")
+file(GLOB GEN_SOURCES    "src/gen/*.cpp" "src/gen/*.c")
+# Lifted SPU images, one directory per image, plus the workload registry that
+# maps each guest image's fingerprint to its lifted entry point.
+file(GLOB_RECURSE SPU_SOURCES "src/spu_gen/*.c")
 
 add_executable(twistedmetal
     "${CMAKE_CURRENT_SOURCE_DIR}/src/boot_main.cpp"
@@ -33,6 +36,7 @@ add_executable(twistedmetal
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"        # boot-critical CRT
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"            # cellFs VFS
     ${GEN_SOURCES}
+    ${SPU_SOURCES}
     ${RECOMP_SOURCES}
 )
 

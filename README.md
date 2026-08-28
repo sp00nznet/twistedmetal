@@ -33,9 +33,10 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | Import / NID analysis | **done** — 439 imports, 34 libraries, 376 resolved (86%) |
 | Function boundary detection | **done** — 31,032 functions, every `.opd` address verified |
 | SPU image extraction | **done** — 11 embedded SPU ELFs, 1.17 MB |
+| SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **runs to a clean exit** — FIOS + SPURS tasksets up; needs game data |
+| Boot | **runs to a clean exit** — FIOS, SPURS tasksets and SPU jobs run |
 | Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
@@ -239,16 +240,61 @@ Five job-queue imports are still faked: `_cellSpursCreateJobQueue`
 whose argument order has not been confirmed, so nothing is bridged on guesswork
 yet.
 
+### SPU images
+
+`cellSpursCreateTask` hands SPURS a guest SPU image; the runtime fingerprints
+it (FNV-1a-64) and looks for a lifted version in the workload registry. All
+eleven images are now lifted and registered via
+`ps3recomp/tools/build_spu_workloads.py`:
+
+```
+[spu_workload] dispatch HIT (async) fp=0xCE95F52496B4AE31 args=0x40083100 image=2 -> spawning thread
+[taskset] built SpursTasksetContext image=2 taskset=0x11ECF180 task=0
+[spu] SPURS taskset syscall num=2 (raw=0x2) image=2 link/r0=0x09668
+```
+
+That took a correction. `extract_spu_images.py` and the runtime's
+`spu_elf_image_size()` disagree about an image's extent — the first dispatch
+reported `size=36564` where the extracted file was 36,512 bytes — so the
+fingerprints never matched and every dispatch missed. Two of the eleven images
+were short; re-carving them at the runtime's own extent makes
+`spu_0001_at_00D53C00` fingerprint to `0xCE95F52496B4AE31`, exactly what the
+miss reported. `tools/recarve_spu.py` does this and is idempotent.
+
 ### Why it still exits
 
-Not SPURS. The game's own boot trace stops before its first timing print
-(`init: %.2f`, then `GameRT::startup`, `WorldLoader::loadUi`) and goes straight
-to `Twisted app terminated! ReceivedExitGameRequest(False)` — terminated, with
-no exit request received. `input/` holds only the EBOOT, so every asset open
-under `/dev_bdvd/PS3_GAME/USRDIR` fails and the boot gives up. Staging the disc
-tree there is the next step.
+Not missing assets — the full 13 GB disc tree is staged under `input/PS3_GAME/`
+and the run has the same shape without it. The game's boot trace stops before
+its first timing print (`init: %.2f`, then `GameRT::startup`,
+`WorldLoader::loadUi`) and goes to
+`Twisted app terminated! ReceivedExitGameRequest(False)` — terminated, with no
+exit request received.
 
-Two things also survive and are not yet understood: six
+It is a timeout, and both halves of it are now visible. The SPU task starts and
+immediately issues SPURS taskset syscall 2, `WAIT_SIGNAL`, parking until the PPU
+delivers `_cellSpursSendSignal` or sets the event flag. The PPU meanwhile makes
+three `sys_event_flag_wait` calls (lv2 syscall 100, mode AND) with
+`timeout=0x01930000` µs — **26 seconds each** — and then main returns:
+
+```
+[spu_workload] WAIT_SIGNAL#1 enter task=0 taskset=0x11ECF180 ran=0ms
+...
+[sc-caller] flag=100 syscall from func_0064AD40+0x1918 (r5/mode=0x1 r7/timeout=0x01930000 ...)
+Twisted app terminated! ReceivedExitGameRequest(False)
+```
+
+Neither side moves. The likeliest culprit is the job-queue layer between them:
+the game creates five job queues at boot through `_cellSpursCreateJobQueue` and
+friends, all of which return a faked `CELL_OK` without creating anything.
+
+That is not a small gap. RPCS3's entire `cellSpursJq` module is 63
+`UNIMPLEMENTED_FUNC` stubs returning `CELL_OK`, so there is no reference
+implementation to port and `_cellSpursCreateJobQueue`'s argument order is
+undocumented — its call site passes eight register arguments with `r3=2`.
+Implementing it means reverse-engineering the job-queue protocol from this
+binary. That is the next real piece of work.
+
+Two smaller things also survive and are not yet understood: six
 `attempt to lock invalid mutex '(null)'` pairs around FIOS scheduler teardown,
 and one `bctr to NULL` per scheduler with the scheduler object in `r3`.
 
@@ -340,6 +386,7 @@ twistedmetal/
 │   ├── hle_extra.cpp       # imports this title reaches that the runtime lacks
 │   ├── compat/             # <dirent.h>/<unistd.h> Win32 shims
 │   ├── gen/                # generated HLE NID table (committed)
+│   ├── spu_gen/            # lifted SPU images, 19 MB (gitignored; regenerate)
 │   └── recomp/             # lifted C++, 295 MB (gitignored; regenerate)
 ├── data/keys               # your scetool key file (gitignored)
 ├── input/                  # your EBOOT + assets (gitignored)

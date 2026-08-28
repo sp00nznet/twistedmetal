@@ -71,3 +71,6 @@ frames/
 # Scratch: other copies of the game staged for comparison
 _demo/
 _stage/
+
+# Generated SPU workload registry (references the gitignored lifted SPU C)
+src/gen/spu_workloads.c
