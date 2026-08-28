@@ -41,6 +41,7 @@ TRACE = {
     '00779C18': 'fios Mutex ctor (this, name) -> sys_lwmutex_create',
     '0076CB00': 'fios worker setup (writes the object that is never constructed)',
     '0076756C': 'candidate element ctor (copies a vtable to +0x00)',
+    '007556B4': 'fios object base ctor (writes the "FIOS obj ...." tag)',
 }
 
 RECOMP = 'src/recomp'

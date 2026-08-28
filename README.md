@@ -331,52 +331,37 @@ attempt to lock invalid mutex '(null)'
 
 and tears the scheduler down again — three times over, never servicing a read.
 
-Tracing the FIOS `Mutex` constructor (guest `0x00779C18`, which calls
-`sys_lwmutex_create`) prints every lock the engine builds. A whole boot builds
-**38**, six of them the scheduler's:
+Every FIOS object is built through one base constructor, guest `0x007556B4`,
+which takes the object and its name. Tracing it enumerates exactly what the
+engine constructs — **278** objects over a boot. The scheduler comes out fully
+built:
 
 ```
-scheduler.m_objectLock     0x40001700
-scheduler.m_opLock         0x40001728
-scheduler.m_completedLock  0x40001768     <- 0x40 after m_opLock, not 0x28
-scheduler.m_ioLock         0x400017D0
-scheduler.m_fhLock         0x40001828
-scheduler.m_workerLock     0x40001878
+0x40001700 scheduler.m_objectLock      0x400017D0 scheduler.m_ioLock
+0x40001728 scheduler.m_opLock          0x400017F8 scheduler.m_ioCond
+0x40001750 scheduler.m_opCallbackLock  0x40001810 scheduler.m_idleCond
+0x40001768 scheduler.m_completedLock   0x40001828 scheduler.m_fhLock
+0x40001790 "fios scheduler"            0x40001878 scheduler.m_workerLock
 ```
 
-`scheduler.m_opCallbackLock` — present in the binary's string table between
-`m_opLock` and `m_completedLock` — is never constructed, and the address gap
-between those two is exactly the wrapper it should occupy. And across all 38,
-**not one is in the worker region**.
+(An earlier version of this file claimed `scheduler.m_opCallbackLock` was never
+constructed. That was wrong — it was an artifact of tracing only the `Mutex`
+constructor `0x00779C18`, which that lock does not go through. It is built, at
+`0x40001750`.)
 
-A store watch (`LBP_WW=0x400163A0 LBP_WW_LEN=0x200`) shows what is written in
-that region and by which guest function:
+In the worker region the same trace shows the sub-objects constructed and the
+owners not:
 
 ```
-0x400163A4 <- 0x400164A0   fn 0x0076C3EC
-0x400163E4 <- 0x400164DC   fn 0x0076C3EC     (0x40 later — a 0x40-stride loop)
-0x400163B4 <- 0x40016460   fn 0x0076C4E0     +0x04 of 0x400163B0 = a Thread*
-0x400163B8 <- 0x40016408   fn 0x0076C4E0     +0x08 of 0x400163B0 = a Cond*
-0x40016420 <- "FIOS obj thrd"  fn 0x0077A4E0 (the Thread constructor)
+0x400163F0  cond[0]     constructed
+0x40016408  cond[1]     constructed
+0x40016420  thread[0]   constructed
+0x40016460  thread[1]   constructed
+0x40016370  worker[0]   never
+0x400163B0  worker[1]   never
 ```
 
-(Those writer addresses sit just before `0x0076C534`, which `post_lift.py`
-renamed — the host symbolizer resolves to the nearest preceding symbol, so they
-are inside the scheduler constructor.)
-
-Three loops populate a descriptor at `0x400163B0` with a `Thread*` at `+0x04`
-and a `Cond*` at `+0x08`, and the Thread and Cond objects themselves are
-properly constructed elsewhere. What is never written, anywhere in the run:
-
-* `0x400163B0 + 0x00` — the word the failing indirect call dereferences.
-* `0x400163C0 .. 0x400163D8` — the mutex `Mutex::lock` is called on and
-  reports invalid.
-
-So the sub-objects (Thread, Cond) are built and linked in, while the structure
-that owns them is left with a null head word and an unconstructed mutex.
-Identifying the construction step that should fill those two — and why it does
-not run — is the next move, and the one thing between here and the game reading
-its own data.
+Not one of the 278 base constructions targets `0x40016370` or `0x400163B0`.
 
 The region's layout is measured rather than guessed: the allocation's own
 zeroing (`fn 0x0097422C`, a w1/w2/w4 burst at `0x40016370`) marks the base, and

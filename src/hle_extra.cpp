@@ -429,6 +429,20 @@ void func_00779C18(ppu_context* ctx)
 }
 void func_0076CB00(ppu_context* ctx) { tm_trace("fiosWorkerSetup", func_0076CB00_lifted, ctx); }
 void func_0076756C(ppu_context* ctx) { tm_trace("elemCtor?", func_0076756C_lifted, ctx); }
+
+/* The FIOS base constructor: it stamps "FIOS obj ...." on every object the
+ * engine builds, so tracing it enumerates exactly what does get constructed. */
+void func_007556B4(ppu_context* ctx)
+{
+    if (tm_trace_on()) {
+        char nm[64];
+        const uint32_t t = (uint32_t)ctx->gpr[4];
+        fprintf(stderr, "[trace] fiosBaseCtor(this=0x%08X, name=0x%08X '%s')\n",
+                (uint32_t)ctx->gpr[3], t,
+                (t >= 0x10000 && t < 0xF00000) ? tm_gstr(t, nm, sizeof nm) : "?");
+    }
+    func_007556B4_lifted(ctx);
+}
 void func_0076C534(ppu_context* ctx) { tm_trace("fiosSchedCtor", func_0076C534_lifted, ctx); }
 void func_0076CDF4(ppu_context* ctx) { tm_trace("createSchedForMedia", func_0076CDF4_lifted, ctx); }
 void func_0077A088(ppu_context* ctx) { tm_trace("Mutex::lock", func_0077A088_lifted, ctx); }
