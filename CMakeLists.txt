@@ -27,6 +27,7 @@ file(GLOB GEN_SOURCES    "src/gen/*.cpp")
 
 add_executable(twistedmetal
     "${CMAKE_CURRENT_SOURCE_DIR}/src/boot_main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/hle_extra.cpp"     # imports the runtime lacks
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"        # vm + ELF loader + run
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"           # NID -> handler dispatch
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"        # boot-critical CRT

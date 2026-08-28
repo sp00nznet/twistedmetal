@@ -29,6 +29,7 @@ void     ppu_recomp_register(void);
 void     ppu_hle_init(void);
 void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
+void     tm_hle_register_extra(void);   /* src/hle_extra.cpp */
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
@@ -419,6 +420,7 @@ int main(int argc, char** argv)
     ps3_load_prx_modules();  /* real system PRX (libsre) -> guest RAM + exports */
     fprintf(stderr,"[boot-dbg] after prx; before ppu_hle_init\n"); fflush(stderr);
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
+    tm_hle_register_extra(); /* first registration wins the ctx lookup */
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
     ppu_fs_register();       /* cellFs VFS over the real game directory */
     fprintf(stderr,"[boot-dbg] before lv2_init_syscalls\n"); fflush(stderr);

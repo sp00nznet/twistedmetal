@@ -20,10 +20,10 @@ libraries that stand in for the PS3 operating system. Same approach as
 
 ## Status
 
-It builds, and it boots real game code — through the CRT, memory setup,
-`cellGcmInit`, video-out configuration and display-buffer registration, into
-the RSX command stream, with a D3D12 window open. It then stalls in the
-engine's file-I/O scheduler. Nothing is rendered yet.
+It builds and boots real game code — CRT, memory, `cellGcmInit`, video-out,
+display buffers, RSX submission with a D3D12 window open — brings the engine's
+FIOS file-I/O scheduler up, runs and joins its worker threads, and then shuts
+down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 
 | Phase | State |
 |---|---|
@@ -35,7 +35,7 @@ engine's file-I/O scheduler. Nothing is rendered yet.
 | SPU image extraction | **done** — 11 embedded SPU ELFs, 1.17 MB |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **runs** — reaches RSX submission, then stalls on a FIOS condvar |
+| Boot | **runs to a clean exit** — FIOS works; blocked on SPURS tasksets |
 | Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
@@ -130,45 +130,98 @@ and be done with.
 ```
 [ppu] loaded 2 PT_LOAD segments, entry OPD 0x00F030D0
 [crt] sys_initialize_tls: block 0x0E000000, r13=0x0E007000
-[sys_memory] allocate(size=0xF00000) -> 0x40000000
-gSysMemInfo.available_user_memory: 201326592
 Available Main Ram at start of RTApp::initHardware 192(201326592)
 IoMem: 0x11000000 167MB
 [HLE] _cellGcmInitBody(cmdSize=0x10000, ioSize=0xA700000, ioAddr=0x11000000)
 [cellVideoOut] Configure: resId=4 -> 720x480, pitch=5120
-[cellGcmSys] SetDisplayBuffer(id=0/1) / SetTile / BindTile / SetFlipMode(1)
-[cellGcmSys] SetVBlankHandler / SetUserHandler
+[cellGcmSys] SetDisplayBuffer(0/1) / SetTile / SetZcull / SetVBlankHandler
 [rsx] backend init OK -- window open
-[RSX] CLEAR_SURFACE x12,  50 unknown methods
-[SYS] sys_ppu_thread_create name="fios mediathread 0/1"
+FileIO initialized with data root = /dev_bdvd/PS3_GAME/USRDIR
+[SYS] sys_ppu_thread_create name="fios mediathread 2..10"   (7 of them)
+[cellSpurs] CreateTask REJECT no-init (taskset=0x11ECF180 elf=0x00D63C00)
+Twisted app terminated! ReceivedExitGameRequest(False)
 ```
 
 The game gets its own engine up: `RTApp::initHardware` runs, GCM is initialised
-with a 167 MB IO region, the video mode is negotiated, both display buffers and
-a tile are registered, vblank and user handlers are installed, and the D3D12
-backend opens a window and receives real RSX commands.
+with a 167 MB IO region, the video mode is negotiated, display buffers, tiles
+and zcull are registered, vblank and user handlers are installed, the D3D12
+backend opens a window and receives real RSX commands, and FIOS mounts the disc
+and its HDD cache. It then decides to quit, cleanly, through its own shutdown
+path.
 
-It then hangs: the FIOS worker thread spins on
-`wait for invalid cond 'fios worker cond'`, with one
-`attempt to lock invalid mutex '(null)'` just before. A condition variable the
-engine's file scheduler waits on was never created, so nothing loads.
+### The FIOS deadlock, and what it was
 
-Seven imports are actually reached at runtime with no handler — a much shorter
-list than the 208 that are merely absent:
+The first run hung with 2.1 million lines of the game's own diagnostic:
+
+```
+attempt to lock invalid mutex '(null)'
+wait for invalid cond 'fios worker cond'      (forever)
+```
+
+Two false leads, both worth recording. `sys_ppu_thread_once` was unimplemented,
+and an unimplemented import returns `CELL_OK` without running the initialiser
+it was handed — that had to be fixed regardless (`src/hle_extra.cpp`), but it
+was not the hang. The runtime's `bctr to NULL from func_000AE828+0x78DA` names
+a host symbol 8 bytes long, so that offset is a symbolizer artefact, not a
+guest address.
+
+The real cause is a struct-layout mismatch. The PS3 ABI is
+
+```c
+struct sys_lwcond_t { sys_lwmutex_t *lwmutex; u32 lwcond_queue; };   /* 4 + 4 */
+```
+
+with a **32-bit** guest pointer, so the mutex EA occupies the first four bytes.
+ps3recomp models it as a big-endian **64-bit** EA at `+0x00` with the queue id
+at `+0x08`. Nothing notices while only the runtime touches the struct — but
+this game touches it. Its FIOS condition-variable wrapper is 24 bytes:
+
+```
++0x00 vtable   +0x08 name   +0x10 sys_lwcond_t
+```
+
+and `Cond::wait` (guest `0x0077A2E0`) validates with
+
+```c
+if (*(u32*)(this + 0x10) == 0) printf("wait for invalid cond '%s'
+", name);
+```
+
+Against the 64-bit layout that word is the *high half* of the EA — always zero.
+So every FIOS wait short-circuited instead of blocking, both media threads
+spun, one held the scheduler's lwmutex the whole time, and the main thread
+deadlocked behind it.
+
+`src/hle_extra.cpp` overrides `sys_lwcond_create` to write the mutex EA into
+both words: the first satisfies the guest ABI and the game's check, the second
+doubles as the queue id and keeps the runtime's `(u32)vm_read64(lwcond + 0)`
+truncating to the mutex, so its `sys_lwcond_wait` works unmodified. The proper
+fix belongs upstream in ps3recomp's `ppu_sysprx.cpp`.
+
+Result: 2,186,074 log lines and a hang became 279 lines and
+`sys_process_exit(code=0)`. FIOS now brings up seven media threads across three
+scheduler generations, runs them, and joins them.
+
+### Next blocker: SPURS
+
+The game stops at `cellSpurs CreateTask REJECT no-init` — the taskset was never
+initialised, because the calls that would have done it are unimplemented:
 
 | NID | Library | Function |
 |---|---|---|
-| `0x42B23552` | `sysPrxForUser` | `sys_prx_register_library` |
-| `0xA3E3BE68` | `sysPrxForUser` | `sys_ppu_thread_once` |
-| `0x626E8518` | `cellGcmSys` | `cellGcmMapEaIoAddressWithFlags` |
 | `0x9DCBCB5D` | `cellSpurs` | `cellSpursAttributeEnableSystemWorkload` |
+| `0xC2ACDF43` | `cellSpurs` | `_cellSpursTasksetAttribute2Initialize` |
+| `0x4A6465E3` | `cellSpurs` | `cellSpursCreateTaskset2` |
+| `0x011EE38B` | `cellSpurs` | `_cellSpursLFQueueInitialize` |
+| `0x1656D49F` | `cellSpurs` | `cellSpursLFQueueAttachLv2EventQueue` |
 | `0xF244E799` | `cellSpursJq` | `_cellSpursCreateJobQueue` |
 | `0x1686957E` | `cellSpursJq` | `cellSpursJobQueueAttributeSetMaxSizeJobDescriptor` |
 | `0x3D1294FC` | `cellSpursJq` | *(not in the NID database)* |
+| `0x45FE2FCE` | `sysPrxForUser` | `_sys_spu_printf_initialize` |
 
-Plus `lv2_syscall 144` (×6) and `254`, both stubbed. `sys_ppu_thread_once` is
-the prime suspect for the missing condvar: a no-op there silently skips
-one-time initialisers.
+Two smaller things also survive and are not yet understood: six
+`attempt to lock invalid mutex '(null)'` pairs around FIOS scheduler teardown,
+and one `bctr to NULL` per scheduler with the scheduler object in `r3`.
 
 ### Names, without a symbol table
 
@@ -255,6 +308,7 @@ twistedmetal/
 │   └── decrypt_self.py     # retail SELF -> plain ELF (bring your own key file)
 ├── src/
 │   ├── boot_main.cpp       # ps3recomp boot harness, rebranded for this title
+│   ├── hle_extra.cpp       # imports this title reaches that the runtime lacks
 │   ├── compat/             # <dirent.h>/<unistd.h> Win32 shims
 │   ├── gen/                # generated HLE NID table (committed)
 │   └── recomp/             # lifted C++, 295 MB (gitignored; regenerate)
