@@ -20,7 +20,7 @@ libraries that stand in for the PS3 operating system. Same approach as
 
 ## Status
 
-The binary is decrypted and fully analysed. Lifting has not started.
+The binary is decrypted, analysed and lifted. First build is running.
 
 | Phase | State |
 |---|---|
@@ -30,8 +30,8 @@ The binary is decrypted and fully analysed. Lifting has not started.
 | Import / NID analysis | **done** — 439 imports, 34 libraries, 376 resolved (86%) |
 | Function boundary detection | **done** — 31,032 functions, every `.opd` address verified |
 | SPU image extraction | **done** — 11 embedded SPU ELFs, 1.17 MB |
-| PPU lifting | not started |
-| Build & link | not started |
+| PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
+| Build & link | in progress |
 | Boot | not started |
 | Graphics (RSX → D3D12) | not started |
 | Audio / input | not started |
@@ -87,6 +87,41 @@ they run as SPURS jobs rather than raw SPU threads. Identifying what each one
 does — physics, particles, audio, culling — comes before any decision to HLE
 them or run them through ps3recomp's SPU lifter.
 
+### Lifting
+
+```
+30,828 functions lifted from the 31,032 detected
+ 4,807 mid-function tail-entry wrappers (5 passes to a fixed point)
+35,635 functions emitted, 16,531 unique call targets
+ 4.47 M lines of C++, 295 MB, split across 8 translation units
+     4 functions with no continuation at a mid-function entry -> halt
+```
+
+`--code-end 0xC79C6C` stops the lifter at the top of the import stub section,
+so `.rodata` beyond it stays data instead of being disassembled as code.
+`--toc 0xF21930` comes from the entry OPD.
+
+### HLE coverage
+
+Of the 439 imports, **231 (53%)** already have a handler in ps3recomp's runtime.
+The gap is where the porting work is:
+
+| Library | Have | Missing | Note |
+|---|---|---|---|
+| `sceNp` | 11 | 36 | dead servers — stub |
+| `sysPrxForUser` | 12 | 31 | core CRT/threading — real work |
+| `sys_net` | 2 | 21 | dead servers — stub |
+| `sceNpTus` | 3 | 16 | dead servers — stub |
+| `cellSpurs` | 31 | 15 | SPU job scheduling |
+| `cellSpursJq` | 2 | 14 | SPU job queue |
+| `sys_fs` | 14 | 13 | real work |
+| `cellSysutil` | 24 | 11 | mixed |
+| `cellGcmSys` | 25 | 3 | graphics, nearly there |
+
+Everything else is one or two functions short. Roughly half the missing count
+is online plumbing for servers that were shut down, which can return an error
+and be done with.
+
 ## Reproducing the analysis
 
 You need your own copy of the game and a scetool-format key file at `data/keys`
@@ -106,6 +141,18 @@ python $P/elf_parser.py       input/EBOOT.ELF --imports > meta/imports.json
 python $P/nid_database.py     --batch meta/nids.txt --json > meta/nids_resolved.json
 python $P/find_functions.py   input/EBOOT.ELF --output meta/functions.json
 python $P/extract_spu_images.py input/EBOOT.ELF --output meta/spu
+python $P/ppu_loader.py       input/EBOOT.ELF -o meta/
+python $P/gen_hle_nids.py     --all --out src/gen/ppu_hle_nids.cpp
+
+# Lift (~2 min, 295 MB of C++)
+python $P/ppu_lifter.py input/EBOOT.ELF \
+       --functions meta/functions.json --hle-stubs meta/EBOOT.imports.json \
+       --toc 0xF21930 --code-end 0xC79C6C --output src/recomp -j 16
+
+# Build
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+cmake --build build
 ```
 
 Both tools carry a `--selftest` that runs without any game data:
@@ -128,9 +175,15 @@ an OPD descriptor pointing back into the image, which noise never does.
 twistedmetal/
 ├── README.md
 ├── LICENSE
+├── CMakeLists.txt          # links the runtime + the boot harness
 ├── tools/
 │   ├── decrypt_iso.py      # raw PS3 disc image -> plain image (bring your own key)
 │   └── decrypt_self.py     # retail SELF -> plain ELF (bring your own key file)
+├── src/
+│   ├── boot_main.cpp       # ps3recomp boot harness, rebranded for this title
+│   ├── compat/             # <dirent.h>/<unistd.h> Win32 shims
+│   ├── gen/                # generated HLE NID table (committed)
+│   └── recomp/             # lifted C++, 295 MB (gitignored; regenerate)
 ├── data/keys               # your scetool key file (gitignored)
 ├── input/                  # your EBOOT + assets (gitignored)
 └── meta/                   # analysis output, regenerated (gitignored)
