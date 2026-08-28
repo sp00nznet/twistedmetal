@@ -36,7 +36,7 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **runs to a clean exit** — blocked on renderer init at 1280x720 |
+| Boot | **runs to a clean exit** — blocked: FIOS opens no files |
 | Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
@@ -293,36 +293,84 @@ points it at the disc's own `PARAM.SFO`:
 [game]   usrdirPath:[/dev_hdd0/game/BCUS98106/USRDIR]
 ```
 
-### Why it exits: the renderer
+### Why it exits: no file ever opens
 
-`RTApp::initHardware` (guest `0x0064AD40` — it prints the three `Available Main
-Ram` / `IoMem` lines) runs its whole sequence, then calls
+`RTApp::initHardware` (guest `0x0064AD40`) completes its sequence and then calls
 
 ```
-func_00671698(this, 0x500, 0x2D0)      // 1280 x 720, at guest 0x0064B060
+func_00671698(1, 0x500, 0x2D0)      // renderer init, 1280 x 720
 ```
 
-and that returns **0**. The failure branch clears the run flag for its
-`RTApp::backgroundSwap` thread, spins on `sys_timer_usleep(100)` until that
-thread acknowledges, and returns failure — after which `main` prints
-`Twisted app terminated! ReceivedExitGameRequest(False)` and exits cleanly. The
-runtime's stray `[sc-caller] ... lr=0x0064B064` line pins the call site exactly:
-it is the instruction after that call.
+which returns **0**. The failure branch stops the `RTApp::backgroundSwap`
+thread, spins on `sys_timer_usleep(100)` until it acknowledges, and returns
+failure; `main` then prints `Twisted app terminated!`. `tools/post_lift.py` can
+wrap guest functions in a tracer (`TM_TRACE=1`), which shows it directly:
 
-So the exit is a **display/renderer init failure**, not FIOS, not SPURS, not
-missing assets. FIOS brings up and tears down its schedulers, SPURS builds its
-taskset and dispatches into lifted SPU code, and `GameContent` completes — all
-before this.
+```
+[trace]-> renderInit(0x00000001, 0x00000500, 0x000002D0)
+[trace]  -> f_00670C10(0x00CD7BCC, ...)      <- "debugfont.fnt"
+[trace]  <- f_00670C10 = 0 (0)
+[trace]<- renderInit = 0 (0)
+```
 
-The visible oddity is the video mode. The game negotiates
-`[cellVideoOut] Configure: resId=4 -> 720x480` — standard definition — and then
-initialises its renderer at 1280x720. ps3recomp's `cellVideoOutGetDeviceInfo`
-does advertise 720p among four modes, so the next question is whether the mode
-table survives the trip into guest memory in big-endian order.
+`0x00CD7BCC` is `"debugfont.fnt"`, and the neighbouring string is
+`graphics/Font.cpp`. The file is present —
+`PS3_GAME/USRDIR/globals/rt/fonts/debugfont.fnt` — so the load is failing, not
+the data.
 
-Two smaller things also survive and are not yet understood: six
-`attempt to lock invalid mutex '(null)'` pairs around FIOS scheduler teardown,
-and one `bctr to NULL` per scheduler with the scheduler object in `r3`.
+And it is failing because **no file is ever opened**. With the runtime's
+filesystem tracing on, a whole boot logs zero opens, reads or seeks. The
+renderer fails because its first font load gets nothing back.
+
+### The actual blocker: a zeroed FIOS object
+
+Which puts the two loose ends from earlier at the centre. FIOS creates a
+scheduler, spawns its media threads, hits
+
+```
+attempt to lock invalid mutex '(null)'
+[ppu] bctr to NULL ... r12(opd)=0x00000000 (r3=0x4009AA30 ...)
+```
+
+and tears the scheduler down again — three times over, never servicing a
+single read.
+
+FIOS's `Mutex::lock` is guest `0x0077A088`. Its wrapper has the same shape as
+the condvar one (`+0x00` vtable, `+0x08` name, `+0x10` `sys_lwmutex_t`), and it
+validates with
+
+```c
+if (lwmutex.attribute == *(u32*)(0x00CDA388 + 0x10))   /* that word is 0 */
+    printf("attempt to lock invalid mutex '%s'", name);
+```
+
+so the test is `attribute == 0`. The name prints as `(null)`, so `+0x08` is zero
+too: the whole wrapper is zeroed memory, never constructed — matching the
+`bctr to NULL`, which is a virtual call through a zero vtable pointer on an
+object in the same family. Finding what should have constructed it is the next
+step, and it is the one thing between here and the game reading its own data.
+
+(Ruled out along the way: it is not a lifter boundary error. `0x0077A088` is a
+heuristic split of a larger function, but the fragment before it trampolines in
+with the same `ppu_context`, so r10/r11 carry across correctly.)
+
+### Video modes
+
+Checked, and not the cause. ps3recomp's `cellVideoOutGetDeviceInfo` advertises
+four modes but leaves `CellVideoOutDisplayMode.refreshRates` zero on every one,
+so a title scanning for a mode that supports its rate finds none;
+`src/hle_extra.cpp` now writes the full big-endian struct with
+`refreshRates = 0x0005` (59.94 | 60 Hz). `TM_VIDEO_MODES` overrides the
+advertised set.
+
+It changes nothing here: with only 720p advertised, with 1080p first, or with
+the set reordered, the game still calls `cellVideoOutConfigure` with
+`resId=4` (720x480). It is not choosing from the device table.
+
+The ten unknown `cellSysutil` imports were also resolved, by computing NIDs from
+RPCS3's function names: nine are `cellWebBrowser*` and one is
+`cellOskDialogAddSupportLanguage` — the in-game browser and OSK, nothing on the
+boot path.
 
 ### Names, without a symbol table
 

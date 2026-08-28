@@ -25,13 +25,25 @@ OVERRIDES = {
     '0034ACAC': "the title's log(level, fmt, ...)",
 }
 
+# Guest functions to WRAP rather than replace: the lifted body is renamed the
+# same way, and src/hle_extra.cpp defines a tracer under the original name that
+# logs r3 in/out and calls through. Enabled at run time with TM_TRACE=1.
+# These four are RTApp::initHardware's renderer init and its three main
+# callees -- the init returns 0 and that is what ends the boot.
+TRACE = {
+    '00671698': 'renderer init (this, 1280, 720)',
+    '00670C10': 'renderer init callee',
+    '00671560': 'renderer init callee',
+    '006A9430': 'renderer init callee',
+}
+
 RECOMP = 'src/recomp'
 
 
 def patch(path, changed):
     src = open(path, encoding='utf-8', errors='surrogateescape').read()
     out = src
-    for addr in OVERRIDES:
+    for addr in list(OVERRIDES) + list(TRACE):
         definition = f'void func_{addr}(ppu_context* ctx) {{'
         if definition in out:
             out = out.replace(definition, f'void func_{addr}_lifted(ppu_context* ctx) {{')
@@ -56,7 +68,7 @@ def main():
     # defines, so it needs no edit -- but the renamed body needs a declaration.
     hdr = f'{RECOMP}/ppu_recomp.h'
     h = open(hdr, encoding='utf-8', errors='surrogateescape').read()
-    for addr in OVERRIDES:
+    for addr in list(OVERRIDES) + list(TRACE):
         decl = f'void func_{addr}_lifted(ppu_context* ctx);'
         if decl not in h:
             h = h.replace(f'void func_{addr}(ppu_context* ctx);',

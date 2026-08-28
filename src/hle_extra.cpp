@@ -87,6 +87,7 @@ static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx);
 static void cellSpursCreateTaskset2(ppu_context* ctx);
 static void cellSpursAttributeEnableSystemWorkload(ppu_context* ctx);
 static void sys_spu_printf_initialize(ppu_context* ctx);
+static void cellVideoOutGetDeviceInfo(ppu_context* ctx);
 
 extern "C" void tm_hle_register_extra(void)
 {
@@ -102,6 +103,8 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x9DCBCB5Du, "cellSpursAttributeEnableSystemWorkload",
                          cellSpursAttributeEnableSystemWorkload);
     ps3_hle_register_ctx(0x45FE2FCEu, "_sys_spu_printf_initialize", sys_spu_printf_initialize);
+
+    ps3_hle_register_ctx(0x1E930EEFu, "cellVideoOutGetDeviceInfo", cellVideoOutGetDeviceInfo);
 }
 
 /* ---------------------------------------------------------------------------
@@ -307,3 +310,115 @@ extern "C" void tm_init_title_metadata(void)
              ppu_vfs_root && *ppu_vfs_root ? ppu_vfs_root : ".");
     cellGame_init_from_paramsfo(path);
 }
+
+/* ---------------------------------------------------------------------------
+ * cellVideoOutGetDeviceInfo (0x1E930EEF) — advertise refresh rates.
+ *
+ * The runtime fills the four available modes (480p/576p/720p/1080p) but writes
+ * the struct with a memset plus three byte fields per mode, which leaves
+ * CellVideoOutDisplayMode.refreshRates zero on every one. A title scanning the
+ * mode table for one that supports the rate it wants finds none, and this game
+ * then settles for `Configure: resId=4` — 480p — before failing its renderer
+ * init at 1280x720.
+ *
+ * Layout (all big-endian in guest memory):
+ *   CellVideoOutDeviceInfo  +0x00 portType  +0x01 colorSpace  +0x02 latency u16
+ *                           +0x04 availableModeCount  +0x05 state
+ *                           +0x06 rgbOutputRange  +0x07 reserved[5]
+ *                           +0x0C availableModes[32]
+ *   CellVideoOutDisplayMode +0x00 resolutionId +0x01 scanMode +0x02 conversion
+ *                           +0x03 aspect  +0x04 reserved[2]  +0x06 refreshRates u16
+ * ------------------------------------------------------------------------- */
+extern "C" void vm_write8(uint64_t a, uint8_t v);
+extern "C" void vm_write16(uint64_t a, uint16_t v);
+
+#define VO_RES_1080   1
+#define VO_RES_720    2
+#define VO_RES_480    4
+#define VO_RES_576    5
+#define VO_SCAN_PROGRESSIVE 1
+#define VO_ASPECT_16_9      2
+/* 59.94Hz | 60Hz — what an NTSC HDMI display reports. The device advertises a
+ * capability set; cellVideoOutGetState separately reports the mode in use. */
+#define VO_RATES  (0x0001 | 0x0004)
+
+static void cellVideoOutGetDeviceInfo(ppu_context* ctx)
+{
+    const uint32_t videoOut = (uint32_t)ctx->gpr[3];
+    const uint32_t info = (uint32_t)ctx->gpr[5];
+    if (!info)     { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8002B221; return; }
+    if (videoOut)  { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8002B220; return; }
+
+    for (uint32_t o = 0; o < 0x0C + 32 * 8; o += 4) vm_write32(info + o, 0);
+
+    /* TM_VIDEO_MODES overrides the advertised set (comma-separated resolution
+     * ids) so the title's mode negotiation can be probed without a rebuild.
+     * A real display reports what it supports; this is that knob. */
+    uint8_t modes[32] = { VO_RES_480, VO_RES_576, VO_RES_720, VO_RES_1080 };
+    uint32_t n = 4;
+    if (const char* env = getenv("TM_VIDEO_MODES")) {
+        n = 0;
+        for (const char* p = env; *p && n < 32; ) {
+            modes[n++] = (uint8_t)strtoul(p, (char**)&p, 0);
+            while (*p == ',' || *p == ' ') p++;
+        }
+        if (!n) { modes[0] = VO_RES_720; n = 1; }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t m = info + 0x0C + i * 8;
+        vm_write8(m + 0, modes[i]);
+        vm_write8(m + 1, VO_SCAN_PROGRESSIVE);
+        vm_write8(m + 2, 0);                 /* conversion: none */
+        vm_write8(m + 3, VO_ASPECT_16_9);
+        vm_write16(m + 6, VO_RATES);
+    }
+
+    vm_write8(info + 0x00, 1);   /* portType = HDMI */
+    vm_write8(info + 0x01, 0);   /* colorSpace = RGB */
+    vm_write16(info + 0x02, 0);  /* latency */
+    vm_write8(info + 0x04, (uint8_t)n);
+    vm_write8(info + 0x05, 2);   /* state = connected */
+    vm_write8(info + 0x06, 1);   /* rgbOutputRange = full */
+
+    fprintf(stderr, "[cellVideoOut] GetDeviceInfo -> %u modes, refreshRates=0x%04X each\n",
+            n, VO_RATES);
+    ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest call tracing (TM_TRACE=1).
+ *
+ * tools/post_lift.py renames the lifted bodies of the functions in its TRACE
+ * table to _lifted; these definitions take the original names, log the
+ * arguments and the return value, and call through. It is the only way to see
+ * inside a guest function — the lifter emits direct calls, so nothing else can
+ * hook one — and it is how the renderer-init failure is being narrowed down.
+ * ------------------------------------------------------------------------- */
+/* Declared in ppu_recomp.h with C++ linkage, like every lifted function. */
+
+static int tm_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_TRACE") ? 1 : 0;
+    return on;
+}
+
+static void tm_trace(const char* name, void (*body)(ppu_context*), ppu_context* ctx)
+{
+    if (!tm_trace_on()) { body(ctx); return; }
+    static int depth = 0;
+    const uint32_t a3 = (uint32_t)ctx->gpr[3], a4 = (uint32_t)ctx->gpr[4],
+                   a5 = (uint32_t)ctx->gpr[5];
+    fprintf(stderr, "[trace]%*s-> %s(0x%08X, 0x%08X, 0x%08X)\n", depth * 2, "", name, a3, a4, a5);
+    depth++;
+    body(ctx);
+    depth--;
+    fprintf(stderr, "[trace]%*s<- %s = 0x%08X (%d)\n", depth * 2, "", name,
+            (uint32_t)ctx->gpr[3], (int32_t)ctx->gpr[3]);
+    fflush(stderr);
+}
+
+void func_00671698(ppu_context* ctx) { tm_trace("renderInit", func_00671698_lifted, ctx); }
+void func_00670C10(ppu_context* ctx) { tm_trace("f_00670C10", func_00670C10_lifted, ctx); }
+void func_00671560(ppu_context* ctx) { tm_trace("f_00671560", func_00671560_lifted, ctx); }
+void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lifted, ctx); }
