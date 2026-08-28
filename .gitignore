@@ -1,0 +1,69 @@
+# --- Copyrighted game material (supply your own legally-dumped copy) ---
+# EBOOT.BIN/ELF, PARAM.SFO, USRDIR assets carved from your disc
+input/
+*.iso
+*.ISO
+*.BIN
+*.elf
+*.ELF
+*.self
+*.SELF
+*.sprx
+*.SPRX
+*.pkg
+*.zip
+*.7z
+
+# --- Disc / SELF keys — never distribute ---
+*.dkey
+*.ird
+*.rap
+data/keys
+
+# --- Generated: lifted C++, analysis JSON, extracted SPU images ---
+#     All derived from YOUR binary; regenerate, don't commit.
+generated/
+meta/
+spu/
+src/recomp/
+src/spu_gen/
+
+# --- Build output ---
+build/
+build_*/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.map
+
+# --- Logs / scratch ---
+*.log
+*.tmp
+run_*.txt
+trap.log
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- IDE / OS ---
+.claude/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
+
+# --- Frame captures: screenshots under docs/images are fine, dumps are not ---
+frame_*.bmp
+frames/
+*.bmp
+*.png
+!docs/images/*.png
