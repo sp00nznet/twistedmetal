@@ -174,30 +174,28 @@ struct sys_lwcond_t { sys_lwmutex_t *lwmutex; u32 lwcond_queue; };   /* 4 + 4 */
 
 with a **32-bit** guest pointer, so the mutex EA occupies the first four bytes.
 ps3recomp models it as a big-endian **64-bit** EA at `+0x00` with the queue id
-at `+0x08`. Nothing notices while only the runtime touches the struct — but
-this game touches it. Its FIOS condition-variable wrapper is 24 bytes:
-
-```
-+0x00 vtable   +0x08 name   +0x10 sys_lwcond_t
-```
-
-and `Cond::wait` (guest `0x0077A2E0`) validates with
-
-```c
-if (*(u32*)(this + 0x10) == 0) printf("wait for invalid cond '%s'
-", name);
-```
-
-Against the 64-bit layout that word is the *high half* of the EA — always zero.
-So every FIOS wait short-circuited instead of blocking, both media threads
-spun, one held the scheduler's lwmutex the whole time, and the main thread
-deadlocked behind it.
-
+at `+0x08`, which puts a zero word where the guest expects the pointer.
 `src/hle_extra.cpp` overrides `sys_lwcond_create` to write the mutex EA into
-both words: the first satisfies the guest ABI and the game's check, the second
-doubles as the queue id and keeps the runtime's `(u32)vm_read64(lwcond + 0)`
-truncating to the mutex, so its `sys_lwcond_wait` works unmodified. The proper
-fix belongs upstream in ps3recomp's `ppu_sysprx.cpp`.
+both 32-bit words: the first satisfies the guest ABI, the second doubles as the
+queue id and keeps the runtime's `(u32)vm_read64(lwcond + 0)` truncating to the
+mutex, so its `sys_lwcond_wait` works unmodified.
+
+A later store watch over a live FIOS condvar confirms the object directly — it
+is 24 bytes, `sys_lwcond_t` at `+0x00`, a debug tag at `+0x08`, the name
+pointer at `+0x10`:
+
+```
+0x40016400 <- 0x40001888   (our sys_lwcond_create: lwmutex EA, both words)
+0x40016408 <- "FIOS obj "  (the Cond constructor's tag)
+0x40016410 <- 0x00CF6A50   ('fios worker cond')
+```
+
+Two conds live at `0x40016400` and `0x40016418` — 0x18 apart, matching. So the
+`+0x00` write is what the guest reads, and that is why the fix works. An earlier
+draft of this file described the wrapper as `vtable / name / sys_lwcond_t at
++0x10`; that was inferred from the disassembly and the watch shows it is wrong.
+The fix stands on the ABI and on the measurement; the wrapper description does
+not.
 
 Result: 2,186,074 log lines and a hang became 279 lines and
 `sys_process_exit(code=0)`. FIOS now brings up seven media threads across three
@@ -322,7 +320,7 @@ And it is failing because **no file is ever opened**. With the runtime's
 filesystem tracing on, a whole boot logs zero opens, reads or seeks. The
 renderer fails because its first font load gets nothing back.
 
-### The actual blocker: FIOS workers are never constructed
+### The actual blocker: a FIOS worker field nothing writes
 
 FIOS creates a scheduler, spawns its media threads, hits
 
@@ -333,14 +331,9 @@ attempt to lock invalid mutex '(null)'
 
 and tears the scheduler down again — three times over, never servicing a read.
 
-`Mutex::lock` is guest `0x0077A088`. Its wrapper has the same shape as the
-condvar's (`+0x00` vtable, `+0x08` name, `+0x10` `sys_lwmutex_t`) and validates
-with `lwmutex.attribute == *(u32*)(0x00CDA388+0x10)` — that word is `0`, so the
-test is `attribute == 0`. The name prints `(null)`, so `+0x08` is zero too.
-
 Tracing the FIOS `Mutex` constructor (guest `0x00779C18`, which calls
 `sys_lwmutex_create`) prints every lock the engine builds. A whole boot builds
-**38**, and the scheduler contributes six:
+**38**, six of them the scheduler's:
 
 ```
 scheduler.m_objectLock     0x40001700
@@ -351,27 +344,36 @@ scheduler.m_fhLock         0x40001828
 scheduler.m_workerLock     0x40001878
 ```
 
-Two things stand out. `scheduler.m_opCallbackLock` — which exists in the
-binary's string table between `m_opLock` and `m_completedLock` — is never
-constructed, and the address gap is exactly the wrapper it should occupy. And
-across all 38, **not one is in the worker region** (`0x400163xx`).
+`scheduler.m_opCallbackLock` — present in the binary's string table between
+`m_opLock` and `m_completedLock` — is never constructed, and the address gap
+between those two is exactly the wrapper it should occupy. And across all 38,
+**not one is in the worker region**.
 
-A store watch (`LBP_WW=0x400163B0 LBP_WW_LEN=0x50`) confirms it from the other
-side: over the whole run that 80-byte block receives writes at `+0x04` and
-`+0x08` (from guest `0x0076CB00`) and `+0x34` (from the scheduler ctor's
-0x40-stride loop) — and nothing else. Never `+0x00`, the vtable; never
-`+0x10..0x28`, the mutex.
+A store watch (`LBP_WW=0x400163A0 LBP_WW_LEN=0x200`) shows what does get
+written there, and by which guest function:
 
-So FIOS allocates its worker objects, writes a few fields, and spawns threads on
-them, but their constructors never run. That is both symptoms at once: the
-invalid mutex is the unconstructed `+0x10`, and the `bctr to NULL` is a virtual
-call through the zero vtable at `+0x00`. The scheduler ctor
-(guest `0x0076C534`) does not return — it tail-jumps into `0x0076CB00`, which is
-where the worker setup continues and where the missing construction lives.
+```
+0x400163A4 <- 0x400164A0   fn 0x0076C3EC
+0x400163B4 <- 0x40016460   fn 0x0076C4E0     descriptor +0x04 = thread object
+0x400163B8 <- 0x40016408   fn 0x0076C4E0     descriptor +0x08 = cond object
+0x400163E4 <- 0x400164DC   fn 0x0076C3EC
+```
+
+Three loops in the scheduler constructor's tail fill `+0x04` (the thread),
+`+0x08` (the cond) and `+0x34`. **Nothing ever writes `+0x00`** — which is the
+word the later indirect call dereferences, giving the `bctr to NULL` — and
+nothing constructs the mutex the descriptor is expected to carry.
+
+So the worker descriptors are allocated raw and partly populated. Finding what
+should fill `+0x00` — a construction step that is skipped, or a branch taken the
+wrong way in `0x0076C534`'s tail — is the next step, and it is the one thing
+between here and the game reading its own data.
 
 (Ruled out: not a lifter boundary error. `0x0077A088` is a heuristic split of a
 larger function, but the fragment before it trampolines in with the same
-`ppu_context`, so r10/r11 carry across correctly.)
+`ppu_context`, so r10/r11 carry across. And the callees in those loops —
+`0x00779AF4`, `0x0077A4E0` — do save and restore r26, so the array pointer is
+not being clobbered by the recompilation.)
 
 ### Video modes
 
