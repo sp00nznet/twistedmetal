@@ -349,25 +349,41 @@ scheduler.m_workerLock     0x40001878
 between those two is exactly the wrapper it should occupy. And across all 38,
 **not one is in the worker region**.
 
-A store watch (`LBP_WW=0x400163A0 LBP_WW_LEN=0x200`) shows what does get
-written there, and by which guest function:
+A store watch (`LBP_WW=0x400163A0 LBP_WW_LEN=0x200`) shows what is written in
+that region and by which guest function:
 
 ```
 0x400163A4 <- 0x400164A0   fn 0x0076C3EC
-0x400163B4 <- 0x40016460   fn 0x0076C4E0     descriptor +0x04 = thread object
-0x400163B8 <- 0x40016408   fn 0x0076C4E0     descriptor +0x08 = cond object
-0x400163E4 <- 0x400164DC   fn 0x0076C3EC
+0x400163E4 <- 0x400164DC   fn 0x0076C3EC     (0x40 later — a 0x40-stride loop)
+0x400163B4 <- 0x40016460   fn 0x0076C4E0     +0x04 of 0x400163B0 = a Thread*
+0x400163B8 <- 0x40016408   fn 0x0076C4E0     +0x08 of 0x400163B0 = a Cond*
+0x40016420 <- "FIOS obj thrd"  fn 0x0077A4E0 (the Thread constructor)
 ```
 
-Three loops in the scheduler constructor's tail fill `+0x04` (the thread),
-`+0x08` (the cond) and `+0x34`. **Nothing ever writes `+0x00`** — which is the
-word the later indirect call dereferences, giving the `bctr to NULL` — and
-nothing constructs the mutex the descriptor is expected to carry.
+(Those writer addresses sit just before `0x0076C534`, which `post_lift.py`
+renamed — the host symbolizer resolves to the nearest preceding symbol, so they
+are inside the scheduler constructor.)
 
-So the worker descriptors are allocated raw and partly populated. Finding what
-should fill `+0x00` — a construction step that is skipped, or a branch taken the
-wrong way in `0x0076C534`'s tail — is the next step, and it is the one thing
-between here and the game reading its own data.
+Three loops populate a descriptor at `0x400163B0` with a `Thread*` at `+0x04`
+and a `Cond*` at `+0x08`, and the Thread and Cond objects themselves are
+properly constructed elsewhere. What is never written, anywhere in the run:
+
+* `0x400163B0 + 0x00` — the word the failing indirect call dereferences.
+* `0x400163C0 .. 0x400163D8` — the mutex `Mutex::lock` is called on and
+  reports invalid.
+
+So the sub-objects (Thread, Cond) are built and linked in, while the structure
+that owns them is left with a null head word and an unconstructed mutex.
+Identifying the construction step that should fill those two — and why it does
+not run — is the next move, and the one thing between here and the game reading
+its own data.
+
+Two honest limits on the above. The exact geometry of this structure is not
+pinned down: `0x400163B0`, `0x400163A0` and `0x400163F0` all receive writes on a
+0x40 grid and the region also holds the two condvars, so which address is the
+array base is inferred, not measured. And the thread names (`fios mediathread
+2`, `3`, then `5`, `6`, then `8`, `9`, `10` across three schedulers) follow a
+running counter with gaps, not an array index, so they do not settle it either.
 
 (Ruled out: not a lifter boundary error. `0x0077A088` is a heuristic split of a
 larger function, but the fragment before it trampolines in with the same
