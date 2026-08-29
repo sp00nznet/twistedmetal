@@ -1,5 +1,5 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 23e7f94..8e27930 100644
+index 23e7f94..83addba 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -566,9 +566,28 @@ static atomic_int s_gcm_pending = 0;
@@ -39,7 +39,35 @@ index 23e7f94..8e27930 100644
  static u32 s_fifo_getoff  = 0;
  static u32 s_fifo_calloff = 0;
  
-@@ -986,6 +1006,51 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+@@ -805,6 +825,27 @@ static void nv3089_blit(void)
+     int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
+     u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
+     u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
++    /* GCM_COMPOSITE_RT=1: if this blit lands in local memory (the display
++     * buffer) and its source is a surface the backend holds as a texture, hand
++     * the composite to the GPU. The loop below reads guest RAM, which the D3D12
++     * path never writes, so it can only ever copy zeros. */
++    { extern void rsx_d3d12_composite_from_offscreen(u32);
++      static int en = -1;
++      if (en < 0) { const char* e = getenv("GCM_COMPOSITE_RT");
++                    en = e ? (int)strtoul(e, NULL, 0) : 0; }
++      int to_display = 0;
++      if (dst_local) for (int _b = 0; _b < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; _b++) {
++          if (!s_display_buffer_set[_b]) continue;
++          u32 base = cellGcmResolveLocated(1, s_display_buffers[_b].offset);
++          u32 end  = base + s_display_buffers[_b].pitch * s_display_buffers[_b].height;
++          if (dst >= base && dst < end) { to_display = 1; break; }
++      }
++      if (en && to_display && s_nv3089.in_off) {
++          /* GCM_COMPOSITE_RT=<hex offset> forces a particular surface, which is
++           * how you find which one actually holds the finished image. */
++          rsx_d3d12_composite_from_offscreen(en > 1 ? (u32)en : s_nv3089.in_off);
++          return;
++      } }
+     u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
+     for (u32 y = 0; y < out_h; y++) {
+         u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
+@@ -986,6 +1027,51 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
                  "-- not taken, drain stops here\n", kind, target, word);
  }
  
@@ -91,7 +119,7 @@ index 23e7f94..8e27930 100644
  static void gcm_ref_push_at(u32 v, u32 getoff)
  {
      { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-@@ -1141,6 +1206,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1141,6 +1227,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
              break;
          }
          u32 w = vm_read32(ea);
@@ -101,7 +129,7 @@ index 23e7f94..8e27930 100644
          u32 type = w >> 29;
  
          if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
-@@ -1161,13 +1229,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1161,13 +1250,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
                if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                 s_fifo_getoff, w & 0x1FFFFFFCu, put); }
              { u32 tgt = w & 0x1FFFFFFCu;
@@ -133,7 +161,7 @@ index 23e7f94..8e27930 100644
                s_fifo_calloff = s_fifo_getoff + 4;
                s_fifo_getoff  = tgt; }
              continue;
-@@ -1200,6 +1284,44 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1200,6 +1305,44 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                    k << 2, hist[k], tot[k], 10);
                    }
                } }
@@ -178,7 +206,7 @@ index 23e7f94..8e27930 100644
              for (u32 i = 0; i < count; i++) {
                  u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                  if (!dea) break;
-@@ -1221,6 +1343,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1221,6 +1364,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
          s_fifo_getoff += 4;                    /* unknown word: skip */
      }
  
@@ -199,10 +227,25 @@ index 23e7f94..8e27930 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..91fa3f7 100644
+index 3a3e5db..ce6d88f 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
-@@ -3505,6 +3505,86 @@ static void screen_copy_capture(u32 fi)
+@@ -3215,6 +3215,14 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+     if (!w) w = s_d3d.width;
+     if (!h) h = s_d3d.height;
+     DXGI_FORMAT want_fmt = rsx_surface_dxgi(rsx_fmt);
++    /* RT_FORCE_RGBA8=1: allocate every offscreen target as R8G8B8A8 rather than
++     * its native format. A title whose final composite reads a half-float
++     * surface cannot be shown with a plain CopyTextureRegion, and giving it an
++     * 8-bit target costs HDR precision but makes the composite a same-format
++     * copy. A stopgap for looking at the frame, not a rendering fix. */
++    { static int f8 = -1;
++      if (f8 < 0) { const char* e = getenv("RT_FORCE_RGBA8"); f8 = e ? atoi(e) : 0; }
++      if (f8) want_fmt = DXGI_FORMAT_R8G8B8A8_UNORM; }
+     int slot = off_rt_find(off);
+     if (slot >= 0) {
+         OffRT* r = &s_d3d.off_rt[slot];
+@@ -3505,6 +3513,151 @@ static void screen_copy_capture(u32 fi)
  
  }
  
@@ -215,6 +258,71 @@ index 3a3e5db..91fa3f7 100644
 + * memory, and the swapchain shows only the clear. Copy it across.
 + *
 + * Off unless the offset and geometry are given, so nothing else changes. */
++/* GPU-side composite of an offscreen RT onto the backbuffer.
++ *
++ * A title that finishes its frame with the RSX 2D engine blits a rendered
++ * surface into the display buffer. That surface lives in guest RAM, which the
++ * D3D12 path never writes -- the scene is on the GPU -- so the CPU copy in
++ * nv3089_blit faithfully moves zeros. The backend already holds the same
++ * surface as a texture, so do the composite here instead. Triggered from
++ * cellGcmSys under GCM_COMPOSITE_RT. */
++static u32 s_composite_src = 0;
++
++void rsx_d3d12_composite_from_offscreen(u32 raw_off) { s_composite_src = raw_off; }
++
++static void composite_present(u32 fi)
++{
++    u32 want = s_composite_src;
++    s_composite_src = 0;
++    if (!want) return;
++    int i = off_rt_find(want);
++    if (i < 0 || !s_d3d.off_rt[i].res) return;
++    OffRT* r = &s_d3d.off_rt[i];
++    /* Same-format copy only; a half-float source would need a converting draw. */
++    if (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) {
++        static int w1 = 0;
++        if (w1++ < 2)
++            fprintf(stderr, "[COMPOSITE] RT 0x%08X is dxgi=%u, not R8G8B8A8 -- needs a draw%c",
++                    want, r->dxgi, 10);
++        return;
++    }
++    u32 cw = r->w < s_d3d.width  ? r->w : s_d3d.width;
++    u32 ch = r->h < s_d3d.height ? r->h : s_d3d.height;
++    if (!cw || !ch) return;
++    { static int n = 0;
++      if (n++ < 3) fprintf(stderr, "[COMPOSITE] RT 0x%08X %ux%u -> backbuffer%c",
++                           want, cw, ch, 10); }
++
++    D3D12_RESOURCE_BARRIER b[2] = {0};
++    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[0].Transition.pResource   = r->res;
++    b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[0].Transition.StateBefore = r->st;
++    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    b[1] = b[0];
++    b[1].Transition.pResource   = s_d3d.render_targets[fi];
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
++    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, b);
++
++    D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
++    dl.pResource = s_d3d.render_targets[fi];
++    dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
++    sl.pResource = r->res;
++    sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
++    D3D12_BOX box = {0};
++    box.left = 0; box.top = 0; box.front = 0;
++    box.right = cw; box.bottom = ch; box.back = 1;
++    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dl, 0, 0, 0, &sl, &box);
++
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    b[0].Transition.StateAfter  = r->st;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, b);
++}
++
++
 +static void guest_fb_present(u32 fi)
 +{
 +    static int inited = 0;
@@ -289,15 +397,16 @@ index 3a3e5db..91fa3f7 100644
  static void render_frame(void)
  {
      double _rf0 = perf_on() ? perf_now() : 0.0;
-@@ -4474,6 +4554,7 @@ static void render_frame(void)
+@@ -4474,6 +4627,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
 +    guest_fb_present(fi);
++    composite_present(fi);
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -6289,6 +6370,10 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6444,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -305,6 +414,7 @@ index 3a3e5db..91fa3f7 100644
 +    { static int gfb = -1;
 +      if (gfb < 0) { const char* e = getenv("GCM_GUEST_FB"); gfb = e ? 1 : 0; }
 +      if (gfb) has_display = 1; }
++    if (s_composite_src) has_display = 1;
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose

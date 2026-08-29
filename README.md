@@ -855,6 +855,32 @@ at the backbuffer (`RT_DISPLAY_BY_SIZE=1` at 1280x704) is not a shortcut either:
 four surfaces share those dimensions, so the render-to-texture chain collapses
 and the screen stays black.
 
+So the composite was built. `GCM_COMPOSITE_RT=1` makes `nv3089_blit` hand the
+job to the GPU when its destination lands inside a registered display buffer and
+its source is a surface the backend holds as a texture — a `CopyTextureRegion`
+from that render target onto the backbuffer, with `has_display` forced so the
+pass runs. `GCM_COMPOSITE_RT=<hex>` forces a particular source, and
+`RT_FORCE_RGBA8=1` allocates offscreen targets as 8-bit, because the title's
+real composite source is `dxgi=10` — `R16G16B16A16_FLOAT`, exactly as the
+10240-byte pitch over 1280 pixels predicted — and a same-format copy cannot
+read it otherwise.
+
+All of that works. It finds the right target, in the right format, and copies
+1280x704 onto the backbuffer every frame. **And every render target is empty.**
+Not the composite source, not the scene MRT target, not the post-process chain:
+
+```
+GCM_COMPOSITE_RT=0xAB0000  -> [COMPOSITE] RT 0x00AB0000 1280x704 -> backbuffer, 0.00%
+GCM_COMPOSITE_RT=0x1BE0000 -> [COMPOSITE] RT 0x01BE0000 1280x704 -> backbuffer, 0.00%
+```
+
+while `PERF` in the same runs reports 660k vertices, 6469 texture binds and 4362
+pipeline states with zero cache misses. So the draws are recorded, their shaders
+compile and their PSOs bind — and nothing they rasterise reaches the surface
+they target. That is the next layer down, and it is where this stops for now:
+the frame path is complete from the FIFO to the backbuffer, and the rasteriser
+in the middle of it is writing somewhere else.
+
 That is a piece of emulator-correctness work rather than another fix, and it is
 what stands between this port and a picture. The picture is in turn what the
 front end needs before its menu will take input: injected pad input
