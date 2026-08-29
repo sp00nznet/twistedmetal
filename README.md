@@ -1163,10 +1163,35 @@ because its *input* is black:
 [EMPTYSCAN] 0xC1800000..+1MB nonzero 0/1027
 ```
 
-The UI program samples render target `0x01870000`, and that surface is empty.
-This is a render-to-texture chain in which something upstream never receives
-content -- a shading-input problem, not a rasterisation failure. Everything
-below this heading was chasing the wrong thing.
+and following that to the end names the actual input. `DRAWARGS` now prints the
+texture each draw samples and whether it resolves to an offscreen target:
+
+```
+[DRAWARGS] verts=6 start=0 rt=3 rec=0x01BE0000 bound=0x01BE0000
+           tex0=0x02ACD800 texrt=-1 dvp=0,0 640x352
+```
+
+`texrt=-1` means it is not a render target at all -- it is an ordinary texture
+at local-memory offset `0x2ACD800`, uploaded from guest memory. And that is the
+same texture dumped near the top of this file with `TM_TEXDUMP`: **8.64%
+non-zero, two thin bands of noise on black.** A shader sampling a near-empty
+texture outputs near-black, which is exactly what lands.
+
+So the chain is complete and it is not a graphics-pipeline fault at all:
+
+1. the draws rasterise correctly into their 640x352 viewport;
+2. the fragment program samples the texture at local memory `0x2ACD800`;
+3. that texture is essentially empty;
+4. so the UI renders black, and the composite faithfully carries black to the
+   display buffer.
+
+The question that matters is therefore **why the texture at `0x2ACD800` is
+empty**, which is an asset-upload question, not a D3D12 one -- and it is next
+door to work this port already does: `ui.vram`, all 132 MB of it, inflates
+straight into local memory at `0xC321D800`-`0xC921D800`, well above this
+offset. Something fills `0x2ACD800` by another route and is not arriving.
+
+Everything below this heading was chasing the wrong layer.
 
 The list that was eliminated is still sound as far as it goes, each verified
 rather than assumed: FIFO walk and fences;
