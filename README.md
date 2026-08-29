@@ -706,10 +706,36 @@ waiting guest.
 
 Measured, honestly: `render_frame` goes from **0% of frame time to 95%** and the
 frame rate from 6.8 to 32 fps, so the backend is finally doing work every frame
-— and the screen is still black, with zero vertices. The drain still ends up
-parked in data rather than commands. So this is progress on the mechanism and
-not yet a picture; the remaining question is where the walker loses sync with
-the command stream.
+— and the screen is still black, with zero vertices.
+
+`GCM_RECDBG=1` now also records the last words the walker consumed and prints
+that decode chain when a branch goes bad, which answers where it loses sync.
+The answer is: it doesn't. The chain is correctly aligned for hundreds of
+commands — real NV4097 state, surface, viewport, transform — right up to
+
+```
+io=0F101F68 w=00040064  method=0x0064 count=1   SEMAPHORE_OFFSET
+io=0F101F70 w=0004006C  method=0x006C count=1   SEMAPHORE_RELEASE
+io=0F101F78 w=40000000  <- float 2.0f
+```
+
+`0x0F101F78` is exactly where the healthy trace had `JUMP -> 0F700100`. Every
+segment jump sits at a `0xF78` block boundary, and this one has been
+**overwritten with vertex data**. The title reused the block while the RSX was
+one command short of the jump out of it — a FIFO overrun, not a parser bug.
+
+That closes the loop with the timeout: `_jsGcmFifoFinish` waits, the wait fails,
+the title proceeds anyway after its 25,000 polls and writes over commands the
+walker has not reached. The semaphore trace shows the handshake it is waiting on:
+
+```
+[SEMA] m=0x64 v=0x00000010   OFFSET label 1
+[SEMA] m=0x68 v=0x00000000   ACQUIRE  wait for label 1 == 0
+[SEMA] m=0x64 v=0x00000400   OFFSET label 64
+[SEMA] m=0x6C v=0x00000001   RELEASE  label 64 = 1
+```
+
+So the next step is that handshake, not the command parser.
 
 ### Finding a message when the cross-reference cannot
 

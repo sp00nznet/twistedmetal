@@ -870,6 +870,13 @@ extern "C" void tm_fifowatch_tick(void)
         for (int i = 0; i < 6; i++) fprintf(stderr, " %08X", vm_read32(ea + i * 4));
     }
     last_get = get;
+    /* The title syncs on RSX labels (cellGcmGetLabelAddress). ps3recomp puts
+     * them at a fixed guest base, 16 bytes apart, so the ones the FIFO's
+     * SEMAPHORE_RELEASE writes are readable here. If these never move, the
+     * title's wait can never succeed however the FIFO behaves. */
+    fprintf(stderr, "  labels:");
+    for (int i = 0; i < 4; i++) fprintf(stderr, " %u", vm_read32(0x20000000u + i * 0x10u));
+    fprintf(stderr, " [64]=%u", vm_read32(0x20000000u + 64 * 0x10u));
     fprintf(stderr, "\n");
     fflush(stderr);
 }

@@ -1,5 +1,5 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 23e7f94..3bb1e65 100644
+index 23e7f94..42747f7 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -655,6 +655,7 @@ unsigned long long ps3_ms_now(void)
@@ -10,10 +10,60 @@ index 23e7f94..3bb1e65 100644
  static u32 s_fifo_getoff  = 0;
  static u32 s_fifo_calloff = 0;
  
-@@ -1162,6 +1163,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -986,6 +987,37 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+                 "-- not taken, drain stops here\n", kind, target, word);
+ }
+ 
++/* A bad branch nearly always means the walker mis-counted a method batch a few
++ * dwords back and is now reading vertex data -- a float 1.0f is 0x3F800000,
++ * which decodes as JUMP 0x1F800000. Dump the run-up: the command that consumed
++ * the wrong count is in here. */
++/* Last words the walker actually consumed, so a bad branch can show the decode
++ * chain that led there rather than raw memory around it. */
++#define GCM_TRACE_N 64
++static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
++static u32 s_tr_i = 0;
++
++static void gcm_fifo_dump_around(u32 getoff)
++{
++    static int d = 0;
++    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
++    for (u32 t = 0; t < GCM_TRACE_N; t++) {
++        u32 k = (s_tr_i + t) % GCM_TRACE_N;
++        if (!s_tr_w[k]) continue;
++        u32 w = s_tr_w[k];
++        fprintf(stderr, "[FIFOSTEP] io=%08X w=%08X  type=%u method=0x%04X count=%u\n",
++                s_tr_off[k], w, w >> 29, w & 0x1FFCu, (w >> 18) & 0x7FFu);
++    }
++    for (int k = -20; k <= 2; k++) {
++        u32 io = getoff + (u32)(k * 4);
++        u32 ea = gcm_io2ea(io);
++        if (!ea) continue;
++        fprintf(stderr, "[FIFODUMP] %+3d io=%08X w=%08X%s\n",
++                k, io, vm_read32(ea), k ? "" : "   <-- bad word");
++    }
++}
++
++
+ static void gcm_ref_push_at(u32 v, u32 getoff)
+ {
+     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
+@@ -1141,6 +1173,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             break;
+         }
+         u32 w = vm_read32(ea);
++        s_tr_off[s_tr_i % GCM_TRACE_N] = s_fifo_getoff;
++        s_tr_w[s_tr_i % GCM_TRACE_N] = w;
++        s_tr_i++;
+         u32 type = w >> 29;
+ 
+         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+@@ -1161,7 +1196,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
+               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                 s_fifo_getoff, w & 0x1FFFFFFCu, put); }
              { u32 tgt = w & 0x1FFFFFFCu;
-               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); break; }
+-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); break; }
++              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); break; }
 +              /* A JUMP to its own address is the "park the RSX here" idiom:
 +               * the title leaves it at the write head so the GPU stops if it
 +               * catches up, and overwrites it when the next segment is
@@ -25,7 +75,7 @@ index 23e7f94..3bb1e65 100644
                s_fifo_getoff = tgt; }
              continue;
          }
-@@ -1200,6 +1209,42 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1200,6 +1243,44 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                    k << 2, hist[k], tot[k], 10);
                    }
                } }
@@ -49,6 +99,8 @@ index 23e7f94..3bb1e65 100644
 +                    u32 m = (type == 0) ? method + i * 4 : method;
 +                    u32 v = vm_read32(dea);
 +                    u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
++                    { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
++                        fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
 +                    if (m == 0x64u)      s_sema_offset = v;
 +                    else if (m == 0x6Cu) vm_write32(la, v);
 +                    else if (m == 0x68u && vm_read32(la) != v) {
