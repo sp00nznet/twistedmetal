@@ -280,6 +280,7 @@ static void tm_game_log(ppu_context* ctx)
     tm_gstr((uint32_t)ctx->gpr[4], fmt, sizeof fmt);
 
     int argi = 5;                       /* r5..r10 hold the varargs */
+    int fargi = 1;                      /* f1..f13 hold varargs floats */
     /* TM_GAMELOG=2 prefixes each line with the guest address that logged it,
      * which is the only practical way to locate a message in a stripped
      * binary whose string references the static cross-reference misses. */
@@ -298,7 +299,11 @@ static void tm_game_log(ppu_context* ctx)
         case 'p': fprintf(stderr, "0x%08X", (uint32_t)a); break;
         case 'c': fprintf(stderr, "%c", (char)a); break;
         case 'e': case 'E': case 'f': case 'g': case 'G':
-            fprintf(stderr, "<float>"); break;   /* varargs floats are in f1.. */
+            /* A varargs float consumes its GPR slot *and* is passed in f1..f13,
+             * so the argi bump above is right and the value comes from the FPR.
+             * The Ui state machine timestamps every transition with %f, which is
+             * how long each legal screen has been up. */
+            fprintf(stderr, "%g", fargi <= 13 ? ctx->fpr[fargi++] : 0.0); break;
         case 'd': case 'i': fprintf(stderr, "%d", (int32_t)a); break;
         case 'u': fprintf(stderr, "%u", (uint32_t)a); break;
         case 'o': fprintf(stderr, "%o", (uint32_t)a); break;
@@ -333,6 +338,19 @@ void func_00980B20(ppu_context* ctx)
     if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
     if (on) tm_game_log(ctx);
     func_00980B20_lifted(ctx);
+}
+
+/* And a third, log(channel, fmt, ...), used by the Ui state machine -- the
+ * "!@#$%^&* UiLegal_N::onEnter() triggered at [%f]" line every legal screen
+ * prints comes through here, timestamp and all. */
+void func_004740EC_lifted(ppu_context* ctx);
+
+void func_004740EC(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_004740EC_lifted(ctx);
 }
 
 /* ---------------------------------------------------------------------------
@@ -546,8 +564,99 @@ void func_00474710(ppu_context* ctx) { tm_trace("UiLegal_3::onEnter", func_00474
 void func_00474A68(ppu_context* ctx) { tm_trace("UiLegal_4::onEnter", func_00474A68_lifted, ctx); }
 void func_00475150(ppu_context* ctx) { tm_trace("UiLegal_Health::onEnter", func_00475150_lifted, ctx); }
 void func_00475450(ppu_context* ctx) { tm_trace("UiLegal_ESRB::onEnter", func_00475450_lifted, ctx); }
+/* The Ui state machine itself: which state it enters, how often it ticks,
+ * and the timer each screen sets. Legal_4 enters and never leaves, and
+ * these say whether the driver stops calling it or the transition never
+ * fires. update() runs per frame, so it is verbose-only. */
+void func_005BA908_lifted(ppu_context* ctx);
+void func_005BB358_lifted(ppu_context* ctx);
+void func_005CAEA0_lifted(ppu_context* ctx);
+/* r4 is the state being entered. Most Ui classes are not in the trace table, so
+ * print the object's vtable and its first slots: matching a slot against a known
+ * onEnter (UiLegal_3's is 0x00474710) names the slot, and the same slot then
+ * names every other state the machine walks into -- including whatever it does
+ * instead of the intro movie. */
+void func_005BA908(ppu_context* ctx)
+{
+    if (tm_trace_on()) {
+        const uint32_t st = (uint32_t)ctx->gpr[4];
+        const uint32_t vt = st ? vm_read32(st) : 0;
+        fprintf(stderr, "[trace] UiState::enter state=0x%08X vtable=0x%08X [", st, vt);
+        for (uint32_t i = 0; i < 10 && vt; i++) fprintf(stderr, " %08X", vm_read32(vt + i * 4));
+        fprintf(stderr, " ]\n");
+    }
+    tm_trace("UiState::enter", func_005BA908_lifted, ctx);
+}
+void func_005BB358(ppu_context* ctx)
+{ static int n = 0;
+  if (tm_trace_on() && (n++ < 4 || tm_trace_verbose())) tm_trace("UiState::update", func_005BB358_lifted, ctx);
+  else func_005BB358_lifted(ctx); }
+void func_005CAEA0(ppu_context* ctx) { tm_trace("UiState::setTimer", func_005CAEA0_lifted, ctx); }
+/* The state the machine enters straight after UiLegal_4 and leaves again for
+ * the main menu. It calls into the 0x006Axxxx MoviePlayer, which is where
+ * the intro video lives -- so this is where the movie is meant to start
+ * and where it gives up. update() is per frame, so it is capped. */
+void func_004AA780_lifted(ppu_context* ctx);
+void func_004AAA98_lifted(ppu_context* ctx);
+void func_006AD8E8_lifted(ppu_context* ctx);
+void func_006ADA38_lifted(ppu_context* ctx);
+void func_004B6270_lifted(ppu_context* ctx);
+void func_004B6580_lifted(ppu_context* ctx);
+/* IntroMovie::onEnter guards the movie on three reads before it will start one:
+ *
+ *     p = *(u32*)0x00F42288;        if (!p) skip
+ *     q = *(u32*)(p + 0x3AB8);      if (!q) skip
+ *     b = *(u8 *)0x0120AC25;        if (!b) skip
+ *
+ * It takes the skip branch and falls straight through to the main menu, so
+ * printing all three says which one is zero. */
+void func_004AA780(ppu_context* ctx)
+{
+    const uint32_t p = vm_read32(0x00F42288u);
+    const uint32_t q = p ? vm_read32(p + 0x3AB8) : 0;
+    const uint32_t b = vm_read8(0x0120AC25u);
+    fprintf(stderr, "[intro] guards: [0x00F42288]=0x%08X  +0x3AB8=0x%08X  "
+                    "[0x0120AC25]=%u  -> %s\n", p, q, b,
+            (p && q && b) ? "plays" : "SKIPPED");
+    fflush(stderr);
+    tm_trace("IntroMovie::onEnter", func_004AA780_lifted, ctx);
+}
+void func_004AAA98(ppu_context* ctx)
+{ static int n = 0;
+  if (tm_trace_on() && (n++ < 6 || tm_trace_verbose())) tm_trace("IntroMovie::update", func_004AAA98_lifted, ctx);
+  else func_004AAA98_lifted(ctx); }
+void func_006AD8E8(ppu_context* ctx) { tm_trace("MoviePlayer::a", func_006AD8E8_lifted, ctx); }
+void func_006ADA38(ppu_context* ctx) { tm_trace("MoviePlayer::b", func_006ADA38_lifted, ctx); }
+/* The last call IntroMovie::onEnter makes, with two heap pointers that look
+ * like strings -- if this is "play this movie", they name it. */
+void func_004B6270(ppu_context* ctx)
+{
+    if (tm_trace_on()) {
+        char a[128], b[128];
+        fprintf(stderr, "[trace] Movie::c('%s', '%s') from 0x%08X\n",
+                tm_gstr((uint32_t)ctx->gpr[4], a, sizeof a),
+                tm_gstr((uint32_t)ctx->gpr[5], b, sizeof b), (uint32_t)ctx->lr - 4);
+    }
+    tm_trace("Movie::c", func_004B6270_lifted, ctx);
+}
+void func_004B6580(ppu_context* ctx) { tm_trace("Movie::d", func_004B6580_lifted, ctx); }
+
+
 
 void func_006AC648(ppu_context* ctx) { tm_trace("MoviePlayer::openFile", func_006AC648_lifted, ctx); }
+/* The chain that would actually play an intro: the ArchiveLoader building the
+ * movies path from "%smovies", the attract script, the id->filename table
+ * holding c1.avi/ep_1.avi/..., and the one caller of MoviePlayer::openFile.
+ * Whichever of these never runs is where the intro is lost. */
+void func_0036255C_lifted(ppu_context* ctx);
+void func_000120C4_lifted(ppu_context* ctx);
+void func_00059F6C_lifted(ppu_context* ctx);
+void func_001DB604_lifted(ppu_context* ctx);
+void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", func_0036255C_lifted, ctx); }
+void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
+void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
+void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
+
 void func_0014BCA8_lifted(ppu_context* ctx);
 void func_0020C698_lifted(ppu_context* ctx);
 void func_0014BCA8(ppu_context* ctx) { tm_trace("boot::seq", func_0014BCA8_lifted, ctx); }

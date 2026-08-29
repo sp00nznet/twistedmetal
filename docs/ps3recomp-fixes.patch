@@ -1,8 +1,37 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 23e7f94..42747f7 100644
+index 23e7f94..8e27930 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -655,6 +655,7 @@ unsigned long long ps3_ms_now(void)
+@@ -566,9 +566,28 @@ static atomic_int s_gcm_pending = 0;
+ 
+ /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
+  * and mark a vblank+flip tick pending for the main thread to deliver. */
++static u32 s_fifo_getoff;   /* tentative: defined below */
++
+ void cellGcm_request_tick(void)
+ {
+     s_vblank_count++;
++    /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
++     * actually consumed up to `put`.
++     *
++     * A title's fifo-finish can use flip status as a fast path -- Twisted
++     * Metal's reads it first and, if the flip is done, skips waiting for `get`
++     * entirely. Completing a flip on the 60 Hz beat regardless of FIFO
++     * progress therefore tells it the RSX has caught up when it has not, and
++     * it recycles a FIFO block the walker is still inside, overwriting the
++     * JUMP out of it. Off by default: a title whose FIFO never drains would
++     * stop flipping entirely. */
++    { static int need = -1;
++      if (need < 0) { const char* e = getenv("GCM_FLIP_NEEDS_FIFO"); need = e ? atoi(e) : 0; }
++      if (need) {
++          u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
++          GCM_PENDING_SET(s_fifo_getoff == put ? 3 : 1);
++          return;
++      } }
+     GCM_PENDING_SET(3);
+ }
+ 
+@@ -655,6 +674,7 @@ unsigned long long ps3_ms_now(void)
  #endif
  }
  
@@ -10,7 +39,7 @@ index 23e7f94..42747f7 100644
  static u32 s_fifo_getoff  = 0;
  static u32 s_fifo_calloff = 0;
  
-@@ -986,6 +987,37 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+@@ -986,6 +1006,51 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
                  "-- not taken, drain stops here\n", kind, target, word);
  }
  
@@ -23,6 +52,20 @@ index 23e7f94..42747f7 100644
 +#define GCM_TRACE_N 64
 +static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
 +static u32 s_tr_i = 0;
++
++/* A branch we cannot take leaves the walker pointing at whatever it
++ * mis-decoded, and it never recovers -- get freezes for the rest of the
++ * run and nothing renders. Resynchronise to `put` instead, the same trade
++ * the unmapped-get path already makes: the commands between here and put
++ * are lost, but the next frame is written from a clean boundary and the
++ * FIFO lives. */
++static void gcm_fifo_resync(u32* getoff, u32 put)
++{
++    static int n = 0;
++    if (n++ < 8)
++        fprintf(stderr, "[cellGcmSys] FIFO resync 0x%08X -> put 0x%08X\n", *getoff, put);
++    *getoff = put;
++}
 +
 +static void gcm_fifo_dump_around(u32 getoff)
 +{
@@ -48,7 +91,7 @@ index 23e7f94..42747f7 100644
  static void gcm_ref_push_at(u32 v, u32 getoff)
  {
      { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-@@ -1141,6 +1173,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1141,6 +1206,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
              break;
          }
          u32 w = vm_read32(ea);
@@ -58,12 +101,12 @@ index 23e7f94..42747f7 100644
          u32 type = w >> 29;
  
          if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
-@@ -1161,7 +1196,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1161,13 +1229,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
                if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                 s_fifo_getoff, w & 0x1FFFFFFCu, put); }
              { u32 tgt = w & 0x1FFFFFFCu;
 -              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); break; }
-+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); break; }
++              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync(&s_fifo_getoff, put); break; }
 +              /* A JUMP to its own address is the "park the RSX here" idiom:
 +               * the title leaves it at the write head so the GPU stops if it
 +               * catches up, and overwrites it when the next segment is
@@ -71,11 +114,26 @@ index 23e7f94..42747f7 100644
 +               * times in one Twisted Metal run, which is the drain burning the
 +               * CPU the guest needs. Stop this pass instead; the next one
 +               * re-reads the word, so a patched jump is still followed. */
-+              if (tgt == s_fifo_getoff) break;
++              if (tgt == s_fifo_getoff) {
++                  /* Parked. If the title has meanwhile moved `put` somewhere
++                   * else, it has switched to its other segment and left this
++                   * park standing -- it only patches a park when it reuses that
++                   * block. Waiting for a patch that will not come freezes the
++                   * FIFO for the rest of the run, so follow the write head. */
++                  if (put != s_fifo_getoff) { gcm_fifo_resync(&s_fifo_getoff, put); }
++                  break;
++              }
                s_fifo_getoff = tgt; }
              continue;
          }
-@@ -1200,6 +1243,44 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+             { u32 tgt = w & 0x1FFFFFFCu;
+-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); break; }
++              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync(&s_fifo_getoff, put); break; }
+               s_fifo_calloff = s_fifo_getoff + 4;
+               s_fifo_getoff  = tgt; }
+             continue;
+@@ -1200,6 +1284,44 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                    k << 2, hist[k], tot[k], 10);
                    }
                } }
@@ -120,6 +178,26 @@ index 23e7f94..42747f7 100644
              for (u32 i = 0; i < count; i++) {
                  u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                  if (!dea) break;
+@@ -1221,6 +1343,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         s_fifo_getoff += 4;                    /* unknown word: skip */
+     }
+ 
++    /* Walker watchdog. Everything above recovers from a *recognised* stall --
++     * a branch we cannot take, a park the title abandoned. A walker that stops
++     * for any other reason simply freezes `get` for the rest of the run and
++     * nothing renders again, and which of those happens is a race, so the same
++     * boot renders one time in five. If `get` has not moved across several
++     * passes while `put` is somewhere else, there is work the walker will
++     * never reach: resynchronise to the write head. Same trade as the
++     * unmapped-get path -- commands are lost, the FIFO lives. */
++    { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
++      if (s_fifo_getoff == last && s_fifo_getoff != put) {
++          if (++stuck >= 8) { gcm_fifo_resync(&s_fifo_getoff, put); stuck = 0; }
++      } else { stuck = 0; last = s_fifo_getoff; } }
++
+     /* Publish progress: get chases put; ref advances at most ONE queued fence
+      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+      * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index 886fbc7..976a05b 100644
 --- a/runtime/ppu/ppu_fs.cpp

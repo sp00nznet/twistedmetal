@@ -746,6 +746,45 @@ changes nothing: the desync still happens, still at a block-end jump, still with
 zero vertices. The title is not inferring from flip status, so that patch was
 taken back out rather than left as a knob that does nothing.
 
+### Getting the walker unstuck, and the first real geometry
+
+The overrun above leaves the walker pointing at whatever it mis-decoded, and
+nothing brings it back — `get` freezes for the rest of the run. Three recoveries
+in `docs/ps3recomp-fixes.patch` fix that, in increasing order of generality:
+
+- a branch whose target has no IO mapping **resyncs to `put`** instead of
+  stopping, the same trade the unmapped-`get` path already makes;
+- a park (`JUMP` to its own address) whose block the title has since abandoned —
+  `put` is elsewhere — **follows the write head**, because the title only ever
+  patches a park when it reuses that block;
+- and a **watchdog**: if `get` has not moved across several passes while `put` is
+  somewhere else, resync. The first two handle stalls we recognise; this one
+  catches the rest, and it is what makes the result repeatable. Without it the
+  same boot rendered about one run in five.
+
+With those, the FIFO stays live — `get == put`, `ref` publishing, and the
+semaphore label the title waits on finally moving:
+
+```
+[fifo] put=0x0F105694 get=0x0F105694 ref=0x80000000  labels: [64]=1
+```
+
+and the renderer receives real work for the first time:
+
+```
+[PERF] tex 6469 calls | vtx 660k verts | pso 4362 calls | render_frame ...
+```
+
+660,000 vertices per 20 frames, 6,469 texture binds, 4,362 pipeline states, and
+seven offscreen render targets including the half-res post-processing chain —
+against zero for all of them before. The title is drawing its main menu.
+
+The screen is still black. The scene renders into those offscreen targets and
+the composite to the 720x480 display buffer never lands: no `NV3089` blit is
+issued at all in this state, and `RTT_SAVERT` on the 1280x704 colour targets
+comes back empty, so the geometry is going somewhere that ends up cleared. That
+composite is the remaining step between this port and a picture.
+
 ### Finding a message when the cross-reference cannot
 
 Almost none of this was reachable by reading the lifted C++. String addresses in

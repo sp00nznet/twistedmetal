@@ -24,6 +24,7 @@ import sys
 OVERRIDES = {
     '0034ACAC': "the title's log(level, fmt, ...)",
     '00980B20': "the title's second log(level, fmt, ...) -- FIOS, ArchiveLoader, WorldLoader",
+    '004740EC': "the title's third log(channel, fmt, ...) -- the Ui state machine",
 }
 
 # Guest functions to WRAP rather than replace: the lifted body is renamed the
@@ -57,7 +58,20 @@ TRACE = {
     '00474A68': 'UiLegal_4::onEnter',
     '00475150': 'UiLegal_Health::onEnter',
     '00475450': 'UiLegal_ESRB::onEnter',
+    '005BA908': 'UiState::enter',
+    '005BB358': 'UiState::update',
+    '005CAEA0': 'UiState::setTimer',
+    '004AA780': 'IntroMovie::onEnter',
+    '004AAA98': 'IntroMovie::update',
+    '006AD8E8': 'MoviePlayer::a',
+    '006ADA38': 'MoviePlayer::b',
+    '004B6270': 'Movie::c',
+    '004B6580': 'Movie::d',
     '006AC648': 'MoviePlayer::openFile',
+    '0036255C': 'ArchiveLoader::moviesPath',
+    '000120C4': 'attractScript',
+    '00059F6C': 'movieNameForId',
+    '001DB604': 'playMovieFile',
     '0014BCA8': 'boot::seq',
     '0020C698': 'WorldLoader::setup',
     '00360B90': 'AL::b90',
