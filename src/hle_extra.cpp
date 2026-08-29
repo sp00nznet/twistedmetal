@@ -86,6 +86,7 @@ static void cellGcmMapEaIoAddressWithFlags(ppu_context* ctx)
 
 static void sys_lwcond_create(ppu_context* ctx);
 static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx);
+static uint64_t g_edge_bytes;    /* total inflated, for progress */
 static uint32_t g_edge_dst;      /* where the inflated contents.dat landed */
 static uint32_t g_tasksets[8];    /* every taskset the title creates */
 static int      g_ntasksets;
@@ -444,6 +445,15 @@ static int tm_trace_on(void)
     return on;
 }
 
+/* TM_TRACE=2 adds the FIOS mutex/ctor chatter, which is thousands of lines per
+ * second and buries the handful of calls that say where the boot actually is. */
+static int tm_trace_verbose(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("TM_TRACE"); v = e ? atoi(e) : 0; }
+    return v >= 2;
+}
+
 static void tm_trace(const char* name, void (*body)(ppu_context*), ppu_context* ctx)
 {
     if (!tm_trace_on()) { body(ctx); return; }
@@ -466,13 +476,14 @@ static void tm_trace(const char* name, void (*body)(ppu_context*), ppu_context* 
 void func_00779C18(ppu_context* ctx)
 {
     char nm[64];
-    if (tm_trace_on())
+    if (tm_trace_verbose())
         fprintf(stderr, "[trace] Mutex::ctor(this=0x%08X, name='%s')\n",
                 (uint32_t)ctx->gpr[3], tm_gstr((uint32_t)ctx->gpr[4], nm, sizeof nm));
     func_00779C18_lifted(ctx);
 }
 void func_0076CB00(ppu_context* ctx) { tm_trace("fiosWorkerSetup", func_0076CB00_lifted, ctx); }
-void func_0076756C(ppu_context* ctx) { tm_trace("elemCtor?", func_0076756C_lifted, ctx); }
+void func_0076756C(ppu_context* ctx)
+{ if (tm_trace_verbose()) tm_trace("elemCtor?", func_0076756C_lifted, ctx); else func_0076756C_lifted(ctx); }
 
 /* The FIOS base constructor: it stamps "FIOS obj ...." on every object the
  * engine builds, so tracing it enumerates exactly what does get constructed. */
@@ -489,7 +500,8 @@ void func_007556B4(ppu_context* ctx)
 }
 void func_0076C534(ppu_context* ctx) { tm_trace("fiosSchedCtor", func_0076C534_lifted, ctx); }
 void func_0076CDF4(ppu_context* ctx) { tm_trace("createSchedForMedia", func_0076CDF4_lifted, ctx); }
-void func_0077A088(ppu_context* ctx) { tm_trace("Mutex::lock", func_0077A088_lifted, ctx); }
+void func_0077A088(ppu_context* ctx)
+{ if (tm_trace_verbose()) tm_trace("Mutex::lock", func_0077A088_lifted, ctx); else func_0077A088_lifted(ctx); }
 void func_00671698(ppu_context* ctx) { tm_trace("renderInit", func_00671698_lifted, ctx); }
 
 /* Front-end path: does the title reach the UI load, the legal screens and the
@@ -547,7 +559,17 @@ void func_00360E84(ppu_context* ctx) { tm_trace("AL::e84", func_00360E84_lifted,
 void func_00360EBC(ppu_context* ctx) { tm_trace("AL::ebc", func_00360EBC_lifted, ctx); }
 void func_00360F68(ppu_context* ctx) { tm_trace("AL::f68", func_00360F68_lifted, ctx); }
 void func_00360F88(ppu_context* ctx) { tm_trace("AL::f88", func_00360F88_lifted, ctx); }
-void func_0064BA08(ppu_context* ctx) { tm_trace("updateLoadBar::frame", func_0064BA08_lifted, ctx); }
+void func_0064BA08(ppu_context* ctx)
+{ if (tm_trace_verbose()) tm_trace("updateLoadBar::frame", func_0064BA08_lifted, ctx); else func_0064BA08_lifted(ctx); }
+
+/* The two writers of the load-complete byte at 0x0190FC89. The boot sequence
+ * and the loading-screen thread both spin until one of them runs, so knowing
+ * whether either is ever reached separates "the load is unfinished" from "the
+ * load finished and nobody said so". */
+void func_0064C410_lifted(ppu_context* ctx);
+void func_0010E57C_lifted(ppu_context* ctx);
+void func_0064C410(ppu_context* ctx) { tm_trace("loadBar::finish", func_0064C410_lifted, ctx); }
+void func_0010E57C(ppu_context* ctx) { tm_trace("setLoadDone", func_0010E57C_lifted, ctx); }
 void func_0036204C(ppu_context* ctx) { tm_trace("AL::204c", func_0036204C_lifted, ctx); }
 
 
@@ -886,8 +908,26 @@ void func_0099790C(ppu_context* ctx)
          * Inflate to the host first so the source survives being overwritten. */
         const uint32_t inplace = vm_read32(req + REQ_BUF);
         if (src && srclen && dstlen && vm_base && (inplace || dst)) {
+            /* Attribute the load time: how much of the wall clock between two
+             * requests is actually spent inflating, and how much is the title
+             * getting back here. A full archive is ~2900 blocks, so a hundred
+             * milliseconds of round trip per block is ten minutes of loading. */
+            using clk = std::chrono::steady_clock;
+            static clk::time_point last;
+            static double gap_ms = 0, work_ms = 0;
+            const clk::time_point t0 = clk::now();
+            if (last.time_since_epoch().count())
+                gap_ms += std::chrono::duration<double, std::milli>(t0 - last).count();
+
             uint8_t* tmp = (uint8_t*)malloc(dstlen);
             int n = tmp ? tm_inflate(tmp, dstlen, vm_base + src, srclen) : -1;
+            work_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            last = clk::now();
+            { static long long m = 0;
+              if (++m % 512 == 0)
+                  fprintf(stderr, "[edge] %lld blocks: %.1f ms/block round trip, "
+                                  "%.2f ms/block inflating (%.0f%%)\n",
+                          m, gap_ms / m, work_ms / m, 100.0 * work_ms / (gap_ms ? gap_ms : 1)); }
             if (n >= 0) {
                 if (inplace) memcpy(vm_base + inplace, tmp, (size_t)n);
                 else         memcpy(vm_base + dst,     tmp, (size_t)n);
@@ -897,10 +937,14 @@ void func_0099790C(ppu_context* ctx)
             if (n >= 0) {
                 g_edge_dst = inplace ? inplace : dst;
                 vm_write32(req + REQ_BUSY, 0);   /* the wait loop polls this */
-                if (done++ < 8)
+                g_edge_bytes += (uint64_t)n;
+                /* A full archive load is thousands of 64K blocks; report
+                 * progress periodically rather than capping and going quiet. */
+                if (done++ < 4 || (done % 512) == 0)
                     fprintf(stderr, "[edge] inflated request 0x%08X: %u -> %d bytes "
-                                    "(src 0x%08X -> dst 0x%08X)\n",
-                            req, srclen, n, src, inplace ? inplace : dst);
+                                    "(src 0x%08X -> dst 0x%08X) [#%lld, %llu MB total]\n",
+                            req, srclen, n, src, inplace ? inplace : dst,
+                            done, (unsigned long long)(g_edge_bytes >> 20));
                 /* Fall through to the lifted body rather than returning: with the
                  * busy flag already clear it skips the event-flag wait but still
                  * runs the post-processing after it, which the caller depends on. */

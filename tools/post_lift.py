@@ -61,6 +61,8 @@ TRACE = {
     '00360F68': 'AL::f68',
     '00360F88': 'AL::f88',
     '0064BA08': 'updateLoadBar::frame',
+    '0064C410': 'loadBar::finish -- sets the load-complete byte',
+    '0010E57C': 'setLoadDone -- the other writer of that byte',
     '0036204C': 'AL::204c',
 }
 

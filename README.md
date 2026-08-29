@@ -40,7 +40,8 @@ load bar is up, and the load has not finished.
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
 | Boot | **reaches the UI load** — 186 files opened, audio middleware up |
-| Asset decompression | **works on the host** — `src/tm_inflate.cpp`, no zlib dependency |
+| Asset decompression | **works on the host** — 192 MB, ~1.8 ms per 64 KB block |
+| Front end | **starts** — Scaleform UI loads, `UiLegal_1::onEnter` reached |
 | Graphics (RSX → D3D12) | **presents** — clear reaches the swapchain; title draws a black fade |
 | Audio / input | **audio initialises** — BoomRangBuss 1.0.33, banks load; input not started |
 
