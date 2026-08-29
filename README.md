@@ -958,8 +958,19 @@ readback is sound — `CLEAR_RGB` comes back as a uniform `(204,102,51)` there �
 so the instrument is trustworthy and the offscreen target genuinely is not being
 written.
 
-That is where this pass stops. It is open-ended work inside ps3recomp's D3D12
-backend rather than another fix here, and every probe costs a four-minute boot.
+One more check closes the loop: the D3D12 debug layer is genuinely on
+(`D3D12_DBG=1` prints "Debug layer enabled") and reports **nothing**. So every
+barrier, descriptor and PSO/RTV format pairing is valid by D3D12's own
+validation, while the target it all points at stays empty.
+
+That combination — valid bindings, executed draws, unwritten target — is past
+what inference can settle from logs, and it is where this pass stops. The right
+next tool is a frame capture: PIX or RenderDoc on a single frame will show in
+seconds whether the draws reach that render target, which descriptor is actually
+bound and what the output merger does with the result. Everything above narrows
+where to look in that capture; the following are known-good and can be skipped:
+the FIFO walk, the vertex fetch, `is_vp` gating, the colour mask, depth, cull,
+alpha test, the RTV heap size and indexing, and the backbuffer readback.
 
 That is a piece of emulator-correctness work rather than another fix, and it is
 what stands between this port and a picture. The picture is in turn what the
