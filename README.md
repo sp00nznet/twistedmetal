@@ -36,7 +36,7 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **runs to a clean exit** — blocked: FIOS opens no files |
+| Boot | **reads its own data** — blocked on short reads past 32 KB |
 | Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
@@ -320,107 +320,71 @@ And it is failing because **no file is ever opened**. With the runtime's
 filesystem tracing on, a whole boot logs zero opens, reads or seeks. The
 renderer fails because its first font load gets nothing back.
 
-### The actual blocker: FIOS workers are allocated but never constructed
+### The actual blocker was a lifter boundary bug
 
-FIOS creates a scheduler, spawns its media threads, hits
+FIOS allocated its worker objects, spawned threads on them and then locked an
+unconstructed mutex and called through a null vtable. A census of the FIOS base
+constructor (guest `0x007556B4`, which every FIOS object goes through) showed
+**278** objects built over a boot — the scheduler complete with all eleven named
+sub-objects, both worker condvars, both worker threads — and **not one** of them
+a worker. A store watch confirmed it from the other side: the worker block is
+memset at allocation and then receives only `+0x04` (its `Thread*`), `+0x08`
+(its `Cond*`) and `+0x34`.
 
-```
-attempt to lock invalid mutex '(null)'
-[ppu] bctr to NULL ... r12(opd)=0x00000000 (r3=0x400163B0 ...)
-```
+The cause turned out to be in the recompilation, not the HLE.
+`find_functions` ended `func_0076C534` at `0x0076CAFC`, but the real function
+runs to `0x0076CDF4` — 760 bytes, about 190 instructions, covered by no
+detected function. The lifter emitted the branch targets inside that gap as
+separate fragments, and every one of them ends in a trampoline **except**
+`0x0076CB00`, whose loop falls off the end of the emitted function:
 
-and tears the scheduler down again — three times over, never servicing a read.
-
-Every FIOS object is built through one base constructor, guest `0x007556B4`,
-which takes the object and its name. Tracing it enumerates exactly what the
-engine constructs — **278** objects over a boot. The scheduler comes out fully
-built:
-
-```
-0x40001700 scheduler.m_objectLock      0x400017D0 scheduler.m_ioLock
-0x40001728 scheduler.m_opLock          0x400017F8 scheduler.m_ioCond
-0x40001750 scheduler.m_opCallbackLock  0x40001810 scheduler.m_idleCond
-0x40001768 scheduler.m_completedLock   0x40001828 scheduler.m_fhLock
-0x40001790 "fios scheduler"            0x40001878 scheduler.m_workerLock
-```
-
-(An earlier version of this file claimed `scheduler.m_opCallbackLock` was never
-constructed. That was wrong — it was an artifact of tracing only the `Mutex`
-constructor `0x00779C18`, which that lock does not go through. It is built, at
-`0x40001750`.)
-
-In the worker region the same trace shows the sub-objects constructed and the
-owners not:
-
-```
-0x400163F0  cond[0]     constructed
-0x40016408  cond[1]     constructed
-0x40016420  thread[0]   constructed
-0x40016460  thread[1]   constructed
-0x40016370  worker[0]   never
-0x400163B0  worker[1]   never
+```c
+        if (((ctx->cr >> 0) & 4)) goto loc_0076CB54;
+}                                    /* <- no fall-through to 0x0076CBB4 */
 ```
 
-Not one of the 278 base constructions targets `0x40016370` or `0x400163B0`.
+So when that loop finished, control returned to the caller instead of
+continuing into the rest of the FIOS scheduler constructor — which is where the
+workers are built — and callee-saved registers were left holding loop values.
+The caller then took a loop pointer for its object, locked a mutex that had
+never been constructed, and called through a zero vtable. Every symptom traced
+over the previous several passes was downstream of that one missing edge.
 
-The region's layout is measured rather than guessed: the allocation's own
-zeroing (`fn 0x0097422C`, a w1/w2/w4 burst at `0x40016370`) marks the base, and
-the two `+0x34` stores 0x40 apart fix the stride.
+`tools/post_lift.py` restores it (`FALLTHROUGH`, idempotent):
 
-```
-0x40016370  worker[0]   0x40 bytes
-0x400163B0  worker[1]   0x40 bytes
-0x400163F0  cond[0]     0x18        <- base + 2*0x40, exactly where
-0x40016408  cond[1]     0x18           count*0x40 + count*0x18 puts them
-0x40016420  thread[0]   0x40        <- separate allocation
-0x40016460  thread[1]   0x40
-```
+| | before | after |
+|---|---|---|
+| `attempt to lock invalid mutex` | 6 | **0** |
+| `bctr to NULL` | 3 | **0** |
+| file opens | 0 | **real** |
+| log lines | ~300 | 16,716 |
 
-Two workers, and the whole block is memset to zero at allocation. Across the
-run each worker then receives exactly three stores — `+0x04` its `Thread*`,
-`+0x08` its `Cond*`, `+0x34` a pointer — while the Thread and Cond objects
-themselves are fully constructed by `0x0077A4E0` and `0x00779AF4`.
-
-The failing accesses are both on `worker[1]`: the null indirect call reads
-`0x400163B0 + 0x00`, and `Mutex::lock` is called on `0x400163B0 + 0x10` and
-reports it invalid. Neither offset is ever written by anything, so both are
-still the allocator's zeroes. The engine builds a worker's sub-objects and links
-them in, but never constructs the worker itself.
-
-That they are unconstructed — rather than the wrong objects being addressed —
-is settled by a detail of the watch. Every FIOS object this engine builds gets
-an ASCII tag written by its constructor: `"FIOS"`, `"obj "`, then a four-byte
-type code. A Cond carries it at `+0x08` (after its 8-byte `sys_lwcond_t`), a
-Thread at `+0x00`:
+The game now reads its own data:
 
 ```
-0x400163F0 <- "FIOS" "obj " "cond"   fn 0x00779AF4   cond[0]
-0x40016420 <- "FIOS" "obj " "thrd"   fn 0x0077A4E0   thread[0]
-0x40016370 <-  nothing                               worker[0]
-0x400163B0 <-  nothing                               worker[1]
+[fs] open '/dev_bdvd/PS3_GAME/USRDIR/globals/rt/fonts/debugfont.fnt' -> fd 3
+[fs] read fd=3 nbytes=32768 -> 32768 (magic=464F4E54 "FONT")
+[fs] open '/dev_bdvd/PS3_GAME/USRDIR/globals/rt/textures/specials.rtt' -> fd 3
+GameContent::initConfigDocA(tmxconfig.sdat)
 ```
 
-The two workers never receive a tag, so they are genuinely unbuilt FIOS objects,
-not correctly-built objects being addressed at the wrong offset.
+The proper fix belongs upstream in `find_functions`' boundary detection; the
+post-lift edge keeps it in this repo for now. It is also worth auditing the
+other 35,635 lifted functions for the same shape — a fragment whose last
+statement is a conditional branch, with no terminator.
 
-The obvious candidate for their constructor is ruled out too. `0x0076C534`'s
-first allocate-then-construct block has exactly the right shape —
-`func_0076756C` followed by `vm_write32(r26 + 0x0, r9)`, copying a vtable
-pointer out of a template — but tracing `func_0076756C` shows it is only ever
-called on a 232-byte stride (`0x40008C68`, `0x40008B80`, …, 0xE8 apart) and
-returns `this`. It serves a different array and is never applied to the 0x40
-workers. So this is not a constructor being branch-skipped; there is no worker
-constructor call in the path at all.
+### Where it stops now
 
-What remains is to find the constructor that writes the `"FIOS obj ...."` tag
-for a worker — the same base constructor the Cond and Thread paths reach — and
-work out why the scheduler's worker loop never calls it.
+Two new and specific problems, both in the runtime's filesystem layer:
 
-(Ruled out: not a lifter boundary error. `0x0077A088` is a heuristic split of a
-larger function, but the fragment before it trampolines in with the same
-`ppu_context`, so r10/r11 carry across. And the callees in those loops —
-`0x00779AF4`, `0x0077A4E0` — do save and restore r26, so the array pointer is
-not being clobbered by the recompilation.)
+* **Short reads.** `read fd=3 nbytes=32768 -> 0` at offset 32768 of a
+  175,248-byte file. Anything past the first 32 KB comes back empty, and the
+  game's own diagnostic says so: *"Short read at offset 32768 … Possible
+  reasons include disc eject"*, then it retries.
+* **`tmxconfig.sdat`** — `SdataOpen … NPD decrypt FAILED (unsupported
+  EDAT/needs license); returning success without a handle`. The title's config
+  document is an EDAT the runtime cannot decrypt, and the caller is handed a
+  success with nothing behind it.
 
 ### Video modes
 

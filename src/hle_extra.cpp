@@ -409,7 +409,10 @@ static void tm_trace(const char* name, void (*body)(ppu_context*), ppu_context* 
     static int depth = 0;
     const uint32_t a3 = (uint32_t)ctx->gpr[3], a4 = (uint32_t)ctx->gpr[4],
                    a5 = (uint32_t)ctx->gpr[5];
-    fprintf(stderr, "[trace]%*s-> %s(0x%08X, 0x%08X, 0x%08X)\n", depth * 2, "", name, a3, a4, a5);
+    /* The lifter sets ctx->lr to the guest return address before every call,
+     * so lr-4 names the exact guest instruction that called this. */
+    fprintf(stderr, "[trace]%*s-> %s(0x%08X, 0x%08X, 0x%08X) from 0x%08X\n",
+            depth * 2, "", name, a3, a4, a5, (uint32_t)ctx->lr - 4);
     depth++;
     body(ctx);
     depth--;

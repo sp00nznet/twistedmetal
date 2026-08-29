@@ -44,6 +44,18 @@ TRACE = {
     '007556B4': 'fios object base ctor (writes the "FIOS obj ...." tag)',
 }
 
+# Guest fragments the lifter emitted without a fall-through edge, mapped to the
+# guest address execution should continue at. find_functions ended
+# func_0076C534 at 0x0076CAFC while the real function runs to 0x0076CDF4, so the
+# ~190 instructions in between became disconnected fragments. Every one of them
+# ends in a trampoline except 0x0076CB00, whose loop simply falls off the end of
+# the emitted function -- so when the loop exits, the rest of the FIOS scheduler
+# constructor never runs, its workers are never built and the caller resumes
+# with clobbered callee-saved registers.
+FALLTHROUGH = {
+    '0076CB00': '0076CBB4',
+}
+
 RECOMP = 'src/recomp'
 
 
@@ -55,6 +67,17 @@ def patch(path, changed):
         if definition in out:
             out = out.replace(definition, f'void func_{addr}_lifted(ppu_context* ctx) {{')
             changed.append(f'{path}: renamed func_{addr} definition')
+    for addr, nxt in FALLTHROUGH.items():
+        head = f'void func_{addr}_lifted(ppu_context* ctx) {{'
+        i = out.find(head)
+        if i < 0:
+            continue
+        end = out.find('\n}\n', i)
+        edge = f'        {{ g_trampoline_fn = (void(*)(void*))func_{nxt}; return; }}'
+        if end > 0 and edge not in out[i:end]:
+            out = out[:end] + '\n' + edge + out[end:]
+            changed.append(f'{path}: func_{addr} falls through to func_{nxt}')
+
     if out != src:
         open(path, 'w', encoding='utf-8', errors='surrogateescape', newline='').write(out)
         return True
