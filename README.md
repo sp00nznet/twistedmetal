@@ -1123,7 +1123,53 @@ binding is live when the draw runs. `RT_REBIND=1` re-issues
 change — and the surface is still uniformly magenta. So the binding is not it
 either.
 
-The exhausted list, each verified rather than assumed: FIFO walk and fences;
+### The draws were rendering the whole time
+
+All of the above is wrong about the most important thing, and the mistake was
+mine twice over.
+
+`VP_TESTTRI=1` injects a triangle of my own through the game's exact pipeline --
+same PSO, same root signature, same vertex buffer, same RTV -- written at vertex
+1000 so it cannot collide with guest data. **It rendered.** So the GPU reads
+`vp_vb`, the pipeline works, and draws do reach render targets.
+
+That forced a re-read of every "uniform magenta" result, and both were artefacts
+of how I sampled them:
+
+- `DRAWARGS` was printing the *retarget* viewport, not the per-draw one. The
+  guest draws set their own: `dvp=0,0 640x352` -- the top-left quadrant of a
+  1280x704 target.
+- The colour histograms sampled the first 300,000 pixels of the BMP, which in
+  bottom-up order is the **bottom** of the image. The draws land at the top.
+  I was counting the one region they never touch.
+
+Analysing the whole surface instead:
+
+```
+whole image      distinct=2  (255,0,255) x168960   (0,0,0) x56320
+top-left 640x352 distinct=1  (0,0,0) x112640
+```
+
+The quadrant the draws target is entirely black while the rest stays magenta --
+exactly the shape of geometry that rasterised. And `FP_IDCOLOR=1` fills that
+same quadrant with a flat `(240,177,172)`.
+
+**So the renderer works end to end.** Geometry rasterises, the fragment shader
+executes, and forcing a colour makes it visible. The real shader outputs black
+because its *input* is black:
+
+```
+[EMPTYTEX] fp=0xFDDC82 unit=0 raw=0x01870000 res=0xC1870000 1280x704 fmt=0xE5
+[EMPTYSCAN] 0xC1800000..+1MB nonzero 0/1027
+```
+
+The UI program samples render target `0x01870000`, and that surface is empty.
+This is a render-to-texture chain in which something upstream never receives
+content -- a shading-input problem, not a rasterisation failure. Everything
+below this heading was chasing the wrong thing.
+
+The list that was eliminated is still sound as far as it goes, each verified
+rather than assumed: FIFO walk and fences;
 vertex fetch and the buffer's contents, allocation and mapping; input layout,
 stride and buffer view; `is_vp` gating; draw arguments; PSO and root signature;
 RTV creation, indexing and per-draw rebinding; viewport and scissor; colour

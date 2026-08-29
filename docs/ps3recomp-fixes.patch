@@ -227,7 +227,7 @@ index 23e7f94..83addba 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..44ab797 100644
+index 3a3e5db..343e427 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -1758,6 +1758,23 @@ static int vp_get_vs(const rsx_state* st)
@@ -458,15 +458,16 @@ index 3a3e5db..44ab797 100644
  static void render_frame(void)
  {
      double _rf0 = perf_on() ? perf_now() : 0.0;
-@@ -4165,6 +4348,7 @@ static void render_frame(void)
+@@ -4165,6 +4348,8 @@ static void render_frame(void)
              D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
              s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
              int cur_rt = -1;                       /* target A: -1 = backbuffer */
 +            float vp_last_w = 0, vp_last_h = 0;    /* for DRAWARGS */
++            float dvp_x = 0, dvp_y = 0, dvp_w = 0, dvp_h = 0;  /* per-draw, for DRAWARGS */
              int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
              double _rec0 = perf_on() ? perf_now() : 0.0;
              int seen_small_vp = 0, captured = 0;
-@@ -4191,6 +4375,10 @@ static void render_frame(void)
+@@ -4191,6 +4376,10 @@ static void render_frame(void)
                  /* Render-to-texture: retarget when this op's surfaces differ.
                   * Depth is a single shared buffer, so clear it per switch. */
                  int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
@@ -477,7 +478,7 @@ index 3a3e5db..44ab797 100644
                  int wantm[3];
                  for (int _m = 0; _m < 3; _m++)
                      wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
-@@ -4211,18 +4399,45 @@ static void render_frame(void)
+@@ -4211,18 +4400,74 @@ static void render_frame(void)
                          rh[nrt++] = off_rt_rtv(wantm[_m]);
                      }
                      D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
@@ -499,6 +500,35 @@ index 3a3e5db..44ab797 100644
 +                          const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
 +                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
 +                              s_d3d.cmd_list, off_rt_rtv(want), mag, 0, NULL);
++                      } }
++                    /* VP_TESTTRI=1: our own triangle, through the game's exact
++                     * pipeline -- same vpso, same root signature, same vertex
++                     * buffer, same RTV just bound. Written at vertex 1000 so it
++                     * cannot collide with the guest's data. Pair with
++                     * VP_BYPASS=1 so the shader is a trivial passthrough.
++                     *
++                     * If this renders, the GPU does read vp_vb and the fault is
++                     * in the guest draws' own state. If it does not, nothing
++                     * this backend draws reaches a render target at all. */
++                    { static int tt = -1;
++                      if (tt < 0) { const char* e = getenv("VP_TESTTRI"); tt = e ? atoi(e) : 0; }
++                      if (tt && want >= 0 && s_d3d.vp_vb_mapped) {
++                          float* vtx = (float*)((char*)s_d3d.vp_vb_mapped
++                              + (u64)s_d3d.vp_parity * MAX_VERTICES * 256u
++                              + (u64)1000 * 256u);
++                          static const float tri[3][4] = {
++                              {-2.0f, -2.0f, 0.0f, 1.0f},
++                              { 2.0f, -2.0f, 0.0f, 1.0f},
++                              { 0.0f,  2.0f, 0.0f, 1.0f} };
++                          for (int _v = 0; _v < 3; _v++) {
++                              float* dstv = vtx + (size_t)_v * (256u / 4u);
++                              dstv[0] = tri[_v][0]; dstv[1] = tri[_v][1];
++                              dstv[2] = tri[_v][2]; dstv[3] = tri[_v][3];
++                          }
++                          s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list, 3, 1, 1000, 0);
++                          { static int _n = 0;
++                            if (_n++ < 3) fprintf(stderr, "[TESTTRI] issued on rt=%d off=0x%08X%c",
++                                                  want, s_d3d.off_rt[want].off, 10); }
 +                      } }
                      cur_rt = want;
                      for (int _m = 0; _m < 3; _m++) cur_m[_m] = wantm[_m];
@@ -524,7 +554,16 @@ index 3a3e5db..44ab797 100644
                      for (int _m = 0; _m < 3; _m++)
                          if (cur_m[_m] >= 0) {
                              D3D12_CPU_DESCRIPTOR_HANDLE rhm = off_rt_rtv(cur_m[_m]);
-@@ -4281,6 +4496,38 @@ static void render_frame(void)
+@@ -4258,6 +4503,8 @@ static void render_frame(void)
+                     D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
+                                       (LONG)(dvp.TopLeftX + dvp.Width),
+                                       (LONG)(dvp.TopLeftY + dvp.Height)};
++                    dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
++                    dvp_w = dvp.Width;    dvp_h = dvp.Height;
+                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
+                     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &dsc);
+                 }
+@@ -4281,6 +4528,39 @@ static void render_frame(void)
                      s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                          s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
                          + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
@@ -537,11 +576,12 @@ index 3a3e5db..44ab797 100644
 +                  if (dcap && dn < dcap) { dn++;
 +                      D3D12_CPU_DESCRIPTOR_HANDLE _rh =
 +                          (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
-+                      fprintf(stderr, "[DRAWARGS] verts=%u start=%u rt=%d off=0x%08X rtv=%llu vp=%.0fx%.0f%c",
++                      fprintf(stderr, "[DRAWARGS] verts=%u start=%u rt=%d off=0x%08X rtv=%llu vp=%.0fx%.0f dvp=%.0f,%.0f %.0fx%.0f%c",
 +                              dr->vertex_count, dr->vb_byte_offset / 256, cur_rt,
 +                              (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].off : 0u,
 +                              (unsigned long long)_rh.ptr,
-+                              (double)vp_last_w, (double)vp_last_h, 10); } }
++                              (double)vp_last_w, (double)vp_last_h,
++                              (double)dvp_x, (double)dvp_y, (double)dvp_w, (double)dvp_h, 10); } }
 +                /* RT_REBIND=1: re-issue OMSetRenderTargets immediately before
 +                 * every draw instead of only when the target changes. A clear
 +                 * proves the RTV descriptor is good but not that the binding is
@@ -563,7 +603,7 @@ index 3a3e5db..44ab797 100644
                  s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                      dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                  /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
-@@ -4419,7 +4666,10 @@ static void render_frame(void)
+@@ -4419,7 +4699,10 @@ static void render_frame(void)
      static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
      { const char* sv = getenv("RTT_SAVERT");
        static int _done = 0;
@@ -575,7 +615,7 @@ index 3a3e5db..44ab797 100644
        if (sv && !_done && s_d3d.frame_count > 60 + _skip) {
          int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
          if (rt >= 0 && s_d3d.off_rt[rt].res) {
-@@ -4474,6 +4724,8 @@ static void render_frame(void)
+@@ -4474,6 +4757,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
@@ -584,7 +624,7 @@ index 3a3e5db..44ab797 100644
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -5064,7 +5316,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
+@@ -5064,7 +5349,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
      const rsx_vertex_attrib* a = &state->vertex_attribs[0];
      fprintf(stderr, "[VTXPOS] a0 off=0x%X stride=%u size=%u type=%u -> (%g, %g, %g, %g)\n",
              a->offset, a->stride, a->size, a->type,
@@ -593,7 +633,7 @@ index 3a3e5db..44ab797 100644
  }
  
  static void vp_attrs_dbg(const rsx_state* state)
-@@ -6289,6 +6541,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6574,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -605,7 +645,7 @@ index 3a3e5db..44ab797 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
-@@ -6303,6 +6560,28 @@ void rsx_d3d12_backend_present(void)
+@@ -6303,6 +6593,28 @@ void rsx_d3d12_backend_present(void)
              if (s_d3d.draws[_i].is_clear) { clears++; continue; }
              if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
          }
