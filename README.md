@@ -1069,6 +1069,28 @@ HLSL). The target still comes back uniform magenta. By the backend's own note on
 that switch, "if it stays blank, the fault is upstream of the shader -- the
 attribute binding itself".
 
+`LOAD_DBG=1` sharpens the first one considerably. Across a whole run the title
+issues exactly **two** `SET_TRANSFORM_CONSTANT_LOAD` indices:
+
+```
+100  1
+100  467
+```
+
+So `c467 = (-1, 1, 0, 0)` is genuinely what the game wrote, and the decompiled
+shader takes lane `.x` of it for `w`:
+
+```
+{ float4 _v = (float4)((vp_c[467]).xxxx);  o[0].w = _v.w; }
+```
+
+Lane `.y` of that same constant is `1` — the value a sane `w` would have. That
+makes a **source-swizzle decode bug in the vertex-program decompiler** the most
+likely reading: the ucode probably says `.y` (or `.w` of a differently-loaded
+register) and the decompiler emits `.xxxx`. Worth checking against the raw VP
+ucode before believing it, but the shape of the evidence fits, and it is a
+defect that would silently blank any title whose program does this.
+
 Those two together are the handoff: the negative `w` is a real defect that would
 stop rendering on its own and wants fixing regardless, and something upstream of
 the vertex shader is *also* wrong, because correcting the position is not
