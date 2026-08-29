@@ -779,11 +779,27 @@ and the renderer receives real work for the first time:
 seven offscreen render targets including the half-res post-processing chain —
 against zero for all of them before. The title is drawing its main menu.
 
-The screen is still black. The scene renders into those offscreen targets and
-the composite to the 720x480 display buffer never lands: no `NV3089` blit is
-issued at all in this state, and `RTT_SAVERT` on the 1280x704 colour targets
-comes back empty, so the geometry is going somewhere that ends up cleared. That
-composite is the remaining step between this port and a picture.
+The screen is still black, and the composite is now located exactly.
+`GCM2D_TRACE=1` shows the title issuing a full NV3089 scaled blit on
+**subchannel 6** — which the backend does accept — with every method present and
+the trigger fired:
+
+```
+subch=6 0x0400 IMAGE_IN_SIZE   = 0x01600400   (1024 x 352)
+subch=6 0x0404 IMAGE_IN_FORMAT = 0x00022800   (pitch 10240)
+subch=6 0x0408 IMAGE_IN_OFFSET = 0x01BE0000   (offscreen RT 3)
+subch=6 0x0318/0x031C          = 0x00100000   (1:1 scale)
+subch=6 0x0300 FORMAT          = 0x00000003
+```
+
+So the blit runs and produces nothing, and the reason is that last line:
+`nv3089_blit()` handles the 32-bit colour formats, and **format 3** only via the
+NV309E swizzled-destination path, which needs `s_nv309e.active` and matching
+log2 dimensions. The runtime's comment on format 3 is explicit that treating it
+as A8R8G8B8 is wrong and floods the scene, so this needs the format decoded
+properly rather than added to the list. That is the remaining step between this
+port and a picture — and the picture is what the front end needs before its menu
+will take input, which is what starts a campaign and plays an intro cinematic.
 
 ### Finding a message when the cross-reference cannot
 
