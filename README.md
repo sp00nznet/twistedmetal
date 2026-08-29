@@ -22,8 +22,11 @@ libraries that stand in for the PS3 operating system. Same approach as
 
 It builds and boots real game code — CRT, memory, `cellGcmInit`, video-out,
 display buffers, RSX submission with a D3D12 window open — brings the engine's
-FIOS file-I/O scheduler up, runs and joins its worker threads, and then shuts
-down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
+FIOS file-I/O scheduler up, installs its game data, initialises Sony's
+BoomRangBuss audio middleware, opens 186 asset files off the disc, and reaches
+`WorldLoader::loadUi`, where it decompresses the UI archive and loads the shell
+sound bank. The screen is still dark: the title holds a black fade while its
+load bar is up, and the load has not finished.
 
 | Phase | State |
 |---|---|
@@ -36,9 +39,10 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **renders** — 200 files, 32 draws, D3D12 textures bound |
-| Graphics (RSX → D3D12) | **presents** — geometry rasterizes; flat fill only |
-| Audio / input | not started |
+| Boot | **reaches the UI load** — 186 files opened, audio middleware up |
+| Asset decompression | **works on the host** — `src/tm_inflate.cpp`, no zlib dependency |
+| Graphics (RSX → D3D12) | **presents** — clear reaches the swapchain; title draws a black fade |
+| Audio / input | **audio initialises** — BoomRangBuss 1.0.33, banks load; input not started |
 
 ### The binary
 
@@ -506,7 +510,14 @@ and the PPU binary names the taskset it belongs to, `edgeDecompressorTaskset`.
 It is Sony's **Edge Zlib** decompressor — the thing that inflates the title's
 packed assets. It parks in `WAIT_SIGNAL` having run 0 ms, which is *correct*
 behaviour for an idle worker, and a PPU thread blocks in
-`cellSpursEventFlagWait` for it. Nothing ever submits work.
+`cellSpursEventFlagWait` for it.
+
+Work **is** submitted — an earlier draft of this file said it was not, and that
+was wrong. Decoding `func_0099790C`, the PPU-side wait, shows it takes a
+*request object* whose busy flag at `+0x28` the SPU clears on completion; the
+title queues a request and then blocks on that flag. Signalling the parked task
+by hand (`spu_taskset_signal_task`) does wake it — the sleep messages stop — but
+it still never clears the flag, so the lifted SPU image is not the way in.
 
 The submission path is the **job queue**, not the lock-free queue. Logging every
 faked import actually reached at run time settles it:
@@ -529,6 +540,73 @@ called either; an earlier draft of this file blamed it, wrongly.
 `cellSpursJq` is 63 `UNIMPLEMENTED_FUNC` stubs in RPCS3 and absent from
 ps3recomp, so this is a reverse-engineering project rather than a bridge — and
 it is the one thing between this port and content.
+
+### Inflating on the host, and the buffer that was wrong twice
+
+ps3recomp's porting guide recommends doing SPU decompression on the host, and
+the requests make that easy: the captured 63-byte stream starts `78 DA` and
+`zlib.decompress` returns exactly the 132 bytes the descriptor asks for. It is
+ordinary RFC 1950 zlib.
+
+ps3recomp links no zlib and Windows exposes no system one, so `src/tm_inflate.cpp`
+is a self-contained RFC 1951 inflater — stored, fixed and dynamic Huffman, about
+200 lines. `tm_inflate_selftest()` checks it against that captured request, so
+the decoder has a runnable check that fails if the logic breaks.
+
+Overriding `func_0099790C` to service the request and clear the busy flag took
+the title from **2 files opened to 186**: fonts, localisation, every `.rtt`
+texture, every level `.psarc`, the audio banks and `ui.psarc`. That single
+inflate is the archive's `contents.dat`.
+
+It then stopped again, and the reason was a wrong field. The request is:
+
+```
++00: 016ACD28   +0C: 122A0331 (src)   +10: 0000003F (63)
++14: 122A02EC   +18: 00000084 (132)   +24: 00000084   +28: 00000001 (busy)
+```
+
+`+0x00` looks like the destination and it is not. The source at `+0x0C` sits
+`0x45` bytes *inside* the `+0x14` buffer, because **Edge decompresses in
+place**: it DMAs the compressed file into local store and writes the inflated
+result back over the same main-memory buffer. Writing to `+0x00` left the title
+parsing the still-compressed bytes, which it did without complaining — the
+20-byte name field of each `contents.dat` entry read as empty, so it built the
+member path with `"%s/%s"` and an empty second half and opened the archive's
+mount root:
+
+```
+ArchiveLoader (ui//ui.psarc)... Failed to load ui//ui/!
+```
+
+Two dead ends came before the right answer. Extracting `ui.psarc` to the loose
+directory the path names turned the FIOS error from `0x80010709` into
+`0x80010012` and made things *worse* — `loc_0036028C` compares against
+`0x80010709` explicitly, so "not found" is a case the title handles and
+"is a directory" is not. Putting an empty file there instead let the open
+succeed and printed the third member path as mojibake — and that mojibake was
+the compressed stream, which is what finally named the bug.
+
+Inflating into `+0x14` instead takes the title through `TweakFile::Object::Read():
+Success (ui/ui.ltn)`, the patch-path setup, and `CommonBank::Load() : Loading
+bank "shell"... 669872 bytes`. `tools/unpsarc.py` — the PSARC v1.4 reader written
+during the wrong turn — stays, because it is how the archive's real layout was
+confirmed against what the title was reading.
+
+### Finding a message when the cross-reference cannot
+
+Almost none of this was reachable by reading the lifted C++. String addresses in
+this binary are formed with `lis`/`addi` off a base register held across many
+uses, so grepping for a string's low half-word finds nothing, and the two
+messages that mattered most — the rwlock warning and `Failed to load` — never
+matched.
+
+What worked was finding the *logger*. `func_0034ACAC` was already known;
+`func_00980B20` is a second one with the same `log(level, fmt, ...)` shape, and
+everything FIOS, the ArchiveLoader and the WorldLoader say goes through it. One
+override turned a silent boot into a running commentary, including the exact
+failure and the archive it was reading. `TM_GAMELOG=2` additionally prefixes
+each line with `lr-4`, the guest address that logged it, which locates any
+message in a stripped binary without a cross-reference at all.
 
 ### Why the screen is dark: nothing is drawn
 
@@ -553,8 +631,14 @@ draws in a hundred seconds, all at startup, all the same 4-vertex QUAD, and
 renders nothing else — because it is waiting on a loading screen.
 
 So the compositor, the blit, the present and the draws all behave; there is
-simply no image to show. The dark window is a symptom of the decompressor, not
-of the renderer.
+simply no image to show. The dark window is a symptom of the loader, not of the
+renderer, and `CLEAR_RGB=0.2,0.4,0.8` settles it in one run: every dumped frame
+comes back a uniform `(204,102,51)`, so the clear reaches the swapchain and only
+geometry is missing. The one texture the title does bind, dumped out of local
+memory with `TM_TEXDUMP=0x2ACD800,1024,512`, is two thin bands of noise on
+black — an allocation nothing has filled in. Meanwhile `cellVideoOutSetGamma(0.00)`
+every frame is the title holding a deliberate black fade while its load bar is
+up.
 
 ### Reading the title's own config
 
@@ -673,10 +757,13 @@ twistedmetal/
 │   ├── decrypt_self.py     # retail SELF -> plain ELF (bring your own key file)
 │   ├── recarve_spu.py      # size SPU images the way the runtime fingerprints them
 │   ├── seed_gaps.py        # cover the 12% of code find_functions misses
-│   └── post_lift.py        # idempotent post-lift patches (the title's logger)
+│   ├── unpsarc.py          # PSARC v1.4 reader (how the archive layout was confirmed)
+│   ├── symbolize.py        # watchdog host RVAs -> lifted guest function names
+│   └── post_lift.py        # idempotent post-lift patches (loggers, traces, overrides)
 ├── src/
 │   ├── boot_main.cpp       # ps3recomp boot harness, rebranded for this title
 │   ├── hle_extra.cpp       # imports this title reaches that the runtime lacks
+│   ├── tm_inflate.cpp      # self-contained RFC 1951 inflater for the SPU decompressor
 │   ├── compat/             # <dirent.h>/<unistd.h> Win32 shims
 │   ├── gen/                # generated HLE NID table (committed)
 │   ├── spu_gen/            # lifted SPU images, 19 MB (gitignored; regenerate)

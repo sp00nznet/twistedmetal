@@ -23,6 +23,7 @@ import sys
 # src/hle_extra.cpp defines the replacement under the original name.
 OVERRIDES = {
     '0034ACAC': "the title's log(level, fmt, ...)",
+    '00980B20': "the title's second log(level, fmt, ...) -- FIOS, ArchiveLoader, WorldLoader",
 }
 
 # Guest functions to WRAP rather than replace: the lifted body is renamed the
@@ -42,6 +43,25 @@ TRACE = {
     '0076CB00': 'fios worker setup (writes the object that is never constructed)',
     '0076756C': 'candidate element ctor (copies a vtable to +0x00)',
     '007556B4': 'fios object base ctor (writes the "FIOS obj ...." tag)',
+    '0099790C': 'edge decompressor wait(this, request, ...) -- dumps the request',
+    '0020C26C': 'WorldLoader::loadGame',
+    '0020C33C': 'WorldLoader::loadUi',
+    '0020C478': 'WorldLoader::loadCinema',
+    '0035FBFC': 'ArchiveLoader::waitIO',
+    '0035FD84': 'ArchiveLoader::load',
+    '003609AC': 'ArchiveLoader::thread',
+    '00474110': 'UiLegal_1::onEnter',
+    '006AC648': 'MoviePlayer::openFile',
+    '0014BCA8': 'boot::seq',
+    '0020C698': 'WorldLoader::setup',
+    '00360B90': 'AL::b90',
+    '00360C3C': 'AL::c3c',
+    '00360E84': 'AL::e84',
+    '00360EBC': 'AL::ebc',
+    '00360F68': 'AL::f68',
+    '00360F88': 'AL::f88',
+    '0064BA08': 'updateLoadBar::frame',
+    '0036204C': 'AL::204c',
 }
 
 # Guest fragments the lifter emitted without a fall-through edge, mapped to the

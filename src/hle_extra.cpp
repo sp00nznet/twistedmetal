@@ -22,6 +22,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <mutex>
+#include <thread>
+#include <chrono>
 
 extern "C" {
 void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -84,6 +86,9 @@ static void cellGcmMapEaIoAddressWithFlags(ppu_context* ctx)
 
 static void sys_lwcond_create(ppu_context* ctx);
 static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx);
+static uint32_t g_edge_dst;      /* where the inflated contents.dat landed */
+static uint32_t g_tasksets[8];    /* every taskset the title creates */
+static int      g_ntasksets;
 static void cellSpursCreateTaskset2(ppu_context* ctx);
 static void cellSpursAttributeEnableSystemWorkload(ppu_context* ctx);
 static void sys_spu_printf_initialize(ppu_context* ctx);
@@ -93,6 +98,7 @@ static void cellSpursTaskAttribute2Initialize(ppu_context* ctx);
 static void cellSpursCreateTask2(ppu_context* ctx);
 static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx);
 static void probe_cellSpursSendSignal(ppu_context* ctx);
+static void probe_EventFlagWait(ppu_context* ctx);
 
 extern "C" void tm_hle_register_extra(void)
 {
@@ -118,6 +124,7 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x9034E538u, "cellSpursTaskGetContextSaveAreaSize",
                          cellSpursTaskGetContextSaveAreaSize);
     ps3_hle_register_ctx(0xE0A6DBE4u, "_cellSpursSendSignal", probe_cellSpursSendSignal);
+    ps3_hle_register_ctx(0x373523D4u, "cellSpursEventFlagWait", probe_EventFlagWait);
 }
 
 /* ---------------------------------------------------------------------------
@@ -206,6 +213,8 @@ static void cellSpursCreateTaskset2(ppu_context* ctx)
     const uint32_t attr = (uint32_t)ctx->gpr[5];
     const uint64_t args = attr ? vm_read64(attr + TSA2_ARGS) : 0;
     const uint32_t maxcont = attr ? vm_read32(attr + TSA2_MAXCONT) : 8;
+    if (g_ntasksets < (int)(sizeof g_tasksets / sizeof *g_tasksets))
+        g_tasksets[g_ntasksets++] = taskset;
     fprintf(stderr, "[cellSpurs] CreateTaskset2(spurs=0x%08X, taskset=0x%08X, attr=0x%08X) "
                     "args=0x%llX maxContention=%u -> v1 CreateTaskset\n",
             spurs, taskset, attr, (unsigned long long)args, maxcont);
@@ -268,7 +277,13 @@ static void tm_game_log(ppu_context* ctx)
     tm_gstr((uint32_t)ctx->gpr[4], fmt, sizeof fmt);
 
     int argi = 5;                       /* r5..r10 hold the varargs */
-    fprintf(stderr, "[game] ");
+    /* TM_GAMELOG=2 prefixes each line with the guest address that logged it,
+     * which is the only practical way to locate a message in a stripped
+     * binary whose string references the static cross-reference misses. */
+    if (getenv("TM_GAMELOG") && atoi(getenv("TM_GAMELOG")) > 1)
+        fprintf(stderr, "[game @%08X] ", (uint32_t)ctx->lr - 4);
+    else
+        fprintf(stderr, "[game] ");
     for (const char* p = fmt; *p; p++) {
         if (*p != '%') { fputc(*p, stderr); continue; }
         const char* spec = p++;
@@ -302,6 +317,19 @@ void func_0034ACAC(ppu_context* ctx)
     if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
     if (on) tm_game_log(ctx);
     ctx->gpr[3] = 0;
+}
+
+/* The title's other logger, same log(level, fmt, ...) shape. Everything the
+ * FIOS layer, the ArchiveLoader and the WorldLoader say goes here rather than
+ * through 0x0034ACAC -- including the "Failed to load %s!" that ends the boot. */
+void func_00980B20_lifted(ppu_context* ctx);
+
+void func_00980B20(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_00980B20_lifted(ctx);
 }
 
 /* ---------------------------------------------------------------------------
@@ -463,6 +491,67 @@ void func_0076C534(ppu_context* ctx) { tm_trace("fiosSchedCtor", func_0076C534_l
 void func_0076CDF4(ppu_context* ctx) { tm_trace("createSchedForMedia", func_0076CDF4_lifted, ctx); }
 void func_0077A088(ppu_context* ctx) { tm_trace("Mutex::lock", func_0077A088_lifted, ctx); }
 void func_00671698(ppu_context* ctx) { tm_trace("renderInit", func_00671698_lifted, ctx); }
+
+/* Front-end path: does the title reach the UI load, the legal screens and the
+ * intro movie? Each name comes from the format string the function logs. */
+void func_0020C26C_lifted(ppu_context* ctx);
+void func_0020C33C_lifted(ppu_context* ctx);
+void func_0020C478_lifted(ppu_context* ctx);
+void func_0035FBFC_lifted(ppu_context* ctx);
+void func_0035FD84_lifted(ppu_context* ctx);
+void func_003609AC_lifted(ppu_context* ctx);
+void func_00474110_lifted(ppu_context* ctx);
+void func_006AC648_lifted(ppu_context* ctx);
+void func_0020C26C(ppu_context* ctx) { tm_trace("WorldLoader::loadGame", func_0020C26C_lifted, ctx); }
+void func_0020C33C(ppu_context* ctx) { tm_trace("WorldLoader::loadUi", func_0020C33C_lifted, ctx); }
+void func_0020C478(ppu_context* ctx) { tm_trace("WorldLoader::loadCinema", func_0020C478_lifted, ctx); }
+void func_0035FBFC(ppu_context* ctx) { tm_trace("ArchiveLoader::waitIO", func_0035FBFC_lifted, ctx); }
+void func_0035FD84(ppu_context* ctx) { tm_trace("ArchiveLoader::load", func_0035FD84_lifted, ctx); }
+void func_003609AC(ppu_context* ctx) { tm_trace("ArchiveLoader::thread", func_003609AC_lifted, ctx); }
+void func_00474110(ppu_context* ctx) { tm_trace("UiLegal_1::onEnter", func_00474110_lifted, ctx); }
+void func_006AC648(ppu_context* ctx) { tm_trace("MoviePlayer::openFile", func_006AC648_lifted, ctx); }
+void func_0014BCA8_lifted(ppu_context* ctx);
+void func_0020C698_lifted(ppu_context* ctx);
+void func_0014BCA8(ppu_context* ctx) { tm_trace("boot::seq", func_0014BCA8_lifted, ctx); }
+void func_0020C698(ppu_context* ctx) { tm_trace("WorldLoader::setup", func_0020C698_lifted, ctx); }
+void func_00360B90_lifted(ppu_context* ctx);
+void func_00360C3C_lifted(ppu_context* ctx);
+void func_00360E84_lifted(ppu_context* ctx);
+void func_00360EBC_lifted(ppu_context* ctx);
+void func_00360F68_lifted(ppu_context* ctx);
+void func_00360F88_lifted(ppu_context* ctx);
+void func_0064BA08_lifted(ppu_context* ctx);
+void func_0036204C_lifted(ppu_context* ctx);
+void func_00360B90(ppu_context* ctx) { tm_trace("AL::b90", func_00360B90_lifted, ctx); }
+/* ArchiveLoader's open-and-read helper. r4 is the path it is after, and
+ * naming the one call that returns 0 is the whole point of watching it. */
+void func_00360C3C(ppu_context* ctx)
+{
+    char nm[192];
+    if (tm_trace_on()) {
+        const uint32_t a3 = (uint32_t)ctx->gpr[3];
+        fprintf(stderr, "[trace] AL::c3c path=%s  arg0=0x%08X [",
+                tm_gstr((uint32_t)ctx->gpr[4], nm, sizeof nm), a3);
+        for (uint32_t o = 0; o < 0x20; o += 4) fprintf(stderr, " %08X", vm_read32(a3 + o));
+        fprintf(stderr, " ]\n");
+        /* Is the contents.dat we inflated still where the title parses it? */
+        if (g_edge_dst) {
+            fprintf(stderr, "[trace]   contents.dat @0x%08X:", g_edge_dst);
+            for (uint32_t o = 0; o < 0x30; o += 4) fprintf(stderr, " %08X", vm_read32(g_edge_dst + o));
+            fprintf(stderr, "\n");
+        }
+    }
+    tm_trace("AL::c3c", func_00360C3C_lifted, ctx);
+}
+void func_00360E84(ppu_context* ctx) { tm_trace("AL::e84", func_00360E84_lifted, ctx); }
+void func_00360EBC(ppu_context* ctx) { tm_trace("AL::ebc", func_00360EBC_lifted, ctx); }
+void func_00360F68(ppu_context* ctx) { tm_trace("AL::f68", func_00360F68_lifted, ctx); }
+void func_00360F88(ppu_context* ctx) { tm_trace("AL::f88", func_00360F88_lifted, ctx); }
+void func_0064BA08(ppu_context* ctx) { tm_trace("updateLoadBar::frame", func_0064BA08_lifted, ctx); }
+void func_0036204C(ppu_context* ctx) { tm_trace("AL::204c", func_0036204C_lifted, ctx); }
+
+
+
 void func_00670C10(ppu_context* ctx) { tm_trace("f_00670C10", func_00670C10_lifted, ctx); }
 void func_00671560(ppu_context* ctx) { tm_trace("f_00671560", func_00671560_lifted, ctx); }
 void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lifted, ctx); }
@@ -636,11 +725,25 @@ extern "C" void tm_fbdump_tick(void)
 
     /* Local memory base 0xC0000000; display buffer 0 at offset 0x10000,
      * 720x480 with the 5120-byte pitch cellGcmSetDisplayBuffer reported. */
+    /* TM_TEXDUMP=<offset>[,w,h] aims the dump at any local-memory surface
+     * -- the bound texture, say -- instead of the display buffer. */
+    uint32_t off = 0x00010000u, w = 720, h = 480, pitch = 5120;
+    if (const char* t = getenv("TM_TEXDUMP")) {
+        off = (uint32_t)strtoul(t, 0, 0);
+        if (const char* c = strchr(t, ',')) {
+            w = (uint32_t)strtoul(c + 1, 0, 0);
+            const char* c2 = strchr(c + 1, ',');
+            h = c2 ? (uint32_t)strtoul(c2 + 1, 0, 0) : w;
+            pitch = w * 4;
+        }
+    }
+
     static int n = 0;
     char path[64];
     snprintf(path, sizeof path, "fb_%03d.bmp", n++);
-    tm_write_bmp(path, vm_base + 0xC0010000u, 720, 480, 5120);
-    fprintf(stderr, "[fbdump] wrote %s from guest 0xC0010000\n", path);
+    tm_write_bmp(path, vm_base + 0xC0000000u + off, w, h, pitch);
+    fprintf(stderr, "[fbdump] wrote %s from local memory 0x%08X %ux%u\n",
+            path, off, w, h);
 }
 
 /* TM_EF_KICK=<secs> — diagnostic: set SPURS event flag bit 0 after N seconds.
@@ -670,4 +773,147 @@ extern "C" void tm_ef_kick_tick(void)
      * blocking. The waiter polls the guest events word directly, so write it. */
     vm_write16(flag + 0x00 /* EF_EVENTS */, 0x0001);
     fprintf(stderr, "[TM_EF_KICK] wrote events=0x0001 to flag 0x%08X\n", flag);
+}
+
+/* Probe: cellSpursEventFlagWait (0x373523D4). Logs the guest return address so
+ * the waiting function can be identified, then forwards to the runtime. */
+extern "C" int32_t cellSpursEventFlagWait(void* eventFlag, void* bits, uint32_t mode);
+
+static void probe_EventFlagWait(ppu_context* ctx)
+{
+    const uint32_t ea = (uint32_t)ctx->gpr[3], b = (uint32_t)ctx->gpr[4];
+    const uint32_t mode = (uint32_t)ctx->gpr[5];
+    static int n = 0;
+    if (n++ < 6)
+        fprintf(stderr, "[probe] EventFlagWait(flag=0x%08X, bits=0x%08X, mode=%u) from guest 0x%08X\n",
+                ea, b, mode, (uint32_t)ctx->lr - 4);
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSpursEventFlagWait(
+        (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
+}
+
+/* ---------------------------------------------------------------------------
+ * The Edge decompressor's completion wait, guest 0x0099790C.
+ *
+ * Decoded from the lifted code: wait(this, request, ...) computes its event-flag
+ * bit as `1 << ((request - (this + 0x2C04)) / sizeof(request))`, then loops
+ * cellSpursEventFlagWait while `*(u32*)(request + 0x28)` is non-zero. So
+ * `request` is a submitted decompression request and `+0x28` is its busy flag,
+ * which the SPU task clears on completion.
+ *
+ * That means work IS queued and the wait is legitimate — the SPU side simply
+ * never runs it. Dumping the request is the way to learn its layout, which is
+ * what an HLE inflate would need. TM_REQDUMP=1.
+ * ------------------------------------------------------------------------- */
+#define REQ_DST     0x00
+#define REQ_SRC     0x0C
+#define REQ_SRCLEN  0x10
+#define REQ_DSTLEN  0x18
+#define REQ_BUF     0x14
+#define REQ_DSTLEN2 0x24
+#define REQ_BUSY    0x28
+
+extern "C" int tm_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, uint32_t src_len);
+
+/* The lifted Edge SPU task parks in WAIT_SIGNAL the instant it starts and
+ * nothing in the runtime ever wakes it -- the title never calls
+ * _cellSpursSendSignal, so whatever it does kick the task with, we do not model
+ * it. This is the one point where the title is provably blocked on a queued
+ * request, so kick the task here and give it a moment to answer. If it does
+ * not, fall back to inflating on the host. */
+extern "C" void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
+extern "C" int tm_inflate_selftest(void);
+
+void func_0099790C_lifted(ppu_context* ctx);
+
+void func_0099790C(ppu_context* ctx)
+{
+    const uint32_t self = (uint32_t)ctx->gpr[3];
+    const uint32_t req  = (uint32_t)ctx->gpr[4];
+
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("TM_EDGE_HLE"); on = e ? atoi(e) : 1; }
+
+    { static long long dumped = 0;
+      if (getenv("TM_REQDUMP") && req && dumped++ < 4) {
+          fprintf(stderr, "[edge] request 0x%08X raw:' + B + 'n", req);
+          for (uint32_t o = 0; o < 0x40; o += 0x10)
+              fprintf(stderr, "    +%02X: %08X %08X %08X %08X' + B + 'n", o,
+                      vm_read32(req + o), vm_read32(req + o + 4),
+                      vm_read32(req + o + 8), vm_read32(req + o + 12));
+      } }
+
+    { static long long calls = 0;
+      if (getenv("TM_REQDUMP") && calls++ < 40)
+          fprintf(stderr, "[edge] enter #%lld req=0x%08X busy=%u dst=0x%08X src=0x%08X "
+                          "srclen=%u dstlen=%u/%u\n", calls, req,
+                  req ? vm_read32(req + REQ_BUSY) : 0,
+                  req ? vm_read32(req + REQ_DST) : 0,
+                  req ? vm_read32(req + REQ_SRC) : 0,
+                  req ? vm_read32(req + REQ_SRCLEN) : 0,
+                  req ? vm_read32(req + REQ_DSTLEN) : 0,
+                  req ? vm_read32(req + REQ_DSTLEN2) : 0); }
+
+    if (req && getenv("TM_SPU_KICK")) {
+        const char* ms = getenv("TM_SPU_KICK_MS");
+        const int spins = (ms ? atoi(ms) : 200) / 5;
+        /* Signalling a taskset with nothing parked is a no-op, so poke them all
+         * rather than guess which one owns the Edge task. */
+        for (int i = 0; i < g_ntasksets; i++)
+            for (uint32_t t = 0; t < 4; t++)
+                spu_taskset_signal_task(g_tasksets[i], t);
+        for (int i = 0; i < spins && vm_read32(req + REQ_BUSY); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!vm_read32(req + REQ_BUSY)) {
+            static int said = 0;
+            if (said++ < 4) fprintf(stderr, "[edge] SPU task serviced request 0x%08X\n", req);
+            ctx->gpr[3] = 0;
+            return;
+        }
+    }
+
+    if (on && req) {
+        const uint32_t dst    = vm_read32(req + REQ_DST);
+        const uint32_t src    = vm_read32(req + REQ_SRC);
+        const uint32_t srclen = vm_read32(req + REQ_SRCLEN);
+        uint32_t dstlen       = vm_read32(req + REQ_DSTLEN);
+        if (!dstlen) dstlen   = vm_read32(req + REQ_DSTLEN2);
+
+        /* Edge decompresses IN PLACE: the request's +0x14 buffer holds the
+         * compressed file (the +0x0C source points 0x45 bytes into it) and the
+         * title parses the inflated result back out of that same buffer, not
+         * out of +0x00. Writing to +0x00 left it parsing the still-compressed
+         * bytes, which is why every member name came out empty or garbage.
+         * Inflate to the host first so the source survives being overwritten. */
+        const uint32_t inplace = vm_read32(req + REQ_BUF);
+        if (src && srclen && dstlen && vm_base && (inplace || dst)) {
+            uint8_t* tmp = (uint8_t*)malloc(dstlen);
+            int n = tmp ? tm_inflate(tmp, dstlen, vm_base + src, srclen) : -1;
+            if (n >= 0) {
+                if (inplace) memcpy(vm_base + inplace, tmp, (size_t)n);
+                else         memcpy(vm_base + dst,     tmp, (size_t)n);
+            }
+            free(tmp);
+            static long long done = 0;
+            if (n >= 0) {
+                g_edge_dst = inplace ? inplace : dst;
+                vm_write32(req + REQ_BUSY, 0);   /* the wait loop polls this */
+                if (done++ < 8)
+                    fprintf(stderr, "[edge] inflated request 0x%08X: %u -> %d bytes "
+                                    "(src 0x%08X -> dst 0x%08X)\n",
+                            req, srclen, n, src, inplace ? inplace : dst);
+                /* Fall through to the lifted body rather than returning: with the
+                 * busy flag already clear it skips the event-flag wait but still
+                 * runs the post-processing after it, which the caller depends on. */
+                func_0099790C_lifted(ctx);
+                return;
+            }
+            static int warned = 0;
+            if (warned++ < 4)
+                fprintf(stderr, "[edge] inflate FAILED for request 0x%08X "
+                                "(src 0x%08X len %u -> dst 0x%08X cap %u); waiting instead\n",
+                        req, src, srclen, dst, dstlen);
+        }
+    }
+    (void)self;
+    func_0099790C_lifted(ctx);
 }
