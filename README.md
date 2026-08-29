@@ -815,17 +815,29 @@ Every batch, all run. This title composites *entirely* through the 2D engine, so
 broken in the parser, the walker, the shaders or the draws — the frame is
 finished, in the wrong memory.
 
-Closing it needs a backend capability that does not exist yet: when an NV3089
-blit resolves to a registered display buffer, present its **source** offscreen
-RT rather than discarding the frame. `RTT_VIEWRT` is close but only rewrites the
-texture of an existing display draw, and here there are none to rewrite — the
-composite draw has to be synthesised. That is one well-defined piece of work,
-and it is the last one before a picture. The picture is in turn what the front
-end needs before its menu will take input, which is what starts a campaign and
-plays an intro cinematic: injected pad input (`YDKJ_INJECT_PAD`) does not move
-the menu today, and the movie chain — the ArchiveLoader's movies path, the
-attract script, the `c1.avi`/`ep_1.avi` id table, `MoviePlayer::openFile` — is
-confirmed at zero calls.
+So the backend needs to be able to show a frame it did not draw.
+`GCM_GUEST_FB=<off>,<w>,<h>,<pitch>` in `docs/ps3recomp-fixes.patch` adds that:
+it maps the guest display buffer, swaps BGRA to RGBA into an upload heap and
+`CopyTextureRegion`s it onto the backbuffer at the end of the pass, and forces
+`has_display` so the pass runs at all. `GCM_GUEST_FB=0x10000,720,480,5120`
+wires up correctly — but there is still nothing to show, because **the composite
+itself only runs occasionally**. A whole run often logs no `[NV3089]` line at
+all, and both display buffers read back black.
+
+That is the honest state of it, and it points at the recoveries above. Resyncing
+to `put` keeps the FIFO alive at the cost of every command between here and the
+write head — and the 2D composite is one of the commands being dropped. The
+walker recovers, the frame does not. Making this reliable means not desyncing in
+the first place: the title's `_jsGcmFifoFinish` has to actually succeed, which
+means the label/semaphore handshake completing end to end. It does in a good run
+— `labels: [64]=1`, `ref` publishing, `get == put` — just not dependably.
+
+That is a piece of emulator-correctness work rather than another fix, and it is
+what stands between this port and a picture. The picture is in turn what the
+front end needs before its menu will take input: injected pad input
+(`YDKJ_INJECT_PAD`) does not move the menu today, and the movie chain — the
+ArchiveLoader's movies path, the attract script, the `c1.avi`/`ep_1.avi` id
+table, `MoviePlayer::openFile` — is confirmed at zero calls.
 
 ### Finding a message when the cross-reference cannot
 
