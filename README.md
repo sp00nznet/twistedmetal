@@ -593,6 +593,55 @@ bank "shell"... 669872 bytes`. `tools/unpsarc.py` — the PSARC v1.4 reader writ
 during the wrong turn — stays, because it is how the archive's real layout was
 confirmed against what the title was reading.
 
+### The front end runs; the renderer never leaves the loading screen
+
+With the trace readable, the legal sequence runs in full:
+
+```
+-> UiLegal_Health::onEnter    -> UiLegal_1::onEnter
+-> UiLegal_1::update (x3)     -> UiLegal_2::onEnter
+-> UiLegal_3::onEnter         -> UiLegal_4::onEnter
+```
+
+That is the sequence the intro movie sits on the far side of, and the state
+machine advances through it on its own thread. What does not happen is any
+drawing. `PERF=1` is unambiguous:
+
+```
+[PERF] 561.43 fps | tex 0.00s (0%, 0 calls) | vtx 0.00s (0%, 0k verts)
+       | render_frame 0.00s (3%) | guest 0.03s (97%)
+```
+
+Zero vertices, for the whole run. The backend is presenting empty frames as fast
+as it can while the guest does all the work — so the dark window is now the
+guest not submitting, not the backend dropping anything. `renderInit(1, 1280,
+720)` returns 1, and every `bctr to NULL` indirect-dispatch failure that used to
+fill the log is gone: they were downstream of the garbage decompressed data.
+
+The reason is that the boot sequence never leaves its load bar. `func_0064C23C`
+(`updateLoadBar`) spins until the byte at `0x0190FC89` goes non-zero, and while
+it does, the only thing rendering is the load bar. The byte's two writers,
+`func_0064C410` and `func_0010E57C`, are never reached — both are called
+indirectly, and indirect dispatch demonstrably works now, so the title simply
+has not decided the load is done. Setting the byte by hand (`TM_LOADDONE=<secs>`)
+does release the thread that spins on it, but `updateLoadBar` still does not
+return, so that byte is a symptom rather than the gate.
+
+Two measurements are worth recording because both contradicted a guess:
+
+- **The decompressor is not the slow part.** 1.8 ms per 64 KB block, 0.46 ms of
+  it actually inflating — about five seconds for the whole 192 MB archive.
+- **The flip wait is not the gate either.** The renderer's frame wait
+  (`func_006755D0`) polls `cellGcmGetFlipStatus` up to 25,000 times at 40 us
+  before giving up, and a raw count looks damning — 2.28 M polls, 98.4% of them
+  `WAITING`. Per completion it is 64 polls, about 2.5 ms a frame, which is fine.
+  The one-off 8,890-poll run (356 ms) is the archive load starving the ticker.
+
+Audio is a known casualty rather than a mystery: BRB's mixer is the SPURS job
+workload `Wws_Job/BrBDblBufWrkld`, whose PM is not lifted, so its primary output
+never comes up and `brb_StartSession()` times out after ten seconds. The title
+carries on without it.
+
 ### Finding a message when the cross-reference cannot
 
 Almost none of this was reachable by reading the lifted C++. String addresses in

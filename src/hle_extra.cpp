@@ -99,6 +99,7 @@ static void cellSpursTaskAttribute2Initialize(ppu_context* ctx);
 static void cellSpursCreateTask2(ppu_context* ctx);
 static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx);
 static void probe_cellSpursSendSignal(ppu_context* ctx);
+static void probe_cellGcmGetFlipStatus(ppu_context* ctx);
 static void probe_EventFlagWait(ppu_context* ctx);
 
 extern "C" void tm_hle_register_extra(void)
@@ -125,6 +126,7 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x9034E538u, "cellSpursTaskGetContextSaveAreaSize",
                          cellSpursTaskGetContextSaveAreaSize);
     ps3_hle_register_ctx(0xE0A6DBE4u, "_cellSpursSendSignal", probe_cellSpursSendSignal);
+    ps3_hle_register_ctx(0x72A577CEu, "cellGcmGetFlipStatus", probe_cellGcmGetFlipStatus);
     ps3_hle_register_ctx(0x373523D4u, "cellSpursEventFlagWait", probe_EventFlagWait);
 }
 
@@ -521,6 +523,30 @@ void func_0035FBFC(ppu_context* ctx) { tm_trace("ArchiveLoader::waitIO", func_00
 void func_0035FD84(ppu_context* ctx) { tm_trace("ArchiveLoader::load", func_0035FD84_lifted, ctx); }
 void func_003609AC(ppu_context* ctx) { tm_trace("ArchiveLoader::thread", func_003609AC_lifted, ctx); }
 void func_00474110(ppu_context* ctx) { tm_trace("UiLegal_1::onEnter", func_00474110_lifted, ctx); }
+/* The rest of the legal-screen sequence. UiLegal_1 enters; whether its
+ * update() advances to 2/3/4 is what says if the front end is running or
+ * just sitting there, and the intro movie is on the far side of it. */
+void func_00474198_lifted(ppu_context* ctx);
+void func_0047447C_lifted(ppu_context* ctx);
+void func_00474710_lifted(ppu_context* ctx);
+void func_00474A68_lifted(ppu_context* ctx);
+void func_00475150_lifted(ppu_context* ctx);
+void func_00475450_lifted(ppu_context* ctx);
+/* update() runs every frame; only its first calls are informative. */
+void func_00474198(ppu_context* ctx)
+{
+    static int n = 0;
+    if (tm_trace_on() && (n++ < 3 || tm_trace_verbose()))
+        tm_trace("UiLegal_1::update", func_00474198_lifted, ctx);
+    else
+        func_00474198_lifted(ctx);
+}
+void func_0047447C(ppu_context* ctx) { tm_trace("UiLegal_2::onEnter", func_0047447C_lifted, ctx); }
+void func_00474710(ppu_context* ctx) { tm_trace("UiLegal_3::onEnter", func_00474710_lifted, ctx); }
+void func_00474A68(ppu_context* ctx) { tm_trace("UiLegal_4::onEnter", func_00474A68_lifted, ctx); }
+void func_00475150(ppu_context* ctx) { tm_trace("UiLegal_Health::onEnter", func_00475150_lifted, ctx); }
+void func_00475450(ppu_context* ctx) { tm_trace("UiLegal_ESRB::onEnter", func_00475450_lifted, ctx); }
+
 void func_006AC648(ppu_context* ctx) { tm_trace("MoviePlayer::openFile", func_006AC648_lifted, ctx); }
 void func_0014BCA8_lifted(ppu_context* ctx);
 void func_0020C698_lifted(ppu_context* ctx);
@@ -675,6 +701,30 @@ static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx)
  * whether the PPU side ever sends the signal at all. Forwards to the runtime. */
 extern "C" int32_t _cellSpursSendSignal(void* taskset, uint32_t taskId);
 
+
+/* Probe: cellGcmGetFlipStatus (0x72A577CE).
+ *
+ * The renderer's frame wait (func_006755D0) polls this up to 25,000 times with
+ * a 40 us sleep between -- a second per frame if the flip never completes --
+ * and then gives up and draws anyway. Counting the polls per completion says
+ * whether flips are arriving at 60 Hz or not at all, which is the difference
+ * between a slow port and a renderer that never gets a frame out. */
+extern "C" uint32_t cellGcmGetFlipStatus(void);
+
+static void probe_cellGcmGetFlipStatus(ppu_context* ctx)
+{
+    const uint32_t st = cellGcmGetFlipStatus();
+    ctx->gpr[3] = (uint64_t)st;
+
+    static long long polls = 0, waits = 0, done = 0, worst = 0, run = 0;
+    polls++;
+    if (st == 0) { done++; if (run > worst) worst = run; run = 0; }
+    else         { waits++; run++; }
+    if ((polls % 20000) == 0)
+        fprintf(stderr, "[flip] %lld polls: %lld DONE, %lld WAITING, "
+                        "longest wait run %lld\n", polls, done, waits, worst);
+}
+
 static void probe_cellSpursSendSignal(ppu_context* ctx)
 {
     const uint32_t ts = (uint32_t)ctx->gpr[3], tid = (uint32_t)ctx->gpr[4];
@@ -776,6 +826,32 @@ extern "C" void tm_fbdump_tick(void)
  * and submit its first job — which is the question this answers. It is a probe,
  * not a fix: nothing here decompresses anything. */
 extern "C" int32_t cellSpursEventFlagSet(void* eventFlag, uint16_t bits);
+
+/* TM_LOADDONE=<secs> -- probe: set the load-complete byte at 0x0190FC89.
+ *
+ * The boot sequence sits in updateLoadBar (func_0064C23C) until that byte goes
+ * non-zero, and while it does, the only thing rendering is the load bar -- so
+ * the front end can run its legal-screen state machine (it does, all the way to
+ * UiLegal_4) without a single vertex reaching the backend. Its two writers,
+ * func_0064C410 and func_0010E57C, are never reached. Setting it by hand says
+ * whether that byte is really the gate or just a symptom. A probe, not a fix.
+ */
+extern "C" void tm_loaddone_tick(void)
+{
+    static int secs = -1;
+    if (secs < 0) { const char* e = getenv("TM_LOADDONE"); secs = e ? atoi(e) : 0; }
+    if (!secs || !vm_base) return;
+    static unsigned long long t0 = 0;
+    const unsigned long long now = (unsigned long long)time(NULL);
+    if (!t0) { t0 = now; return; }
+    if (now - t0 < (unsigned)secs) return;
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    vm_write8(0x0190FC89u, 1);
+    fprintf(stderr, "[probe] set load-complete byte 0x0190FC89 = 1 after %d s\n", secs);
+    fflush(stderr);
+}
 
 extern "C" void tm_ef_kick_tick(void)
 {
