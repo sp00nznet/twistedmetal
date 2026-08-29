@@ -933,10 +933,33 @@ was added for this: the built-in trigger fires at frame 60, minutes before this
 title reaches its menu.)
 
 Correct vertices, correct target, valid pipeline, draws executed, surface empty.
-That is a D3D12 pipeline-state problem — a blend or write mask, an RTV format
-mismatch, a root-signature binding — and it is where this pass stops. It is
-open-ended work inside ps3recomp's backend rather than another fix here, and
-every probe costs a four-minute boot.
+The obvious pipeline-state culprits were then ruled out one at a time, each
+against that same surface rather than through the composite:
+
+```
+CMASK_FORCE=1                                     -> 0.000%
+DEPTH_OFF=1 CULL_OFF=1 CMASK_FORCE=1 NO_ALPHATEST=1 -> 0.000%
+```
+
+Not the colour write mask, not depth, not culling, not alpha test. And then the
+control that sharpens it into something worth handing over:
+
+```
+CLEAR_RGB=0.2,0.4,0.8   -> 0.000%, every pixel (0,0,0)
+```
+
+The guest issues **39 clears per batch** into that surface, and recolouring them
+changes nothing. So it is not that the draws write nothing — **nothing reaches
+that render target at all**, clears included. That moves the suspect off
+pipeline state and onto the render-target binding itself: the RTV descriptor the
+offscreen path binds, or the slot bookkeeping behind `off_rt_find` /
+`off_rt_rtv` / `off_rt_transition`. The same control also shows the backbuffer
+readback is sound — `CLEAR_RGB` comes back as a uniform `(204,102,51)` there —
+so the instrument is trustworthy and the offscreen target genuinely is not being
+written.
+
+That is where this pass stops. It is open-ended work inside ps3recomp's D3D12
+backend rather than another fix here, and every probe costs a four-minute boot.
 
 That is a piece of emulator-correctness work rather than another fix, and it is
 what stands between this port and a picture. The picture is in turn what the
