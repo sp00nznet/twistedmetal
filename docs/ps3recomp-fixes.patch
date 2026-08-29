@@ -227,7 +227,7 @@ index 23e7f94..83addba 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..b5c2bfe 100644
+index 3a3e5db..44ab797 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -1758,6 +1758,23 @@ static int vp_get_vs(const rsx_state* st)
@@ -524,7 +524,7 @@ index 3a3e5db..b5c2bfe 100644
                      for (int _m = 0; _m < 3; _m++)
                          if (cur_m[_m] >= 0) {
                              D3D12_CPU_DESCRIPTOR_HANDLE rhm = off_rt_rtv(cur_m[_m]);
-@@ -4281,6 +4496,20 @@ static void render_frame(void)
+@@ -4281,6 +4496,38 @@ static void render_frame(void)
                      s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                          s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
                          + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
@@ -542,10 +542,28 @@ index 3a3e5db..b5c2bfe 100644
 +                              (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].off : 0u,
 +                              (unsigned long long)_rh.ptr,
 +                              (double)vp_last_w, (double)vp_last_h, 10); } }
++                /* RT_REBIND=1: re-issue OMSetRenderTargets immediately before
++                 * every draw instead of only when the target changes. A clear
++                 * proves the RTV descriptor is good but not that the binding is
++                 * still live at draw time -- ClearRenderTargetView writes
++                 * through the descriptor and never consults the OM. If anything
++                 * between the retarget and here drops the binding, this restores
++                 * it. */
++                { static int rb = -1;
++                  if (rb < 0) { const char* e = getenv("RT_REBIND"); rb = e ? atoi(e) : 0; }
++                  if (rb) {
++                      D3D12_CPU_DESCRIPTOR_HANDLE brh[4];
++                      UINT bn = 1;
++                      brh[0] = (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
++                      for (int _m = 0; _m < 3; _m++)
++                          if (cur_m[_m] >= 0) brh[bn++] = off_rt_rtv(cur_m[_m]);
++                      s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
++                          s_d3d.cmd_list, bn, brh, FALSE, &dsv_handle);
++                  } }
                  s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                      dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                  /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
-@@ -4419,7 +4648,10 @@ static void render_frame(void)
+@@ -4419,7 +4666,10 @@ static void render_frame(void)
      static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
      { const char* sv = getenv("RTT_SAVERT");
        static int _done = 0;
@@ -557,7 +575,7 @@ index 3a3e5db..b5c2bfe 100644
        if (sv && !_done && s_d3d.frame_count > 60 + _skip) {
          int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
          if (rt >= 0 && s_d3d.off_rt[rt].res) {
-@@ -4474,6 +4706,8 @@ static void render_frame(void)
+@@ -4474,6 +4724,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
@@ -566,7 +584,7 @@ index 3a3e5db..b5c2bfe 100644
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -5064,7 +5298,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
+@@ -5064,7 +5316,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
      const rsx_vertex_attrib* a = &state->vertex_attribs[0];
      fprintf(stderr, "[VTXPOS] a0 off=0x%X stride=%u size=%u type=%u -> (%g, %g, %g, %g)\n",
              a->offset, a->stride, a->size, a->type,
@@ -575,7 +593,7 @@ index 3a3e5db..b5c2bfe 100644
  }
  
  static void vp_attrs_dbg(const rsx_state* state)
-@@ -6289,6 +6523,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6541,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -587,7 +605,7 @@ index 3a3e5db..b5c2bfe 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
-@@ -6303,6 +6542,28 @@ void rsx_d3d12_backend_present(void)
+@@ -6303,6 +6560,28 @@ void rsx_d3d12_backend_present(void)
              if (s_d3d.draws[_i].is_clear) { clears++; continue; }
              if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
          }

@@ -1115,6 +1115,22 @@ That is the cleanest statement this investigation can produce without GPU-side
 visibility: `ClearRenderTargetView` and `DrawInstanced`, same RTV, same command
 list, one works and one does nothing.
 
+One caveat on that evidence, and the last hypothesis it suggested:
+`ClearRenderTargetView` writes through the descriptor and never consults
+`OMSetRenderTargets`, so the clear proves the *descriptor* is good, not that the
+binding is live when the draw runs. `RT_REBIND=1` re-issues
+`OMSetRenderTargets` immediately before every draw rather than only on a target
+change — and the surface is still uniformly magenta. So the binding is not it
+either.
+
+The exhausted list, each verified rather than assumed: FIFO walk and fences;
+vertex fetch and the buffer's contents, allocation and mapping; input layout,
+stride and buffer view; `is_vp` gating; draw arguments; PSO and root signature;
+RTV creation, indexing and per-draw rebinding; viewport and scissor; colour
+mask, depth, cull and alpha test; clip-space `w`; the whole position; and D3D12
+validation via the info queue. Everything reports correct and the draws write
+nothing. What remains needs to watch the GPU execute one of them.
+
 Those two together are the handoff: the negative `w` is a real defect that would
 stop rendering on its own and wants fixing regardless, and something upstream of
 the vertex shader is *also* wrong, because correcting the position is not
