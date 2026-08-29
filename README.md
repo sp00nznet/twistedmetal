@@ -1012,9 +1012,37 @@ render-to-texture pre-pass does not fix it — `off_rt_find()` still returns -1
 for them, so the draw records are not carrying MRT offsets in the first place.
 That was tried and reverted rather than left in.
 
-Neither makes the picture appear, but `D3D12_IQ=1` is the tool the next pass
-should start from: it is the only thing so far that has produced real errors
-instead of clean bills of health, and both of its findings are concrete. The
+Neither makes the picture appear — but chasing the second one exposed a flaw in
+how every "is the target empty" test above was read. **`0.000% nonzero` cannot
+tell an untouched surface from one written black.** The dumped fragment shader
+settles part of it (`PSOut _po; _po.c0 = h[0];` — it does write `SV_Target0`),
+and it also shows why `FP_FORCE` never did anything: it patches `return r[0];`,
+which these shaders do not contain.
+
+`RT_CLEARDBG=1` removes the ambiguity by clearing offscreen targets to magenta
+instead of the guest colour:
+
+```
+RT_CLEARDBG=1 RTT_SAVERT=AB0000 -> 1280x704, 66.667% nonzero, uniform (255,0,255)
+```
+
+So the surface **is** reachable and writable, the clears land on it, and the
+readback is sound. And the draws change **not one pixel** of it. That is the
+sharpest statement of the problem yet, and it is much narrower than "nothing
+renders": on the same RTV, in the same command list, `ClearRenderTargetView`
+works and `DrawInstanced` does not. Whatever is wrong is in what separates
+them — the PSO, the root signature, the vertex buffer view, the depth state —
+and not in the surface, the binding, the FIFO or the composite.
+
+Worth noting for whoever picks this up: `DEPTH_OFF`, `CULL_OFF`, `NO_ALPHATEST`
+and `FP_IDCOLOR` all act on the guest-FP pipeline, while these draws go through
+the single shared VP pipeline (`[VPPASS] vpso=...` is one pointer for the whole
+batch). Those knobs were never touching the draws in question, so the earlier
+"not depth, not culling, not the shader" conclusions do not hold and want
+redoing against the VP path.
+
+`D3D12_IQ=1` remains the tool to start from: it is the only thing so far that
+has produced real errors instead of clean bills of health. The
 next tool is a frame capture: PIX or RenderDoc on a single frame will show in
 seconds whether the draws reach that render target, which descriptor is actually
 bound and what the output merger does with the result. Everything above narrows
