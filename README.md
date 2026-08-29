@@ -500,39 +500,61 @@ The stalled SPU task identifies itself. Its image carries
 ```
 SPUNAME  PS3_Release/edgezlib_inflate_task
 EDGE ZLIB ERROR: edgeZlibInflateRawData failed (%d)
-EDGE ZLIB ERROR: edgeZlibFetchAndInflateLargeRawData failed (%d)
 ```
 
 and the PPU binary names the taskset it belongs to, `edgeDecompressorTaskset`.
-So the task is Sony's **Edge Zlib** decompressor: the thing that inflates the
-title's packed assets. It parks in `WAIT_SIGNAL` having run 0 ms, a PPU thread
-blocks in `cellSpursEventFlagWait` for it to signal completion, and nothing ever
-arrives — which is why 202 files load, 32 draws are issued, and then the title
-sits on a loading screen forever.
+It is Sony's **Edge Zlib** decompressor — the thing that inflates the title's
+packed assets. It parks in `WAIT_SIGNAL` having run 0 ms, which is *correct*
+behaviour for an idle worker, and a PPU thread blocks in
+`cellSpursEventFlagWait` for it. Nothing ever submits work.
 
-The reason no work reaches it is one unimplemented import. Auditing every SPURS
-and sync import the title uses leaves 23 faked, and among them:
+The submission path is the **job queue**, not the lock-free queue. Logging every
+faked import actually reached at run time settles it:
 
 ```
-cellSpurs    0x8A85674D  _cellSpursLFQueuePushBody      <- the work submission
-cellSpurs    0x011EE38B  _cellSpursLFQueueInitialize
-cellSpurs    0x1656D49F  cellSpursLFQueueAttachLv2EventQueue
+x12  0x3D1294FC  cellSpursJobQueuePortInitialize
+x6   0xF244E799  _cellSpursCreateJobQueue
+x6   0x80A0264C  cellSpursJobQueuePortTrySync
+x6   0x1686957E  cellSpursJobQueueAttributeSetMaxSizeJobDescriptor
+x5   0x634B1502  cellSpursJobQueuePortSync
+x1   0x011EE38B  _cellSpursLFQueueInitialize
 ```
 
-A SPURS lock-free queue is how the PPU hands jobs to a taskset. `PushBody` does
-nothing here, so the queue stays empty, so the decompressor is never signalled.
+(The unnamed `cellSpursJq` NIDs were resolved by computing NIDs from RPCS3's
+function names.) The title creates six job queues and twelve ports and syncs
+them — and `_cellSpursJobQueuePortPushBody` is **never called**, so it is
+blocked before it ever submits a job. `_cellSpursLFQueuePushBody` is never
+called either; an earlier draft of this file blamed it, wrongly.
 
-This is not a bridging job like the taskset and task v2 APIs were.
-`CellSpursLFQueue` is `CellSyncLFQueue` — a 128-byte-aligned lock-free ring with
-six different header layouts and CAS-based push/pop pointers, and the consumer
-is the **lifted SPU code**, so a PPU-side implementation has to interoperate
-with it byte-for-byte. RPCS3 leaves `_cellSpursLFQueuePushBody` as a `todo()`
-stub. Implementing it, or HLE-ing Edge Zlib wholesale onto host zlib, is the
-next real piece of work and the thing standing between this port and content.
+`cellSpursJq` is 63 `UNIMPLEMENTED_FUNC` stubs in RPCS3 and absent from
+ps3recomp, so this is a reverse-engineering project rather than a bridge — and
+it is the one thing between this port and content.
 
-(The PPU has no Edge Zlib entry point to override instead: the
-`edgeZlibInflateRawData` error strings in the binary have no code references at
-all, so the inflate genuinely only exists on the SPU.)
+### Why the screen is dark: nothing is drawn
+
+Worth stating plainly, because it is easy to blame the graphics path. It is not
+the graphics path.
+
+The title does not present by drawing into a backbuffer. It renders its scene
+into a 1280x704 surface and composites with the RSX 2D engine:
+
+```
+[NV3089] 676x448 src=0xC1190000(pitch 10240) -> dst=0xC0010000(pitch 5120) at 22,16
+```
+
+`dst=0xC0010000` is local-memory offset `0x10000` — display buffer 0 — so the
+finished, letterboxed SD frame is assembled in **guest memory**, scaled down
+from the scene surface and inset by the overscan margin.
+
+Both ends of that are empty. `RTT_SAVERT=1190000` dumps the scene render target
+itself: 1280x704, **every pixel zero**. `TM_FBDUMP` dumps the guest display
+buffer straight out of `vm_base`: 720x480, every pixel zero. The title issues 32
+draws in a hundred seconds, all at startup, all the same 4-vertex QUAD, and
+renders nothing else — because it is waiting on a loading screen.
+
+So the compositor, the blit, the present and the draws all behave; there is
+simply no image to show. The dark window is a symptom of the decompressor, not
+of the renderer.
 
 ### Reading the title's own config
 

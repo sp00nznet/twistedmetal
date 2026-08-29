@@ -31,6 +31,8 @@ void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
 void     tm_hle_register_extra(void);   /* src/hle_extra.cpp */
 void     tm_init_title_metadata(void);  /* src/hle_extra.cpp */
+void     tm_fbdump_tick(void);          /* src/hle_extra.cpp */
+void     tm_ef_kick_tick(void);         /* src/hle_extra.cpp */
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
@@ -202,6 +204,8 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * 60Hz lets that wait time out (JSGcmFifo.cpp:142 ref-mismatch assert), so
          * keep control->get/ref tracking control->put with ~1ms latency. */
         if (rsx_ok) cellGcm_rsx_process_fifo();
+        tm_fbdump_tick();   /* TM_FBDUMP=<secs>: snapshot the guest framebuffer */
+        tm_ef_kick_tick();  /* TM_EF_KICK=<secs>: probe the stalled SPURS wait */
         ULONGLONG now = GetTickCount64();
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {

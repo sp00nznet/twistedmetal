@@ -570,3 +570,104 @@ static void probe_cellSpursSendSignal(ppu_context* ctx)
     fprintf(stderr, "[cellSpurs] SendSignal(taskset=0x%08X, task=%u)\n", ts, tid);
     ctx->gpr[3] = (uint64_t)(int64_t)_cellSpursSendSignal((void*)(uintptr_t)ts, tid);
 }
+
+/* ---------------------------------------------------------------------------
+ * TM_FBDUMP=<seconds> — write the guest display buffer to a BMP.
+ *
+ * This title does not present by drawing into the backbuffer. It renders its
+ * scene into a 1280x704 surface and then composites with the RSX 2D engine:
+ *
+ *   [NV3089] 676x448 src=0xC1190000 -> dst=0xC0010000 at 22,16
+ *
+ * dst 0xC0010000 is local-memory offset 0x10000 — display buffer 0, the one
+ * cellGcmSetDisplayBuffer registered — so the finished, letterboxed frame is
+ * assembled in GUEST MEMORY. The D3D12 backend presents its own backbuffer and
+ * never reads that, which is why the window stays dark however well the draws
+ * translate. Dumping it is the direct way to see what the title actually
+ * produced.
+ * ------------------------------------------------------------------------- */
+extern "C" uint8_t* vm_base;
+
+static void tm_write_bmp(const char* path, const uint8_t* argb, uint32_t w, uint32_t h,
+                         uint32_t pitch)
+{
+    const uint32_t rowsz = ((w * 3 + 3) / 4) * 4;
+    const uint32_t dataz = rowsz * h;
+    uint8_t hdr[54] = {0};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    *(uint32_t*)(hdr + 2) = 54 + dataz;
+    *(uint32_t*)(hdr + 10) = 54;
+    *(uint32_t*)(hdr + 14) = 40;
+    *(int32_t*)(hdr + 18) = (int32_t)w;
+    *(int32_t*)(hdr + 22) = (int32_t)h;         /* positive: bottom-up */
+    *(uint16_t*)(hdr + 26) = 1;
+    *(uint16_t*)(hdr + 28) = 24;
+    *(uint32_t*)(hdr + 34) = dataz;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(hdr, 1, sizeof hdr, f);
+    uint8_t* row = (uint8_t*)calloc(1, rowsz);
+    for (int y = (int)h - 1; y >= 0; y--) {
+        const uint8_t* src = argb + (size_t)y * pitch;
+        for (uint32_t x = 0; x < w; x++) {
+            /* Guest stores big-endian A8R8G8B8: bytes are A,R,G,B. */
+            row[x * 3 + 0] = src[x * 4 + 3];   /* B */
+            row[x * 3 + 1] = src[x * 4 + 2];   /* G */
+            row[x * 3 + 2] = src[x * 4 + 1];   /* R */
+        }
+        fwrite(row, 1, rowsz, f);
+    }
+    free(row);
+    fclose(f);
+}
+
+extern "C" void tm_fbdump_tick(void)
+{
+    static int secs = -1;
+    if (secs < 0) { const char* e = getenv("TM_FBDUMP"); secs = e ? atoi(e) : 0; }
+    if (!secs || !vm_base) return;
+
+    static unsigned long long t0 = 0, next = 0;
+    const unsigned long long now = (unsigned long long)time(NULL);
+    if (!t0) { t0 = now; next = now + (unsigned)secs; return; }
+    if (now < next) return;
+    next = now + (unsigned)secs;
+
+    /* Local memory base 0xC0000000; display buffer 0 at offset 0x10000,
+     * 720x480 with the 5120-byte pitch cellGcmSetDisplayBuffer reported. */
+    static int n = 0;
+    char path[64];
+    snprintf(path, sizeof path, "fb_%03d.bmp", n++);
+    tm_write_bmp(path, vm_base + 0xC0010000u, 720, 480, 5120);
+    fprintf(stderr, "[fbdump] wrote %s from guest 0xC0010000\n", path);
+}
+
+/* TM_EF_KICK=<secs> — diagnostic: set SPURS event flag bit 0 after N seconds.
+ *
+ * A PPU thread blocks in cellSpursEventFlagWait on flag 0x400EDA00 pattern
+ * 0x0001 while the Edge Zlib task idles in WAIT_SIGNAL. If that wait is the
+ * decompressor announcing readiness, satisfying it should let the loader go on
+ * and submit its first job — which is the question this answers. It is a probe,
+ * not a fix: nothing here decompresses anything. */
+extern "C" int32_t cellSpursEventFlagSet(void* eventFlag, uint16_t bits);
+
+extern "C" void tm_ef_kick_tick(void)
+{
+    static int secs = -1;
+    if (secs < 0) { const char* e = getenv("TM_EF_KICK"); secs = e ? atoi(e) : 0; }
+    if (!secs) return;
+    static unsigned long long t0 = 0;
+    const unsigned long long now = (unsigned long long)time(NULL);
+    if (!t0) { t0 = now; return; }
+    if (now - t0 < (unsigned)secs) return;
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const uint32_t flag = 0x400EDA00u;
+    /* A PPU-side Set on an SPU2PPU flag is recorded as "owed bits" for the SPU
+     * to collect rather than applied, so events stays 0 and the waiter keeps
+     * blocking. The waiter polls the guest events word directly, so write it. */
+    vm_write16(flag + 0x00 /* EF_EVENTS */, 0x0001);
+    fprintf(stderr, "[TM_EF_KICK] wrote events=0x0001 to flag 0x%08X\n", flag);
+}
