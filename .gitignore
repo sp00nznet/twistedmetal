@@ -39,6 +39,10 @@ cmake_install.cmake
 compile_commands.json
 *.map
 
+# --- Backend debug dumps: decompiled guest shaders, derived from YOUR binary ---
+*_dump.hlsl
+rt_save.bmp
+
 # --- Logs / scratch ---
 *.log
 *.tmp
