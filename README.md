@@ -383,7 +383,7 @@ statement is a conditional branch, with no terminator.
 With FIOS alive the title started reading, and immediately hit two runtime bugs.
 Both fixes are in **`../ps3recomp`**, not this repo — they are runtime-level and
 affect every title. They live there as working-tree edits; the same diff is
-kept here as [`docs/ps3recomp-fs-fixes.patch`](docs/ps3recomp-fs-fixes.patch)
+kept here as [`docs/ps3recomp-fixes.patch`](docs/ps3recomp-fixes.patch)
 so this repo records what the build depends on, and so they can be reapplied or
 upstreamed independently.
 
@@ -642,6 +642,48 @@ workload `Wws_Job/BrBDblBufWrkld`, whose PM is not lifted, so its primary output
 never comes up and `brb_StartSession()` times out after ten seconds. The title
 carries on without it.
 
+### Why nothing draws: the RSX is parked and never released
+
+`PERF=1` says zero vertices, so the next question is whether the title is
+submitting at all. `TM_FIFOWATCH=1` prints the RSX control register once a
+second — `put`, `get`, `ref` — read straight out of guest memory at ps3recomp's
+fixed control-register EA:
+
+```
+[fifo] put=0x0F7050D4 get=0x0F700940 ref=0x00000000
+       STALLED, words at get: 2F700940 0010C400 02C00400 00022800 00040194 FEED0000
+```
+
+`put` moves; `get` does not. The title **is** submitting — the drain is not
+following. `GCM_RECDBG=1` shows why. The FIFO starts out healthy, ping-ponging
+between two 6 MB segments of the 12 MB ring the title maps at IO `0x0F100000`:
+
+```
+[JMP] 0F100374 -> 0F700100 (put=0F700248)
+[JMP] 0F700248 -> 0F100200 (put=0F100348)
+```
+
+and then degenerates into
+
+```
+[JMP] 0F700940 -> 0F700940 (put=0F7050D4)
+```
+
+`0x2F700940` is a JUMP whose target is its own address — the "park the RSX
+here" idiom. A title writes it at the write head so the GPU stops if it catches
+up, and overwrites it when the next segment is appended. This one never
+overwrites it: `put` moves on into the other half and the park is left standing,
+mid-segment, with perfectly good commands sitting right behind it
+(`0x00040194` is a method write, `FEED0000` a DMA context handle).
+
+The drain used to *take* that jump, re-reading the same word forever — **38.8
+million times in one run**. `docs/ps3recomp-fixes.patch` stops that pass instead
+(the next one re-reads the word, so a jump that does get patched is still
+followed). That removes a pointless spin but changes nothing on screen, which is
+worth stating plainly: the spin was not the cause. The open question is why the
+title leaves the park in place, and it is the single thing between this port and
+a visible frame.
+
 ### Finding a message when the cross-reference cannot
 
 Almost none of this was reachable by reading the lifted C++. String addresses in
@@ -819,7 +861,7 @@ twistedmetal/
 │   ├── spu_gen/            # lifted SPU images, 19 MB (gitignored; regenerate)
 │   └── recomp/             # lifted C++, 295 MB (gitignored; regenerate)
 ├── docs/
-│   └── ps3recomp-fs-fixes.patch   # runtime fixes this build needs
+│   └── ps3recomp-fixes.patch      # runtime fixes this build needs
 ├── data/keys               # your scetool key file (gitignored)
 ├── input/                  # your EBOOT + assets (gitignored)
 └── meta/                   # analysis output, regenerated (gitignored)

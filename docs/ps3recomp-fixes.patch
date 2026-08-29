@@ -1,3 +1,22 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 23e7f94..4f5de3f 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1162,6 +1162,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
+             { u32 tgt = w & 0x1FFFFFFCu;
+               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); break; }
++              /* A JUMP to its own address is the "park the RSX here" idiom:
++               * the title leaves it at the write head so the GPU stops if it
++               * catches up, and overwrites it when the next segment is
++               * appended. Taking it re-reads the same word forever -- 38.8 M
++               * times in one Twisted Metal run, which is the drain burning the
++               * CPU the guest needs. Stop this pass instead; the next one
++               * re-reads the word, so a patched jump is still followed. */
++              if (tgt == s_fifo_getoff) break;
+               s_fifo_getoff = tgt; }
+             continue;
+         }
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index 886fbc7..976a05b 100644
 --- a/runtime/ppu/ppu_fs.cpp

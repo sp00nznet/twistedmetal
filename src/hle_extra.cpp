@@ -836,6 +836,44 @@ extern "C" int32_t cellSpursEventFlagSet(void* eventFlag, uint16_t bits);
  * func_0064C410 and func_0010E57C, are never reached. Setting it by hand says
  * whether that byte is really the gate or just a symptom. A probe, not a fix.
  */
+/* TM_FIFOWATCH=1 -- print the RSX control register once a second.
+ *
+ * put/get/ref is the whole question when nothing draws: if `put` is not moving,
+ * the title is not submitting commands and the backend is blameless; if `put`
+ * runs ahead of `get`, the drain is behind. The register lives at a fixed guest
+ * EA (ps3recomp's VM_HLE_INJECT_BASE + 0x2000) so the recompiled code can reach
+ * it through vm_base, which means we can read it the same way. */
+#define GCM_CONTROL_EA 0x20002000u
+
+extern "C" void tm_fifowatch_tick(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_FIFOWATCH") ? 1 : 0;
+    if (!on || !vm_base) return;
+    static unsigned long long next = 0;
+    const unsigned long long now = (unsigned long long)time(NULL);
+    if (now < next) return;
+    next = now + 1;
+    const uint32_t put = vm_read32(GCM_CONTROL_EA + 0);
+    const uint32_t get = vm_read32(GCM_CONTROL_EA + 4);
+    const uint32_t ref = vm_read32(GCM_CONTROL_EA + 8);
+    fprintf(stderr, "[fifo] put=0x%08X get=0x%08X ref=0x%08X", put, get, ref);
+
+    /* When get stops moving while put runs ahead, the drain has stalled on a
+     * command it will not step over. Print it: this title maps every IO offset
+     * at a constant +0x11000000 (cellGcmInit ioAddr, and both MapEaIoAddress
+     * calls agree), so the word at `get` is directly readable. */
+    static uint32_t last_get = 0xFFFFFFFFu;
+    if (get == last_get && get != put) {
+        const uint32_t ea = get + 0x11000000u;
+        fprintf(stderr, "  STALLED, words at get:");
+        for (int i = 0; i < 6; i++) fprintf(stderr, " %08X", vm_read32(ea + i * 4));
+    }
+    last_get = get;
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 extern "C" void tm_loaddone_tick(void)
 {
     static int secs = -1;
