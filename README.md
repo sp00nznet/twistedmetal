@@ -36,7 +36,7 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **reads its own data** — blocked on short reads past 32 KB |
+| Boot | **past config load** — re-lifting with full code coverage |
 | Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
 | Audio / input | not started |
 
@@ -373,18 +373,59 @@ post-lift edge keeps it in this repo for now. It is also worth auditing the
 other 35,635 lifted functions for the same shape — a fragment whose last
 statement is a conditional branch, with no terminator.
 
-### Where it stops now
+### Two filesystem bugs, in ps3recomp
 
-Two new and specific problems, both in the runtime's filesystem layer:
+With FIOS alive the title started reading, and immediately hit two runtime bugs.
+Both fixes are in **`../ps3recomp`**, not this repo — they are runtime-level and
+affect every title, and are currently local edits there awaiting upstreaming.
 
-* **Short reads.** `read fd=3 nbytes=32768 -> 0` at offset 32768 of a
-  175,248-byte file. Anything past the first 32 KB comes back empty, and the
-  game's own diagnostic says so: *"Short read at offset 32768 … Possible
-  reasons include disc eject"*, then it retries.
-* **`tmxconfig.sdat`** — `SdataOpen … NPD decrypt FAILED (unsupported
-  EDAT/needs license); returning success without a handle`. The title's config
-  document is an EDAT the runtime cannot decrypt, and the caller is handed a
-  success with nothing behind it.
+**Short reads past the first page.** `read fd=3 nbytes=32768 -> 0` with
+`eof=0 err=1`, deterministic, on files hundreds of KB long. The guest VM is
+`MEM_RESERVE`d with each page committed on first access by a vectored exception
+handler — which covers CPU access from lifted code, but `fread` moves data
+through the *kernel*, and a kernel write to a reserved page raises no user-mode
+exception. The I/O just fails. So read 1 of a file worked (its destination had
+been touched) and read 2 into a fresh page returned nothing, and the title
+printed its own *"Short read … Possible reasons include disc eject"* and gave
+up. `ppu_fs.cpp` now pre-faults the destination range read-then-write, in user
+mode, before `fread`/`fwrite`. Short reads: **0**.
+
+**`tmxconfig.sdat` would not decrypt.** `cellFsSdataOpen` reported
+*"NPD decrypt FAILED (unsupported EDAT/needs license)"* and handed the caller a
+success with no handle, so `GameContent::initConfigDocA` got nothing. The file
+is flags `0x0100003C` — `SDAT_FLAG` is set, so it uses the fixed SDAT key and
+needs no license at all. `sdata_decrypt.h` was bailing purely on flag `0x20`,
+which changes only the block *layout*: a 0x20-byte metadata record precedes
+every block instead of one table up front. Same crypto. Teaching it that one
+offset was enough:
+
+```
+[fs] SdataOpen '/dev_bdvd/PS3_GAME/USRDIR/tmxconfig.sdat' -> fd 3
+     (NPD decrypted, 0x54E4 bytes, magic '<?xm')
+```
+
+The config document is XML, and the title stopped exiting — it now runs past
+config load and keeps going.
+
+### 12% of the code was never lifted
+
+What it runs into next is the same defect that caused the FIOS hang, measured
+properly this time. `find_functions` detects 31,032 functions but accounts for
+only 88% of the executable segment: **7,197 gaps totalling 1,573,492 bytes
+(12.09%)** lie between them.
+
+That is not cosmetic. A gap immediately after a function truncates it — which is
+exactly what stranded `func_0076C534`'s tail and left the FIOS workers
+unconstructed. And code *inside* a gap is never lifted, so an indirect call into
+it lands on the runtime's "unresolved indirect call" path and quietly returns.
+Seven such targets at `0x009D38E4..0x009D3A64` — one uncovered 0x1A4-byte
+region — spun the title forever, 199,351 log lines per 200,000.
+
+`tools/seed_gaps.py` closes the holes: it computes the gaps, emits a function
+entry for each, and splits them at addresses harvested from a run log so
+indirect targets become real entry points rather than addresses buried inside a
+blob. 31,032 → 38,235 functions, **0 bytes uncovered**. The proper fix belongs
+in `find_functions`' boundary detection upstream.
 
 ### Video modes
 
@@ -488,6 +529,7 @@ twistedmetal/
 │   ├── decrypt_iso.py      # raw PS3 disc image -> plain image (bring your own key)
 │   ├── decrypt_self.py     # retail SELF -> plain ELF (bring your own key file)
 │   ├── recarve_spu.py      # size SPU images the way the runtime fingerprints them
+│   ├── seed_gaps.py        # cover the 12% of code find_functions misses
 │   └── post_lift.py        # idempotent post-lift patches (the title's logger)
 ├── src/
 │   ├── boot_main.cpp       # ps3recomp boot harness, rebranded for this title
