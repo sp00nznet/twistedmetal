@@ -493,34 +493,60 @@ the same 1024x512 texture bound.
 That is what a stalled loading screen looks like. The render path is not what is
 keeping the screen dark; the title has nothing further to draw.
 
-### What gates the content: a SPURS signal
+### What gates the content: Edge Zlib on the SPU
+
+The stalled SPU task identifies itself. Its image carries
 
 ```
-[spu] SPURS taskset syscall num=2 (raw=0x2 args=0x000027C4) image=2 link/r0=0x09668
-[spu_workload] task 0 (taskset 0x11ECF180) sleeping 13s in WAIT_SIGNAL
-[cellSpurs] EventFlagWait BLOCKED tid=15156 on pattern 0x0001 flagEA=0x400EDA00
-            -- waiting for an SPU workload to cellSpursEventFlagSet it
+SPUNAME  PS3_Release/edgezlib_inflate_task
+EDGE ZLIB ERROR: edgeZlibInflateRawData failed (%d)
+EDGE ZLIB ERROR: edgeZlibFetchAndInflateLargeRawData failed (%d)
 ```
 
-Syscall 2 really is `CELL_SPURS_TASK_SYSCALL_WAIT_SIGNAL` — checked against
-RPCS3's `spursTasksetProcessSyscall`, which also polls for a pending signal
-first and only then parks, exactly as the runtime does. The task parks at LS
-`0x9668` having run 0 ms, and `_cellSpursSendSignal` is **never called** in a
-whole boot (verified with a forwarding probe on NID `0xE0A6DBE4`). Meanwhile a
-PPU thread blocks in `cellSpursEventFlagWait` for that same task to set flag
-`0x400EDA00`, which was initialised `direction=1` — SPU2PPU, so the SPU is
-indeed the side expected to set it.
+and the PPU binary names the taskset it belongs to, `edgeDecompressorTaskset`.
+So the task is Sony's **Edge Zlib** decompressor: the thing that inflates the
+title's packed assets. It parks in `WAIT_SIGNAL` having run 0 ms, a PPU thread
+blocks in `cellSpursEventFlagWait` for it to signal completion, and nothing ever
+arrives — which is why 202 files load, 32 draws are issued, and then the title
+sits on a loading screen forever.
 
-Two ends of one handshake, each waiting for the other. `SPURS_EF_FORCE=1` does
-not break it. What is still unknown is which producer is supposed to set that
-flag: the title creates two tasksets (`maxContention` 1 and 8) but only ever one
-task, so the setter may be a task that is never created — which would put this
-back with the missing v2 task API rather than with the signal itself.
+The reason no work reaches it is one unimplemented import. Auditing every SPURS
+and sync import the title uses leaves 23 faked, and among them:
 
-Bridged along the way, though not yet exercised on this path:
-`cellSpursCreateTask2` (`0xE14CA62D`, argument order taken from the game's own
-call site at `0x00A1C2A0` since RPCS3 does not implement it),
-`_cellSpursTaskAttribute2Initialize` and `cellSpursTaskGetContextSaveAreaSize`.
+```
+cellSpurs    0x8A85674D  _cellSpursLFQueuePushBody      <- the work submission
+cellSpurs    0x011EE38B  _cellSpursLFQueueInitialize
+cellSpurs    0x1656D49F  cellSpursLFQueueAttachLv2EventQueue
+```
+
+A SPURS lock-free queue is how the PPU hands jobs to a taskset. `PushBody` does
+nothing here, so the queue stays empty, so the decompressor is never signalled.
+
+This is not a bridging job like the taskset and task v2 APIs were.
+`CellSpursLFQueue` is `CellSyncLFQueue` — a 128-byte-aligned lock-free ring with
+six different header layouts and CAS-based push/pop pointers, and the consumer
+is the **lifted SPU code**, so a PPU-side implementation has to interoperate
+with it byte-for-byte. RPCS3 leaves `_cellSpursLFQueuePushBody` as a `todo()`
+stub. Implementing it, or HLE-ing Edge Zlib wholesale onto host zlib, is the
+next real piece of work and the thing standing between this port and content.
+
+(The PPU has no Edge Zlib entry point to override instead: the
+`edgeZlibInflateRawData` error strings in the binary have no code references at
+all, so the inflate genuinely only exists on the SPU.)
+
+### Reading the title's own config
+
+`tools/decrypt_edat.py` decrypts SDATA containers with the published fixed keys,
+which makes `tmxconfig.sdat` readable:
+
+```xml
+<root version="1.0" assetlabel="BCUS98106">
+  <param key="RESOLUTION" fmt="int32-enum">1080/720/576/576(16:9)/480/480(16:9)</param>
+  ... <usebots> <unlimitedweapons> <shotclock> ...
+```
+
+446 parameters and 14 file entries — useful for confirming what the title
+expects, and independent of the runtime's own decryptor.
 
 ### Video modes
 
