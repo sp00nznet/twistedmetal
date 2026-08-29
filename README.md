@@ -1248,11 +1248,29 @@ it is a loaded texture — which means it should arrive by a copy from main memo
 not happened.
 
 That is the question to pick up: **which transfer fills local memory
-`0x2ACD800`, and is that transfer path implemented?** The 2D-engine trace
-(`GCM2D_TRACE=1`) shows the title using subchannels 3, 6 and 7 and reports no
-unhandled methods, so if this is an NV0039 memory-to-memory transfer it is
-either landing on a subchannel that the NV3062/NV308A branches silently absorb,
-or it is not being issued at all.
+`0x2ACD800`, and is that transfer path implemented?**
+
+`GCM2D_TRACE=1` turns up a separate, concrete defect while answering it. The
+title uses subchannels 1, 3, 4, 5, 6 and 7, and the drain routes every method
+with `subch != 0` to `gcm_2d_method()`, which handles only 2/3 (NV3062), 4/5
+(NV308A/NV309E) and 6/7 (NV3089). **Subchannel 1 is dropped**, and its methods
+are not 2D at all:
+
+```
+0x0F4C  0x151C  0x1A80 0x1A84 ... 0x1AC0  0x1F78
+```
+
+`0x1A00 + i*0x20` is `NV4097_SET_TEXTURE_OFFSET(i)`, so `0x1A80`-`0x1AC0` is
+texture-unit 4-6 setup — 3D methods on subchannel 1. ps3recomp assumes the 3D
+object is always bound to subchannel 0; this title also drives it through
+subchannel 1, and every one of those methods is silently discarded. That is
+worth fixing on its own: it is state the renderer never sees, and it is
+invisible because the 2D path swallows it without logging.
+
+Whether it is *this* bug that leaves `0x2ACD800` unwritten is not yet
+established — the texture the UI samples is unit 0, which would come through
+subchannel 0 — but it is the first concrete defect on the asset-arrival side and
+the obvious place to start.
 
 Everything downstream of this is now known to work: FIFO walk, fences,
 semaphores, rasteriser, sampler, composite and present.
