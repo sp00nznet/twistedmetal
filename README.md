@@ -377,7 +377,10 @@ statement is a conditional branch, with no terminator.
 
 With FIOS alive the title started reading, and immediately hit two runtime bugs.
 Both fixes are in **`../ps3recomp`**, not this repo — they are runtime-level and
-affect every title, and are currently local edits there awaiting upstreaming.
+affect every title. They live there as working-tree edits; the same diff is
+kept here as [`docs/ps3recomp-fs-fixes.patch`](docs/ps3recomp-fs-fixes.patch)
+so this repo records what the build depends on, and so they can be reapplied or
+upstreamed independently.
 
 **Short reads past the first page.** `read fd=3 nbytes=32768 -> 0` with
 `eof=0 err=1`, deterministic, on files hundreds of KB long. The guest VM is
@@ -538,6 +541,8 @@ twistedmetal/
 │   ├── gen/                # generated HLE NID table (committed)
 │   ├── spu_gen/            # lifted SPU images, 19 MB (gitignored; regenerate)
 │   └── recomp/             # lifted C++, 295 MB (gitignored; regenerate)
+├── docs/
+│   └── ps3recomp-fs-fixes.patch   # runtime fixes this build needs
 ├── data/keys               # your scetool key file (gitignored)
 ├── input/                  # your EBOOT + assets (gitignored)
 └── meta/                   # analysis output, regenerated (gitignored)

@@ -1,0 +1,82 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 886fbc7..976a05b 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -312,6 +312,28 @@ static void cellFsClose(ppu_context* ctx)
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
++/* Pre-fault a guest range so the kernel can write into it.
++ *
++ * The flat VM is MEM_RESERVEd and each page is committed on FIRST ACCESS by a
++ * vectored exception handler. That covers CPU access from lifted code, but
++ * fread/fwrite move data through the kernel, and a kernel write to a reserved
++ * page does not raise a user-mode exception -- the I/O just fails, returning 0
++ * with ferror set. Twisted Metal hit this on every read whose destination the
++ * guest had not touched yet: read 1 of a file succeeded, read 2 into a fresh
++ * page came back n=0 eof=0 err=1, and the title logged its own
++ * "Short read ... Possible reasons include disc eject" and gave up.
++ *
++ * Touch each page read-then-write so the fault happens here, in user mode,
++ * where the handler can commit it. Read-then-write rather than a plain store so
++ * nothing already in the buffer is disturbed. */
++static inline void fs_prefault(uint32_t buf, uint64_t len)
++{
++    if (!vm_base || !len) return;
++    volatile uint8_t* p = (volatile uint8_t*)(vm_base + buf);
++    for (uint64_t o = 0; o < len; o += 0x1000) p[o] = p[o];
++    p[len - 1] = p[len - 1];
++}
++
+ static void cellFsRead(ppu_context* ctx)
+ {
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+@@ -322,6 +344,7 @@ static void cellFsRead(ppu_context* ctx)
+     uint64_t raw_nbytes = ctx->gpr[5];
+     long fpos_before = ftell(g_files[fd]);
+     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
++    fs_prefault(buf, nbytes);
+     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+     if (g_fd_usm[fd] && getenv("YDKJ_USMRD")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
+     if (getenv("YDKJ_FSDBG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
+@@ -348,6 +371,7 @@ static void cellFsWrite(ppu_context* ctx)
+     uint64_t nbytes = ctx->gpr[5];
+     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
+     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
++    fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
+     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+     /* DIAGNOSTIC (FLOW_CFGBT=1): dump the guest back-chain when the game logs the
+      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
+diff --git a/runtime/ppu/sdata_decrypt.h b/runtime/ppu/sdata_decrypt.h
+index c6950a6..ec3380a 100644
+--- a/runtime/ppu/sdata_decrypt.h
++++ b/runtime/ppu/sdata_decrypt.h
+@@ -140,9 +140,15 @@ static inline uint8_t* sdata_decrypt(const uint8_t* d, size_t n, size_t* out_siz
+     uint64_t file_size = sd_be64(d + 0x88);
+     if(!(flags & 0x01000000u)) return NULL;   /* not SDATA (would need NPDRM license) */
+     if(block_size == 0 || file_size == 0 || file_size > (uint64_t)n) return NULL;
+-    /* Only the plain (non-"compressed", non-0x20-metadata) layout is needed for
+-     * LBP's .sdat; bail (caller keeps ciphertext) on the exotic variants. */
+-    if((flags & 0x01/*COMPRESSED*/) || (flags & 0x20)) return NULL;
++    /* Compression is still unsupported; bail (caller keeps ciphertext). */
++    if(flags & 0x01/*COMPRESSED*/) return NULL;
++    /* EDAT_FLAG_0x20 changes only the block LAYOUT: instead of one 0x10-byte
++     * metadata table before the data, a 0x20-byte metadata record precedes
++     * every block. The crypto below is identical. Twisted Metal's
++     * tmxconfig.sdat is flags=0x0100003C, i.e. SDATA with 0x20 set, and
++     * bailing here meant cellFsSdataOpen handed the title a success with no
++     * handle and its config document never loaded. */
++    const int meta_0x20 = (flags & 0x20) != 0;
+     int enc_key = (flags & 0x08) != 0;   /* EDAT_ENCRYPTED_KEY_FLAG */
+     uint8_t crypt_key[16]; for(int i=0;i<16;i++) crypt_key[i]=dev_hash[i]^SDAT_KEY[i];
+     uint64_t total_blocks = (file_size + block_size - 1) / block_size;
+@@ -150,7 +156,8 @@ static inline uint8_t* sdata_decrypt(const uint8_t* d, size_t n, size_t* out_siz
+     if(!out) return NULL;
+     size_t written = 0;
+     for(uint64_t bn=0; bn<total_blocks; bn++){
+-        uint64_t off = 0x100 + total_blocks*0x10 + bn*block_size;
++        uint64_t off = meta_0x20 ? 0x100 + bn*(0x20 + (uint64_t)block_size) + 0x20
++                                 : 0x100 + total_blocks*0x10 + bn*block_size;
+         uint32_t length = block_size;
+         if(bn==total_blocks-1 && (file_size % block_size)) length = (uint32_t)(file_size % block_size);
+         uint32_t padlen = (length + 15) & ~15u;
