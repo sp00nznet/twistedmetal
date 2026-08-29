@@ -227,7 +227,7 @@ index 23e7f94..83addba 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..ce6d88f 100644
+index 3a3e5db..a309f1e 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -3215,6 +3215,14 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
@@ -245,7 +245,7 @@ index 3a3e5db..ce6d88f 100644
      int slot = off_rt_find(off);
      if (slot >= 0) {
          OffRT* r = &s_d3d.off_rt[slot];
-@@ -3505,6 +3513,151 @@ static void screen_copy_capture(u32 fi)
+@@ -3505,6 +3513,157 @@ static void screen_copy_capture(u32 fi)
  
  }
  
@@ -267,6 +267,8 @@ index 3a3e5db..ce6d88f 100644
 + * surface as a texture, so do the composite here instead. Triggered from
 + * cellGcmSys under GCM_COMPOSITE_RT. */
 +static u32 s_composite_src = 0;
++static int s_last_drawn_slot = -1;
++static u32 s_last_drawn_off  = 0;
 +
 +void rsx_d3d12_composite_from_offscreen(u32 raw_off) { s_composite_src = raw_off; }
 +
@@ -275,7 +277,11 @@ index 3a3e5db..ce6d88f 100644
 +    u32 want = s_composite_src;
 +    s_composite_src = 0;
 +    if (!want) return;
-+    int i = off_rt_find(want);
++    /* want == 2 means "whatever this frame's draws targeted" -- the one thing
++     * guaranteed to hold geometry, and immune to the offset collision above. */
++    int i;
++    if (want == 2u) { i = s_last_drawn_slot; want = s_last_drawn_off; }
++    else            { i = off_rt_find(want); }
 +    if (i < 0 || !s_d3d.off_rt[i].res) return;
 +    OffRT* r = &s_d3d.off_rt[i];
 +    /* Same-format copy only; a half-float source would need a converting draw. */
@@ -397,7 +403,18 @@ index 3a3e5db..ce6d88f 100644
  static void render_frame(void)
  {
      double _rf0 = perf_on() ? perf_now() : 0.0;
-@@ -4474,6 +4627,8 @@ static void render_frame(void)
+@@ -4191,6 +4350,10 @@ static void render_frame(void)
+                 /* Render-to-texture: retarget when this op's surfaces differ.
+                  * Depth is a single shared buffer, so clear it per switch. */
+                 int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
++                /* Remember where geometry actually went: off_rt_find() matches
++                 * on offset alone and slots share offsets at different sizes,
++                 * so the composite cannot just look the source up by address. */
++                if (want >= 0) { s_last_drawn_slot = want; s_last_drawn_off = dr->rt_off; }
+                 int wantm[3];
+                 for (int _m = 0; _m < 3; _m++)
+                     wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
+@@ -4474,6 +4637,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
@@ -406,7 +423,7 @@ index 3a3e5db..ce6d88f 100644
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -6289,6 +6444,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6454,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }

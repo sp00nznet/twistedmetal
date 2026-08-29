@@ -875,11 +875,36 @@ GCM_COMPOSITE_RT=0x1BE0000 -> [COMPOSITE] RT 0x01BE0000 1280x704 -> backbuffer, 
 ```
 
 while `PERF` in the same runs reports 660k vertices, 6469 texture binds and 4362
-pipeline states with zero cache misses. So the draws are recorded, their shaders
-compile and their PSOs bind — and nothing they rasterise reaches the surface
-they target. That is the next layer down, and it is where this stops for now:
-the frame path is complete from the FIFO to the backbuffer, and the rasteriser
-in the middle of it is writing somewhere else.
+pipeline states with zero cache misses.
+
+Two refinements ruled out the obvious explanations. `off_rt_find()` matches on
+offset alone and slots share offsets at different sizes, so looking the source
+up by address can pick a stale one — `GCM_COMPOSITE_RT=2` instead composites the
+slot **the draw loop itself bound**, which is where geometry provably went. It
+picks `0x1BE0000`, and with `RT_FORCE_RGBA8=1` making that copyable the
+composite runs every frame onto the backbuffer. Still nothing.
+
+Then the shading path was removed from the question entirely:
+
+```
+RT_FORCE_RGBA8=1 GCM_COMPOSITE_RT=2 DEPTH_OFF=1 CULL_OFF=1 NO_ALPHATEST=1 FP_FORCE=1
+    -> 0.00%
+RT_FORCE_RGBA8=1 GCM_COMPOSITE_RT=2 VP_BYPASS=1 DEPTH_OFF=1 CULL_OFF=1
+    -> 0.00%
+```
+
+Depth off, culling off, alpha test off, fragment shader forced to solid magenta,
+vertex program bypassed — and not one pixel. Meanwhile the vertex shaders
+decompile and cache normally (`[VP] per-draw VS cached`, 3-8 instructions each,
+the right shape for UI quads). So this is not depth, culling, blending, the
+fragment program or the composite: the geometry is not rasterising at all, which
+points at the transform or at the draws never reaching the GPU.
+
+That is where this pass stops. The frame path is now complete from the FIFO
+through to the backbuffer — walker, fences, semaphores, composite, present — and
+the rasteriser in the middle of it produces nothing. Finding out why is an
+open-ended piece of work in ps3recomp's D3D12 backend rather than another fix
+here, and every probe costs a five-minute boot.
 
 That is a piece of emulator-correctness work rather than another fix, and it is
 what stands between this port and a picture. The picture is in turn what the
