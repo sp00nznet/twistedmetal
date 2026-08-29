@@ -89,6 +89,10 @@ static void cellSpursAttributeEnableSystemWorkload(ppu_context* ctx);
 static void sys_spu_printf_initialize(ppu_context* ctx);
 static void cellVideoOutGetDeviceInfo(ppu_context* ctx);
 static void cellNetCtlGetState(ppu_context* ctx);
+static void cellSpursTaskAttribute2Initialize(ppu_context* ctx);
+static void cellSpursCreateTask2(ppu_context* ctx);
+static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx);
+static void probe_cellSpursSendSignal(ppu_context* ctx);
 
 extern "C" void tm_hle_register_extra(void)
 {
@@ -107,6 +111,13 @@ extern "C" void tm_hle_register_extra(void)
 
     ps3_hle_register_ctx(0x1E930EEFu, "cellVideoOutGetDeviceInfo", cellVideoOutGetDeviceInfo);
     ps3_hle_register_ctx(0x8B3EBA69u, "cellNetCtlGetState", cellNetCtlGetState);
+
+    ps3_hle_register_ctx(0x8ADADF65u, "_cellSpursTaskAttribute2Initialize",
+                         cellSpursTaskAttribute2Initialize);
+    ps3_hle_register_ctx(0xE14CA62Du, "cellSpursCreateTask2", cellSpursCreateTask2);
+    ps3_hle_register_ctx(0x9034E538u, "cellSpursTaskGetContextSaveAreaSize",
+                         cellSpursTaskGetContextSaveAreaSize);
+    ps3_hle_register_ctx(0xE0A6DBE4u, "_cellSpursSendSignal", probe_cellSpursSendSignal);
 }
 
 /* ---------------------------------------------------------------------------
@@ -479,4 +490,83 @@ static void cellNetCtlGetState(ppu_context* ctx)
     static long long n = 0;
     if (n++ < 3) fprintf(stderr, "[cellNetCtl] GetState() -> OK, Disconnected\n");
     ctx->gpr[3] = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * cellSpurs "2" task API — the same gap as the taskset, one level down.
+ *
+ * The runtime implements the 7-argument v1 cellSpursCreateTask; this title
+ * creates its tasks through cellSpursCreateTask2, which was unregistered and so
+ * faked CELL_OK without creating anything. RPCS3 does not implement it either
+ * (only a commented prototype), so the argument order comes from the game's own
+ * call site at guest 0x00A1C2A0: r3=taskset, r4=&taskId, r5=elf, r6=argument,
+ * r7=attribute — the SDK's
+ *
+ *   cellSpursCreateTask2(taskset, taskId, elf, argument, attribute)
+ *
+ * CellSpursTaskAttribute2 is 256 bytes: revision +0x00, sizeContext +0x04,
+ * eaContext +0x08 (u64), lsPattern +0x10 (4 words), name +0x20. Unpack it onto
+ * the v1 call, which takes context/size/lsPattern/argument as separate guest
+ * EAs. A null attribute means the SDK defaults, i.e. no context and no pattern.
+ * ------------------------------------------------------------------------- */
+extern "C" int32_t cellSpursCreateTask(void* taskset, void* taskId, void* elf,
+                                       void* context, uint32_t sizeContext,
+                                       uint32_t lsPattern_ea, uint32_t argument_ea);
+
+#define TA2_SIZE       256
+#define TA2_SIZECTX    0x04
+#define TA2_EACTX      0x08
+#define TA2_LSPATTERN  0x10
+
+static void cellSpursTaskAttribute2Initialize(ppu_context* ctx)
+{
+    const uint32_t attr = (uint32_t)ctx->gpr[3];
+    const uint32_t revision = (uint32_t)ctx->gpr[4];
+    if (!attr) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80410901; return; }
+    for (uint32_t o = 0; o < TA2_SIZE; o += 4) vm_write32(attr + o, 0);
+    vm_write32(attr + 0x00, revision);
+    ctx->gpr[3] = 0;
+}
+
+static void cellSpursCreateTask2(ppu_context* ctx)
+{
+    const uint32_t taskset = (uint32_t)ctx->gpr[3], taskId = (uint32_t)ctx->gpr[4];
+    const uint32_t elf = (uint32_t)ctx->gpr[5], argument = (uint32_t)ctx->gpr[6];
+    const uint32_t attr = (uint32_t)ctx->gpr[7];
+
+    const uint32_t sizeContext = attr ? vm_read32(attr + TA2_SIZECTX) : 0;
+    const uint32_t eaContext   = attr ? (uint32_t)vm_read64(attr + TA2_EACTX) : 0;
+    const uint32_t lsPattern   = attr ? attr + TA2_LSPATTERN : 0;
+
+    fprintf(stderr, "[cellSpurs] CreateTask2(taskset=0x%08X, elf=0x%08X, arg=0x%08X, "
+                    "attr=0x%08X ctx=0x%08X/%u) -> v1 CreateTask\n",
+            taskset, elf, argument, attr, eaContext, sizeContext);
+
+    const int32_t rc = cellSpursCreateTask((void*)(uintptr_t)taskset,
+                                           (void*)(uintptr_t)taskId,
+                                           (void*)(uintptr_t)elf,
+                                           (void*)(uintptr_t)eaContext,
+                                           sizeContext, lsPattern, argument);
+    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+
+/* Size of the per-task context save area. The runtime keeps no save area, but
+ * the title allocates from this, so a zero would give every task a null
+ * context. One SPU local store is the SDK's maximum and always sufficient. */
+static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx)
+{
+    ctx->gpr[3] = 0x40000;
+}
+
+/* Probe: _cellSpursSendSignal (0xE0A6DBE4). The SPU task parks in WAIT_SIGNAL
+ * (taskset syscall 2) waiting for this, while a PPU thread blocks in
+ * cellSpursEventFlagWait for that task to set the flag. Logging it answers
+ * whether the PPU side ever sends the signal at all. Forwards to the runtime. */
+extern "C" int32_t _cellSpursSendSignal(void* taskset, uint32_t taskId);
+
+static void probe_cellSpursSendSignal(ppu_context* ctx)
+{
+    const uint32_t ts = (uint32_t)ctx->gpr[3], tid = (uint32_t)ctx->gpr[4];
+    fprintf(stderr, "[cellSpurs] SendSignal(taskset=0x%08X, task=%u)\n", ts, tid);
+    ctx->gpr[3] = (uint64_t)(int64_t)_cellSpursSendSignal((void*)(uintptr_t)ts, tid);
 }

@@ -171,7 +171,22 @@ extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->pu
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
-    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "Twisted Metal (ps3recomp)") == 0);
+    /* Size the backend to the surface the GAME renders, not to the video mode.
+     *
+     * Twisted Metal draws into 1280x704 surfaces (its tiles and every RT the
+     * backend reports are 1280x704) while configuring video-out as 720x480 and
+     * compositing later. RT_DISPLAY_BY_SIZE, which is what rescues a title that
+     * renders into a surface cellGcmSetDisplayBuffer never registered, only
+     * treats a surface as the backbuffer when its clip EQUALS the backend size
+     * -- so a backend opened at 1280x720 misses 1280x704 by sixteen rows, every
+     * draw stays classified offscreen, render_frame() is never called and the
+     * window shows nothing but the clear.
+     *
+     * TM_RSX_W / TM_RSX_H override it; the default matches this title. */
+    uint32_t rsx_w = 1280, rsx_h = 704;
+    if (const char* e = getenv("TM_RSX_W")) rsx_w = (uint32_t)strtoul(e, 0, 0);
+    if (const char* e = getenv("TM_RSX_H")) rsx_h = (uint32_t)strtoul(e, 0, 0);
+    int rsx_ok = (rsx_d3d12_backend_init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
      * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded

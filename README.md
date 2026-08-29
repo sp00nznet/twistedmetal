@@ -37,7 +37,7 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
 | Boot | **renders** — 200 files, 32 draws, D3D12 textures bound |
-| Graphics (RSX → D3D12) | draws + texture binds issued; no flip yet |
+| Graphics (RSX → D3D12) | **presents** — geometry rasterizes; flat fill only |
 | Audio / input | not started |
 
 ### The binary
@@ -454,21 +454,73 @@ Real hardware returns `CELL_OK` with `state = Disconnected` when there is simply
 no connection, so `src/hle_extra.cpp` overrides the NID to say that. 704,666
 calls became 4.
 
-### The current blocker: a SPURS signal
+### Pixels: the path works, the content does not arrive
 
-Two ends of the same handshake, both waiting:
+The window was black. It is now presenting, and the reason it looked dead was a
+size mismatch in this repo's own harness.
+
+The backend classifies a surface as the backbuffer if `cellGcmSetDisplayBuffer`
+registered its offset, or — with `RT_DISPLAY_BY_SIZE=1` — if its clip rectangle
+equals the backend's size. This title renders into **1280x704** surfaces while
+configuring video-out as 720x480 and compositing later, so with the harness
+opening the backend at 1280x**720** nothing ever matched:
 
 ```
-[spu_workload] task 0 (taskset 0x11ECF180) sleeping 10s in WAIT_SIGNAL
-[cellSpurs] EventFlagWait BLOCKED tid=35548 14s on pattern 0x0001
-            flagEA=0x400EDA00 -- waiting for an SPU workload to set it
+[D3D12] offscreen RT 0: off=0x1870000 1280x704 (render-to-texture)
+[D3D12] offscreen RT 1: off=0xAB0000  1280x704 (render-to-texture)
+...                          x4, every render target
 ```
 
-The SPU task issues taskset syscall 2 (`WAIT_SIGNAL`) and parks for a PPU
-signal; a PPU thread blocks on the SPURS event flag waiting for that task to
-set it. Neither moves. Whether the answer is `_cellSpursSendSignal` reaching the
-parked task, or the task not parking in the first place, is the next thing to
-find out.
+Every draw was classified offscreen, `has_display` stayed 0, and `render_frame()`
+— which submits all recorded geometry — was never called. `src/boot_main.cpp`
+now sizes the backend to the surface the game actually renders (`TM_RSX_W` /
+`TM_RSX_H` override it). Offscreen classifications: **4 → 0**.
+
+With that, geometry does reach the screen. Isolating the one object the title
+draws (`DRAW_KEEP_TEX=2ACD800 DRAW_KEEP_NOCLEAR=1`) and dumping presents gives a
+frame that is uniformly filled rather than empty:
+
+```
+frame_000.bmp: 1280x704   100% of pixels lit   single colour rgb(0,0,25)
+frame_002.bmp: 1280x704     0% lit
+```
+
+So the quad rasterizes, blends and presents — a flat dark-blue fill, one draw,
+no image detail — and then the game stops drawing entirely. It issues **20
+draws in a hundred seconds**, all at startup, all the same 4-vertex QUAD with
+the same 1024x512 texture bound.
+
+That is what a stalled loading screen looks like. The render path is not what is
+keeping the screen dark; the title has nothing further to draw.
+
+### What gates the content: a SPURS signal
+
+```
+[spu] SPURS taskset syscall num=2 (raw=0x2 args=0x000027C4) image=2 link/r0=0x09668
+[spu_workload] task 0 (taskset 0x11ECF180) sleeping 13s in WAIT_SIGNAL
+[cellSpurs] EventFlagWait BLOCKED tid=15156 on pattern 0x0001 flagEA=0x400EDA00
+            -- waiting for an SPU workload to cellSpursEventFlagSet it
+```
+
+Syscall 2 really is `CELL_SPURS_TASK_SYSCALL_WAIT_SIGNAL` — checked against
+RPCS3's `spursTasksetProcessSyscall`, which also polls for a pending signal
+first and only then parks, exactly as the runtime does. The task parks at LS
+`0x9668` having run 0 ms, and `_cellSpursSendSignal` is **never called** in a
+whole boot (verified with a forwarding probe on NID `0xE0A6DBE4`). Meanwhile a
+PPU thread blocks in `cellSpursEventFlagWait` for that same task to set flag
+`0x400EDA00`, which was initialised `direction=1` — SPU2PPU, so the SPU is
+indeed the side expected to set it.
+
+Two ends of one handshake, each waiting for the other. `SPURS_EF_FORCE=1` does
+not break it. What is still unknown is which producer is supposed to set that
+flag: the title creates two tasksets (`maxContention` 1 and 8) but only ever one
+task, so the setter may be a task that is never created — which would put this
+back with the missing v2 task API rather than with the signal itself.
+
+Bridged along the way, though not yet exercised on this path:
+`cellSpursCreateTask2` (`0xE14CA62D`, argument order taken from the game's own
+call site at `0x00A1C2A0` since RPCS3 does not implement it),
+`_cellSpursTaskAttribute2Initialize` and `cellSpursTaskGetContextSaveAreaSize`.
 
 ### Video modes
 
