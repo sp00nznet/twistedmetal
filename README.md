@@ -737,6 +737,15 @@ walker has not reached. The semaphore trace shows the handshake it is waiting on
 
 So the next step is that handshake, not the command parser.
 
+One hypothesis was tested and disproved, which is worth recording so nobody
+spends the afternoon on it again. ps3recomp completes a flip on the 60 Hz beat
+whether or not the walker has reached the flip command, so a title that infers
+"the GPU is done with that block" from flip status would recycle too early —
+which is exactly the overrun above. Gating flip completion on `get == put`
+changes nothing: the desync still happens, still at a block-end jump, still with
+zero vertices. The title is not inferring from flip status, so that patch was
+taken back out rather than left as a knob that does nothing.
+
 ### Finding a message when the cross-reference cannot
 
 Almost none of this was reachable by reading the lifted C++. String addresses in
