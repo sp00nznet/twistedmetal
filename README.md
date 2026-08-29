@@ -1200,11 +1200,33 @@ there.
 sound -- populated source, known format, correct mapping -- and the sample still
 comes back black.
 
-That is the open question, and it is a narrow one: **a DXT1 texture whose guest
-memory is 87% populated samples as black.** Candidates worth checking first are
-the upload's block-compressed row pitch (BC1 rows are `(w/4)*8` bytes, not
-`w*bpp/8`), and the RSX swizzle/tiling of compressed surfaces, neither of which
-this session got to. It is an asset-upload question, not a pipeline one.
+Except the texture is not populated either, and "87% non-zero" was one more
+measurement error of mine: it counts non-zero **bytes**, not decoded pixels.
+`RTT_DUMP=1` prints the bytes the upload actually reads:
+
+```
+[TEXUP] off=0xC2ACD800 fmt=0x86  row0: 01 00 00 00 55 55 55 55
+                                row240: 01 00 00 00 55 55 55 55
+                                   mid: 01 00 00 00 55 55 55 55
+```
+
+Identical at the first row, row 240 and the middle. As DXT1 that block is
+`color0 = 0x0001`, `color1 = 0x0000` — both black in RGB565 — with indices
+`0x55555555`, every texel selecting `color1`. **The whole texture is a uniform
+black DXT1 image**, and non-zero bytes throughout, which is why every
+byte-counting check called it populated.
+
+So the pipeline was right all along and so was the sampler: the UI draws a
+texture that really is black, because the surface at local memory `0x2ACD800`
+holds a formatted placeholder rather than the game's artwork. `ui.vram` — all
+132 MB of it — inflates into local memory at `0xC321D800` and above, about
+7.7 MB past this address, so whatever fills `0x2ACD800` arrives by another route
+and has not arrived.
+
+That is the question to pick up: **what writes the UI texture at local-memory
+`0x2ACD800`, and why has it not run by the time the menu draws.** It is an
+asset-placement question, and everything downstream of it — rasteriser,
+sampler, composite, present — is now known to work.
 
 Everything below this heading was chasing the wrong layer.
 
