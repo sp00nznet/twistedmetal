@@ -1,8 +1,16 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 23e7f94..4f5de3f 100644
+index 23e7f94..3bb1e65 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1162,6 +1162,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -655,6 +655,7 @@ unsigned long long ps3_ms_now(void)
+ #endif
+ }
+ 
++static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+ static u32 s_fifo_getoff  = 0;
+ static u32 s_fifo_calloff = 0;
+ 
+@@ -1162,6 +1163,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                 s_fifo_getoff, w & 0x1FFFFFFCu, put); }
              { u32 tgt = w & 0x1FFFFFFCu;
                if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); break; }
@@ -17,6 +25,49 @@ index 23e7f94..4f5de3f 100644
                s_fifo_getoff = tgt; }
              continue;
          }
+@@ -1200,6 +1209,42 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                                   k << 2, hist[k], tot[k], 10);
+                   }
+               } }
++            /* NV406E semaphore: OFFSET(0x64) / ACQUIRE(0x68) / RELEASE(0x6C).
++             *
++             * These were falling through to rsx_process_method as "unknown method" --
++             * i.e. no-ops. A title that syncs with cellGcmSetFlipCommandWithWaitLabel and
++             * cellGcmGetLabelAddress (Twisted Metal does both) then waits on a label the
++             * RSX is supposed to write and never sees it move, so it never appends its
++             * next FIFO segment and the GPU sits on a park forever.
++             *
++             * RELEASE writes the value; ACQUIRE stops this drain pass without consuming
++             * the method, so the next pass re-reads it -- which is what the hardware does
++             * while it waits. Semaphore offsets index the same label window
++             * cellGcmGetLabelAddress hands out. */
++            if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
++                int sem_blocked = 0;
++                for (u32 i = 0; i < count; i++) {
++                    u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
++                    if (!dea) break;
++                    u32 m = (type == 0) ? method + i * 4 : method;
++                    u32 v = vm_read32(dea);
++                    u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
++                    if (m == 0x64u)      s_sema_offset = v;
++                    else if (m == 0x6Cu) vm_write32(la, v);
++                    else if (m == 0x68u && vm_read32(la) != v) {
++            /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
++             * the hardware does. Off by default: a title whose label nothing
++             * ever writes would wedge the drain permanently, and RELEASE on
++             * its own is the half that unblocks a waiting guest. */
++            static int blk = -1;
++            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
++            if (blk) { sem_blocked = 1; break; }
++        }
++                }
++                if (sem_blocked) break;
++                s_fifo_getoff += 4 + count * 4;
++                continue;
++            }
+             for (u32 i = 0; i < count; i++) {
+                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                 if (!dea) break;
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index 886fbc7..976a05b 100644
 --- a/runtime/ppu/ppu_fs.cpp

@@ -679,10 +679,37 @@ mid-segment, with perfectly good commands sitting right behind it
 The drain used to *take* that jump, re-reading the same word forever — **38.8
 million times in one run**. `docs/ps3recomp-fixes.patch` stops that pass instead
 (the next one re-reads the word, so a jump that does get patched is still
-followed). That removes a pointless spin but changes nothing on screen, which is
-worth stating plainly: the spin was not the cause. The open question is why the
-title leaves the park in place, and it is the single thing between this port and
-a visible frame.
+followed).
+
+The second half of the patch is the reason the title never releases the park.
+Its GCM imports name its sync mechanism: `_cellGcmSetFlipCommandWithWaitLabel`
+and `cellGcmGetLabelAddress` — it waits on RSX **labels**. And the FIFO's
+"unknown method" log is the NV406E semaphore trio:
+
+```
+[RSX] unknown method 0x0064 = 0x00000400   SEMAPHORE_OFFSET
+[RSX] unknown method 0x0068 = 0x00000000   SEMAPHORE_ACQUIRE
+[RSX] unknown method 0x006C = 0x00000001   SEMAPHORE_RELEASE
+```
+
+All three were falling through as no-ops, so the label the title waits on never
+moved. `GCM_REFLOG=1` confirms the other half of the same story: **zero fences
+drained in a whole run**, `ref` pinned at 0, so `_jsGcmFifoFinish` times out
+every frame — 25,000 polls at 40 us — and the title never appends its next
+segment.
+
+The patch implements RELEASE (write the label) and OFFSET, and puts blocking
+ACQUIRE behind `GCM_SEMA_ACQUIRE=1`: made unconditional it is what the hardware
+does, but it desynced the parser here, leaving `get` sitting in the middle of
+vertex floats. Off by default, RELEASE alone is the half that can unblock a
+waiting guest.
+
+Measured, honestly: `render_frame` goes from **0% of frame time to 95%** and the
+frame rate from 6.8 to 32 fps, so the backend is finally doing work every frame
+— and the screen is still black, with zero vertices. The drain still ends up
+parked in data rather than commands. So this is progress on the mechanism and
+not yet a picture; the remaining question is where the walker loses sync with
+the command stream.
 
 ### Finding a message when the cross-reference cannot
 
