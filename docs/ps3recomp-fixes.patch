@@ -227,7 +227,7 @@ index 23e7f94..83addba 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..f374e2b 100644
+index 3a3e5db..ab8a0f2 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -3215,6 +3215,14 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
@@ -403,7 +403,15 @@ index 3a3e5db..f374e2b 100644
  static void render_frame(void)
  {
      double _rf0 = perf_on() ? perf_now() : 0.0;
-@@ -4191,6 +4350,10 @@ static void render_frame(void)
+@@ -4165,6 +4324,7 @@ static void render_frame(void)
+             D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
+             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
+             int cur_rt = -1;                       /* target A: -1 = backbuffer */
++            float vp_last_w = 0, vp_last_h = 0;    /* for DRAWARGS */
+             int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
+             double _rec0 = perf_on() ? perf_now() : 0.0;
+             int seen_small_vp = 0, captured = 0;
+@@ -4191,6 +4351,10 @@ static void render_frame(void)
                  /* Render-to-texture: retarget when this op's surfaces differ.
                   * Depth is a single shared buffer, so clear it per switch. */
                  int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
@@ -414,7 +422,35 @@ index 3a3e5db..f374e2b 100644
                  int wantm[3];
                  for (int _m = 0; _m < 3; _m++)
                      wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
-@@ -4419,7 +4582,10 @@ static void render_frame(void)
+@@ -4211,6 +4375,7 @@ static void render_frame(void)
+                         rh[nrt++] = off_rt_rtv(wantm[_m]);
+                     }
+                     D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
++                    vp_last_w = vp.Width; vp_last_h = vp.Height;
+                     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, nrt, rh, FALSE, &dsv_handle);
+                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
+                     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &sc);
+@@ -4281,6 +4446,19 @@ static void render_frame(void)
+                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
+                         s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
+                         + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
++                /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
++                 * the target they are aimed at. A zero vertex count, or a start
++                 * vertex past the buffer, rasterises nothing while every other
++                 * check upstream still says the draw is fine. */
++                { static int dcap = -1, dn = 0;
++                  if (dcap < 0) { const char* e = getenv("DRAWARGS"); dcap = e ? atoi(e) : 0; }
++                  if (dcap && dn < dcap) { dn++;
++                      D3D12_CPU_DESCRIPTOR_HANDLE _rh =
++                          (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
++                      fprintf(stderr, "[DRAWARGS] verts=%u start=%u rt=%d rtv=%llu vp=%.0fx%.0f%c",
++                              dr->vertex_count, dr->vb_byte_offset / 256, cur_rt,
++                              (unsigned long long)_rh.ptr,
++                              (double)vp_last_w, (double)vp_last_h, 10); } }
+                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
+                     dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
+                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
+@@ -4419,7 +4597,10 @@ static void render_frame(void)
      static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
      { const char* sv = getenv("RTT_SAVERT");
        static int _done = 0;
@@ -426,7 +462,7 @@ index 3a3e5db..f374e2b 100644
        if (sv && !_done && s_d3d.frame_count > 60 + _skip) {
          int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
          if (rt >= 0 && s_d3d.off_rt[rt].res) {
-@@ -4474,6 +4640,8 @@ static void render_frame(void)
+@@ -4474,6 +4655,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
@@ -435,7 +471,7 @@ index 3a3e5db..f374e2b 100644
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -5064,7 +5232,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
+@@ -5064,7 +5247,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
      const rsx_vertex_attrib* a = &state->vertex_attribs[0];
      fprintf(stderr, "[VTXPOS] a0 off=0x%X stride=%u size=%u type=%u -> (%g, %g, %g, %g)\n",
              a->offset, a->stride, a->size, a->type,
@@ -444,7 +480,7 @@ index 3a3e5db..f374e2b 100644
  }
  
  static void vp_attrs_dbg(const rsx_state* state)
-@@ -6289,6 +6457,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6472,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -456,7 +492,7 @@ index 3a3e5db..f374e2b 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
-@@ -6303,6 +6476,28 @@ void rsx_d3d12_backend_present(void)
+@@ -6303,6 +6491,28 @@ void rsx_d3d12_backend_present(void)
              if (s_d3d.draws[_i].is_clear) { clears++; continue; }
              if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
          }

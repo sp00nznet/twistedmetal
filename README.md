@@ -964,7 +964,26 @@ barrier, descriptor and PSO/RTV format pairing is valid by D3D12's own
 validation, while the target it all points at stays empty.
 
 That combination — valid bindings, executed draws, unwritten target — is past
-what inference can settle from logs, and it is where this pass stops. The right
+what inference can settle from logs.
+
+The last thing worth doing without a capture was to stop trusting the layers
+above the draw call and print what is actually handed to the GPU. `DRAWARGS=<N>`
+does that:
+
+```
+[DRAWARGS] verts=6 start=0 rt=3 rtv=2000503706544 vp=1280x704
+```
+
+Six vertices -- a quad expanded to two triangles -- from vertex 0, into slot 3's
+render-target view, with a full 1280x704 viewport. Every argument is sound. The
+vertex-buffer stride agrees with the buffer view on both sides (256 bytes), and
+`rsx_vtx_pos_dbg` prints the *destination* slot, so the NDC quad quoted earlier
+is what landed in the buffer rather than what was read out of guest memory.
+
+Correct vertices, stride, count, viewport and RTV; clean validation; draw
+issued; target empty. Every layer this side of the GPU says the frame should be
+there -- which is exactly the point at which a capture replaces inference, and
+where this pass stops. The right
 next tool is a frame capture: PIX or RenderDoc on a single frame will show in
 seconds whether the draws reach that render target, which descriptor is actually
 bound and what the output merger does with the result. Everything above narrows
