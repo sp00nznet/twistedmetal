@@ -1235,13 +1235,24 @@ The archive lands in `0xC2B0D800` and up. The texture the UI samples is at
 writes.** Nothing touches it, which is why it still holds a formatted black
 placeholder while everything around it is real artwork.
 
-That is the question to pick up, and it is a specific one: the UI texture sits
-256 KB under the base of the inflated `ui.vram` region. Either the loader's
-destination is 256 KB high, or the texture offset the title binds is 256 KB low,
-or a 256 KB header at the head of that VRAM allocation is being skipped when it
-should not be. The destination comes from the request the title itself builds
-(`+0x14`), so the first place to look is how that buffer address is derived for
-the first `ui.vram` block.
+Parsing the archive rules out the tidy explanation: `ui.vram` has **no
+uncompressed blocks** — all 2021 of them are deflated, so every one passes
+through the decompressor, and the observed span matches exactly (1792 blocks x
+64 KB = 117 MB of the 132 MB total, still loading at the time of the print).
+
+So the texture at `0x2ACD800` is not the head of `ui.vram` at all. It is a
+*separate* VRAM allocation sitting 256 KB below it, and nothing this port
+currently does writes there. A 1024x512 DXT1 surface cannot be rendered into, so
+it is a loaded texture — which means it should arrive by a copy from main memory
+(the `ui.ngp` side of the archive) into local memory, and that copy is what has
+not happened.
+
+That is the question to pick up: **which transfer fills local memory
+`0x2ACD800`, and is that transfer path implemented?** The 2D-engine trace
+(`GCM2D_TRACE=1`) shows the title using subchannels 3, 6 and 7 and reports no
+unhandled methods, so if this is an NV0039 memory-to-memory transfer it is
+either landing on a subchannel that the NV3062/NV308A branches silently absorb,
+or it is not being issued at all.
 
 Everything downstream of this is now known to work: FIFO walk, fences,
 semaphores, rasteriser, sampler, composite and present.
