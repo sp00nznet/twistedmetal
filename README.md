@@ -1091,6 +1091,30 @@ register) and the decompiler emits `.xxxx`. Worth checking against the raw VP
 ucode before believing it, but the shape of the evidence fits, and it is a
 defect that would silently blank any title whose program does this.
 
+Both of those were then tested and neither is the blocker. `VP_W_ONE=1` keeps
+the guest transform and forces only the clip-space `w` to 1 — the exact fix the
+swizzle theory predicts — and the target is unchanged. `VP_BYPASS=1` replaces
+the position outright, same result.
+
+And one more assumption of mine was wrong, which invalidated the earlier magenta
+control: **the clears and the draws target different surfaces.** `DRAWARGS` now
+prints the bound slot's offset, and the draws go to `0x01BE0000` while the
+guest's clears go to `0xAB0000`. Every "clears land but draws don't" reading
+above was comparing two different render targets.
+
+`RT_CLEARDBG=2` fixes that by magenta-clearing the surface **the draws
+themselves bind, at the moment they bind it**:
+
+```
+RT_CLEARDBG=2 RTT_SAVERT=1BE0000 -> 1280x704, distinct colours: 1, all (255,0,255)
+```
+
+So on the draws' own target, with the RTV proven good by the clear that lands on
+it through the very same handle, the draws that follow change **not one pixel**.
+That is the cleanest statement this investigation can produce without GPU-side
+visibility: `ClearRenderTargetView` and `DrawInstanced`, same RTV, same command
+list, one works and one does nothing.
+
 Those two together are the handoff: the negative `w` is a real defect that would
 stop rendering on its own and wants fixing regardless, and something upstream of
 the vertex shader is *also* wrong, because correcting the position is not
