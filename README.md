@@ -792,14 +792,40 @@ subch=6 0x0318/0x031C          = 0x00100000   (1:1 scale)
 subch=6 0x0300 FORMAT          = 0x00000003
 ```
 
-So the blit runs and produces nothing, and the reason is that last line:
-`nv3089_blit()` handles the 32-bit colour formats, and **format 3** only via the
-NV309E swizzled-destination path, which needs `s_nv309e.active` and matching
-log2 dimensions. The runtime's comment on format 3 is explicit that treating it
-as A8R8G8B8 is wrong and floods the scene, so this needs the format decoded
-properly rather than added to the list. That is the remaining step between this
-port and a picture — and the picture is what the front end needs before its menu
-will take input, which is what starts a campaign and plays an intro cinematic.
+And the blit does run — `NV3089_DBG` catches it:
+
+```
+[NV3089] 1024x352 fmt=0x3 src=0xC1BE0000(pitch 10240) -> dst=0xC0026A80(pitch 5120) at 0,0
+```
+
+`0xC0026A80` is inside display buffer 0 (base `0x10000`), at the letterbox
+inset. So the title's final image is assembled correctly — into **guest
+memory** — and that is the whole problem. `nv3089_blit()` is a CPU copy; it
+never touches D3D12. Meanwhile the backend presents its own swapchain, and it
+only runs the draw pass when a recorded draw targets the display surface.
+`VP_SUBMIT=30` shows that never happens:
+
+```
+[PRESENTGATE] records=4 onscreen=0 offscreen=1 clears=3
+              has_display=0 -> render_frame=SKIPPED
+```
+
+Every batch, all run. This title composites *entirely* through the 2D engine, so
+`has_display` is 0 forever and the swapchain shows only the clear. Nothing is
+broken in the parser, the walker, the shaders or the draws — the frame is
+finished, in the wrong memory.
+
+Closing it needs a backend capability that does not exist yet: when an NV3089
+blit resolves to a registered display buffer, present its **source** offscreen
+RT rather than discarding the frame. `RTT_VIEWRT` is close but only rewrites the
+texture of an existing display draw, and here there are none to rewrite — the
+composite draw has to be synthesised. That is one well-defined piece of work,
+and it is the last one before a picture. The picture is in turn what the front
+end needs before its menu will take input, which is what starts a campaign and
+plays an intro cinematic: injected pad input (`YDKJ_INJECT_PAD`) does not move
+the menu today, and the movie chain — the ArchiveLoader's movies path, the
+attract script, the `c1.avi`/`ep_1.avi` id table, `MoviePlayer::openFile` — is
+confirmed at zero calls.
 
 ### Finding a message when the cross-reference cannot
 
