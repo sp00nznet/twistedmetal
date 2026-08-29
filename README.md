@@ -981,9 +981,40 @@ vertex-buffer stride agrees with the buffer view on both sides (256 bytes), and
 is what landed in the buffer rather than what was read out of guest memory.
 
 Correct vertices, stride, count, viewport and RTV; clean validation; draw
-issued; target empty. Every layer this side of the GPU says the frame should be
-there -- which is exactly the point at which a capture replaces inference, and
-where this pass stops. The right
+issued; target empty. Every layer this side of the GPU said the frame should be
+there.
+
+Except the validation was not clean — it was being swallowed. `D3D12_DBG=1`
+enables the debug layer and prints nothing; `D3D12_IQ=1` drains the **info
+queue** after submit, and that is a different thing entirely. It carries two
+real findings:
+
+```
+[sev=1 id=921] ID3D12CommandList::Close: An ID3D12Resource object ... was
+               deleted prior to closing the command list.
+[sev=2 id=679] CreateGraphicsPipelineState: The Pixel Shader expects a Render
+               Target View bound to slot 1/2/3, but ... none will be bound.
+               ... writes of an unbound Render Target View are discarded.
+```
+
+The first is a genuine use-after-free: `off_rt_get()` releases an offscreen
+render target the moment its dimensions change — and we see exactly that,
+slot 4 going 1280x704 -> 640x352 — while the frame in flight still references
+it. Every draw recorded against that resource lands nowhere and the replacement
+reads back empty. `docs/ps3recomp-fixes.patch` waits for the GPU before both
+release sites; recreations are rare, so the stall costs nothing. It removes the
+error on the paths it covers, though a run can still surface a handful from
+release sites not yet found.
+
+The second says the fragment programs write four colour outputs while only one
+RTV is ever bound, so slots 1-3 are discarded. Creating the MRT targets in the
+render-to-texture pre-pass does not fix it — `off_rt_find()` still returns -1
+for them, so the draw records are not carrying MRT offsets in the first place.
+That was tried and reverted rather than left in.
+
+Neither makes the picture appear, but `D3D12_IQ=1` is the tool the next pass
+should start from: it is the only thing so far that has produced real errors
+instead of clean bills of health, and both of its findings are concrete. The
 next tool is a frame capture: PIX or RenderDoc on a single frame will show in
 seconds whether the draws reach that render target, which descriptor is actually
 bound and what the output merger does with the result. Everything above narrows
