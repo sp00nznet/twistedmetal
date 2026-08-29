@@ -36,8 +36,8 @@ down cleanly because SPURS task creation is rejected. Nothing is rendered yet.
 | SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **past config load** — re-lifting with full code coverage |
-| Graphics (RSX → D3D12) | window opens, clears submitted, nothing drawn |
+| Boot | **renders** — 200 files, 32 draws, D3D12 textures bound |
+| Graphics (RSX → D3D12) | draws + texture binds issued; no flip yet |
 | Audio / input | not started |
 
 ### The binary
@@ -412,23 +412,63 @@ config load and keeps going.
 
 ### 12% of the code was never lifted
 
-What it runs into next is the same defect that caused the FIOS hang, measured
-properly this time. `find_functions` detects 31,032 functions but accounts for
-only 88% of the executable segment: **7,197 gaps totalling 1,573,492 bytes
-(12.09%)** lie between them.
+The next wall was the same defect that caused the FIOS hang, measured properly.
+`find_functions` detects 31,032 functions but accounts for only 88% of the
+executable segment: **7,197 gaps totalling 1,573,492 bytes (12.09%)** lie
+between them.
 
-That is not cosmetic. A gap immediately after a function truncates it — which is
-exactly what stranded `func_0076C534`'s tail and left the FIOS workers
-unconstructed. And code *inside* a gap is never lifted, so an indirect call into
-it lands on the runtime's "unresolved indirect call" path and quietly returns.
-Seven such targets at `0x009D38E4..0x009D3A64` — one uncovered 0x1A4-byte
-region — spun the title forever, 199,351 log lines per 200,000.
+That is not cosmetic. A gap immediately after a function truncates it — which
+stranded `func_0076C534`'s tail and left the FIOS workers unconstructed. And
+code *inside* a gap is never lifted, so an indirect call into it lands on the
+runtime's "unresolved indirect call" path and quietly returns. Seven such
+targets in one uncovered 0x1A4-byte region at `0x009D38E4` spun the title
+forever — 199,351 log lines per 200,000.
 
 `tools/seed_gaps.py` closes the holes: it computes the gaps, emits a function
 entry for each, and splits them at addresses harvested from a run log so
-indirect targets become real entry points rather than addresses buried inside a
-blob. 31,032 → 38,235 functions, **0 bytes uncovered**. The proper fix belongs
-in `find_functions`' boundary detection upstream.
+indirect targets become real entry points. **31,032 → 38,235 functions, 0 bytes
+uncovered**, and re-lifting produced 47,120 emitted functions (from 35,635)
+across 12 chunks. Unresolved indirect calls: **199,351 → 0**. The proper fix
+belongs in `find_functions`' boundary detection upstream.
+
+### Where it runs to now
+
+The title boots, loads its data and renders:
+
+```
+[D3D12] adapter: NVIDIA GeForce RTX 5070 (VRAM 11943 MB)
+[D3D12] Initialization complete (1280x720, 2 buffers, pipeline=ready)
+[D3D12] bind_texture(unit=0, offset=0x2ACD800, fmt=0x86, 1024x512)
+[RSX] DRAW_ARRAYS prim=... first=... count=...        x32
+[fs] open ... x200          (fonts, .rtt textures, localisation, car icons)
+[cellSaveData] dispatching funcStat OPD=0x00F002D0 (isNew=1)
+[cellSpurs] CreateTaskset2 x2, CreateTask(id=0, entry=0x00D63C00)
+[spu_workload] dispatch HIT (async) fp=0xCE95F52496B4AE31 -> spawning thread
+```
+
+One more title-local fix was needed to get here. ps3recomp deliberately *fails*
+`cellNetCtlGetState` when offline, because LittleBigPlanet polls it forever
+waiting for `IPObtained` and only leaves that loop on `ret < 0`. Twisted Metal
+reads the error as "not ready yet" and retries — 704,666 times in two minutes.
+Real hardware returns `CELL_OK` with `state = Disconnected` when there is simply
+no connection, so `src/hle_extra.cpp` overrides the NID to say that. 704,666
+calls became 4.
+
+### The current blocker: a SPURS signal
+
+Two ends of the same handshake, both waiting:
+
+```
+[spu_workload] task 0 (taskset 0x11ECF180) sleeping 10s in WAIT_SIGNAL
+[cellSpurs] EventFlagWait BLOCKED tid=35548 14s on pattern 0x0001
+            flagEA=0x400EDA00 -- waiting for an SPU workload to set it
+```
+
+The SPU task issues taskset syscall 2 (`WAIT_SIGNAL`) and parks for a PPU
+signal; a PPU thread blocks on the SPURS event flag waiting for that task to
+set it. Neither moves. Whether the answer is `_cellSpursSendSignal` reaching the
+parked task, or the task not parking in the first place, is the next thing to
+find out.
 
 ### Video modes
 

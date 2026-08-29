@@ -88,6 +88,7 @@ static void cellSpursCreateTaskset2(ppu_context* ctx);
 static void cellSpursAttributeEnableSystemWorkload(ppu_context* ctx);
 static void sys_spu_printf_initialize(ppu_context* ctx);
 static void cellVideoOutGetDeviceInfo(ppu_context* ctx);
+static void cellNetCtlGetState(ppu_context* ctx);
 
 extern "C" void tm_hle_register_extra(void)
 {
@@ -105,6 +106,7 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x45FE2FCEu, "_sys_spu_printf_initialize", sys_spu_printf_initialize);
 
     ps3_hle_register_ctx(0x1E930EEFu, "cellVideoOutGetDeviceInfo", cellVideoOutGetDeviceInfo);
+    ps3_hle_register_ctx(0x8B3EBA69u, "cellNetCtlGetState", cellNetCtlGetState);
 }
 
 /* ---------------------------------------------------------------------------
@@ -453,3 +455,28 @@ void func_00671698(ppu_context* ctx) { tm_trace("renderInit", func_00671698_lift
 void func_00670C10(ppu_context* ctx) { tm_trace("f_00670C10", func_00670C10_lifted, ctx); }
 void func_00671560(ppu_context* ctx) { tm_trace("f_00671560", func_00671560_lifted, ctx); }
 void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lifted, ctx); }
+
+/* ---------------------------------------------------------------------------
+ * cellNetCtlGetState (0x8B3EBA69) — report a state instead of an error.
+ *
+ * ps3recomp deliberately FAILS this call when offline, because LittleBigPlanet
+ * polls it forever waiting for IPObtained and only leaves the loop on ret < 0.
+ * Twisted Metal does the opposite: it treats the error as "not ready yet" and
+ * retries, so it spun here 704,666 times in a two-minute run and its frame loop
+ * never completed a flip.
+ *
+ * Real hardware returns CELL_OK with state = Disconnected when there is simply
+ * no connection; NOT_INITIALIZED is for a missing cellNetCtlInit, which this
+ * title does call. Report the truth and let the game go offline.
+ * ------------------------------------------------------------------------- */
+#define CELL_NET_CTL_STATE_Disconnected 0
+
+static void cellNetCtlGetState(ppu_context* ctx)
+{
+    const uint32_t state = (uint32_t)ctx->gpr[3];
+    if (!state) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80130102; return; }
+    vm_write32(state, CELL_NET_CTL_STATE_Disconnected);
+    static long long n = 0;
+    if (n++ < 3) fprintf(stderr, "[cellNetCtl] GetState() -> OK, Disconnected\n");
+    ctx->gpr[3] = 0;
+}
