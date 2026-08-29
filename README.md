@@ -1185,11 +1185,26 @@ So the chain is complete and it is not a graphics-pipeline fault at all:
 4. so the UI renders black, and the composite faithfully carries black to the
    display buffer.
 
-The question that matters is therefore **why the texture at `0x2ACD800` is
-empty**, which is an asset-upload question, not a D3D12 one -- and it is next
-door to work this port already does: `ui.vram`, all 132 MB of it, inflates
-straight into local memory at `0xC321D800`-`0xC921D800`, well above this
-offset. Something fills `0x2ACD800` by another route and is not arriving.
+And that texture is **not** empty any more. The 8.64% reading above predates the
+asset-pipeline fix; re-dumping it now gives **87.05% non-zero**. The data is
+there.
+
+`TEXFMTDBG=1` names what it is:
+
+```
+[TEXFMT] unit=0 fmt=0x86 1024x512 mips=1 cube=0 off=0x2ACD800
+```
+
+`0x86` is `CELL_GCM_TEXTURE_COMPRESSED_DXT1`, and the backend maps it to
+`DXGI_FORMAT_BC1_UNORM` with a correct 4-bits-per-texel size. So every link is
+sound -- populated source, known format, correct mapping -- and the sample still
+comes back black.
+
+That is the open question, and it is a narrow one: **a DXT1 texture whose guest
+memory is 87% populated samples as black.** Candidates worth checking first are
+the upload's block-compressed row pitch (BC1 rows are `(w/4)*8` bytes, not
+`w*bpp/8`), and the RSX swizzle/tiling of compressed surfaces, neither of which
+this session got to. It is an asset-upload question, not a pipeline one.
 
 Everything below this heading was chasing the wrong layer.
 
