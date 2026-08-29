@@ -1041,8 +1041,39 @@ batch). Those knobs were never touching the draws in question, so the earlier
 "not depth, not culling, not the shader" conclusions do not hold and want
 redoing against the VP path.
 
-`D3D12_IQ=1` remains the tool to start from: it is the only thing so far that
-has produced real errors instead of clean bills of health. The
+Redoing them against the VP path got two results worth passing on.
+
+**The guest vertex program writes a negative w.** The decompiled VS ends
+
+```
+o[0].w = vp_c[467].x;
+Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);
+```
+
+and `VP_MVP` prints the constant bank as the shader sees it:
+
+```
+[VPMVP] slot=3 lastNZ=c467  c260=(0 0 0 0)  c467=(-1 1 0 0)
+```
+
+So `w = -1`. Every vertex is behind the camera and the clipper discards all of
+it — clears untouched, exactly the symptom. Worth noting too that `c467`'s value
+`(-1, 1, 0, 0)` mirrors the quad's first vertex `(-1, 1, 0, 1)`, which may mean
+vertex data is landing in the constant bank (a `transform_constant_load`
+indexing problem) rather than the program legitimately asking for `w = -1`.
+
+**But forcing a valid position does not help either.** `VP_BYPASS=1` rewrites
+the output to `float4(v[0].xy * 0.5, 0.5, 1.0)` — `w = 1`, unambiguously on
+screen — and it does patch this per-draw path (the anchor matches the dumped
+HLSL). The target still comes back uniform magenta. By the backend's own note on
+that switch, "if it stays blank, the fault is upstream of the shader -- the
+attribute binding itself".
+
+Those two together are the handoff: the negative `w` is a real defect that would
+stop rendering on its own and wants fixing regardless, and something upstream of
+the vertex shader is *also* wrong, because correcting the position is not
+sufficient. `D3D12_IQ=1`, `RT_CLEARDBG=1` and `VP_MVP` are the instruments that
+got this far; they are the ones to keep using. The
 next tool is a frame capture: PIX or RenderDoc on a single frame will show in
 seconds whether the draws reach that render target, which descriptor is actually
 bound and what the output merger does with the result. Everything above narrows

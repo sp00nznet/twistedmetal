@@ -227,9 +227,22 @@ index 23e7f94..83addba 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..2e91220 100644
+index 3a3e5db..4f95069 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
+@@ -3053,10 +3053,10 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+         int last_nz = -1;
+         for (int i = 0; i < RSX_MAX_VERTEX_CONSTANTS * 4; i++)
+             if (c[i] > 1e-9f || c[i] < -1e-9f) last_nz = i / 4;
+-        fprintf(stderr, "[VPMVP] slot=%u lastNZ=c%d  c260=(%g %g %g %g) c261=(%g %g %g %g)\n",
++        fprintf(stderr, "[VPMVP] slot=%u lastNZ=c%d  c260=(%g %g %g %g) c467=(%g %g %g %g)\n",
+                 slot, last_nz,
+                 c[260*4+0], c[260*4+1], c[260*4+2], c[260*4+3],
+-                c[261*4+0], c[261*4+1], c[261*4+2], c[261*4+3]); } }
++                c[467*4+0], c[467*4+1], c[467*4+2], c[467*4+3]); } }
+     /* DUCK_CB=<hex tex0 offset>: the constants as they land in the per-draw
+      * constant buffer for that texture's draws -- i.e. exactly what the shader
+      * samples, not what the CPU-side rsx_state holds. Those two agreeing is an
 @@ -3215,10 +3215,24 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
      if (!w) w = s_d3d.width;
      if (!h) h = s_d3d.height;
