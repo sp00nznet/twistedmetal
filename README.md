@@ -1223,10 +1223,28 @@ holds a formatted placeholder rather than the game's artwork. `ui.vram` — all
 7.7 MB past this address, so whatever fills `0x2ACD800` arrives by another route
 and has not arrived.
 
-That is the question to pick up: **what writes the UI texture at local-memory
-`0x2ACD800`, and why has it not run by the time the menu draws.** It is an
-asset-placement question, and everything downstream of it — rasteriser,
-sampler, composite, present — is now known to work.
+Tracking every local-memory destination the decompressor writes narrows that to
+a number:
+
+```
+[edge] local-memory writes: 1792 blocks, 0xC2B0D800..0xC9B0D800
+```
+
+The archive lands in `0xC2B0D800` and up. The texture the UI samples is at
+`0xC2ACD800` — **exactly 0x40000, 256 KB, below the first byte the loader ever
+writes.** Nothing touches it, which is why it still holds a formatted black
+placeholder while everything around it is real artwork.
+
+That is the question to pick up, and it is a specific one: the UI texture sits
+256 KB under the base of the inflated `ui.vram` region. Either the loader's
+destination is 256 KB high, or the texture offset the title binds is 256 KB low,
+or a 256 KB header at the head of that VRAM allocation is being skipped when it
+should not be. The destination comes from the request the title itself builds
+(`+0x14`), so the first place to look is how that buffer address is derived for
+the first `ui.vram` block.
+
+Everything downstream of this is now known to work: FIFO walk, fences,
+semaphores, rasteriser, sampler, composite and present.
 
 Everything below this heading was chasing the wrong layer.
 

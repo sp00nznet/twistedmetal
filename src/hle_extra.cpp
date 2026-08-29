@@ -1168,6 +1168,19 @@ void func_0099790C(ppu_context* ctx)
                 g_edge_dst = inplace ? inplace : dst;
                 vm_write32(req + REQ_BUSY, 0);   /* the wait loop polls this */
                 g_edge_bytes += (uint64_t)n;
+                /* Track where the archive lands in RSX local memory. The UI
+                 * samples a texture at local offset 0x2ACD800; knowing the
+                 * inflated range says whether the loader ever writes there. */
+                { const uint32_t d = inplace ? inplace : dst;
+                  static uint32_t lo = 0xFFFFFFFFu, hi = 0;
+                  static long long nloc = 0;
+                  if (d >= 0xC0000000u) {
+                      if (d < lo) lo = d;
+                      if (d + (uint32_t)n > hi) hi = d + (uint32_t)n;
+                      if ((++nloc % 256) == 0)
+                          fprintf(stderr, "[edge] local-memory writes: %lld blocks, "
+                                          "0x%08X..0x%08X\n", nloc, lo, hi);
+                  } }
                 /* A full archive load is thousands of 64K blocks; report
                  * progress periodically rather than capping and going quiet. */
                 if (done++ < 4 || (done % 512) == 0)
