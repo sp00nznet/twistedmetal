@@ -900,11 +900,43 @@ the right shape for UI quads). So this is not depth, culling, blending, the
 fragment program or the composite: the geometry is not rasterising at all, which
 points at the transform or at the draws never reaching the GPU.
 
-That is where this pass stops. The frame path is now complete from the FIFO
-through to the backbuffer — walker, fences, semaphores, composite, present — and
-the rasteriser in the middle of it produces nothing. Finding out why is an
-open-ended piece of work in ps3recomp's D3D12 backend rather than another fix
-here, and every probe costs a five-minute boot.
+Chasing that produced the sharpest statement of the problem, and one correction
+of my own: `VTX_POS` masks components past the attribute's `size`, so a
+2-component position printed as `(-1, 1, 0, 0)` and looked like a `w=0`
+degenerate vertex. It is not. Printing all four shows the fetch is perfect:
+
+```
+[VTXPOS] a0 off=0x80FDF220 stride=16 size=2 type=2 -> (-1,  1, 0, 1)
+[VTXPOS] a0 ...                                    -> (-1, -1, 0, 1)
+[VTXPOS] a0 ...                                    -> ( 1, -1, 0, 1)
+[VTXPOS] a0 ...                                    -> ( 1,  1, 0, 1)
+```
+
+A fullscreen quad in NDC, `w=1`, exactly as it should be — the constant vertex
+attribute register defaults to `(0,0,0,1)` and the fetch honours it.
+
+So the input is right and the output is nothing. Everything between them checks
+out too. A per-batch histogram (`VP_SUBMIT`) says the whole batch is real
+geometry aimed at one surface, and all of it is flagged for execution:
+
+```
+[PRESENTGATE] targets: 0x00AB0000 x57
+[PRESENTGATE] is_vp=1289 not_vp=0
+[VPPASS] records=1328 is_vp=1328 clears=39 any=1 vpso=... rootsig=...
+```
+
+`is_vp` matters because the execution loop skips anything without it; nothing is
+being skipped. The VP pass runs with a valid PSO and root signature. And
+`RTT_SAVERT` on `0x00AB0000` — the surface every one of those draws targets —
+reads back **0.000%** at frame 1560, as does `0x01BE0000`. (`RTT_SAVERT_SKIP`
+was added for this: the built-in trigger fires at frame 60, minutes before this
+title reaches its menu.)
+
+Correct vertices, correct target, valid pipeline, draws executed, surface empty.
+That is a D3D12 pipeline-state problem — a blend or write mask, an RTV format
+mismatch, a root-signature binding — and it is where this pass stops. It is
+open-ended work inside ps3recomp's backend rather than another fix here, and
+every probe costs a four-minute boot.
 
 That is a piece of emulator-correctness work rather than another fix, and it is
 what stands between this port and a picture. The picture is in turn what the

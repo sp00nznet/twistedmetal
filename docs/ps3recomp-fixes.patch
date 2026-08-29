@@ -227,7 +227,7 @@ index 23e7f94..83addba 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..a309f1e 100644
+index 3a3e5db..f374e2b 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -3215,6 +3215,14 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
@@ -414,7 +414,19 @@ index 3a3e5db..a309f1e 100644
                  int wantm[3];
                  for (int _m = 0; _m < 3; _m++)
                      wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
-@@ -4474,6 +4637,8 @@ static void render_frame(void)
+@@ -4419,7 +4582,10 @@ static void render_frame(void)
+     static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
+     { const char* sv = getenv("RTT_SAVERT");
+       static int _done = 0;
+-      static u32 _skip = 0;
++      static u32 _skip = 0xFFFFFFFFu;
++      if (_skip == 0xFFFFFFFFu) { const char* sk = getenv("RTT_SAVERT_SKIP");
++          _skip = sk ? (u32)strtoul(sk, NULL, 0) : 0; }   /* frame 60 is far too
++          early for a title that takes a minute to reach its menu */
+       if (sv && !_done && s_d3d.frame_count > 60 + _skip) {
+         int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
+         if (rt >= 0 && s_d3d.off_rt[rt].res) {
+@@ -4474,6 +4640,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
@@ -423,7 +435,16 @@ index 3a3e5db..a309f1e 100644
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -6289,6 +6454,11 @@ void rsx_d3d12_backend_present(void)
+@@ -5064,7 +5232,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
+     const rsx_vertex_attrib* a = &state->vertex_attribs[0];
+     fprintf(stderr, "[VTXPOS] a0 off=0x%X stride=%u size=%u type=%u -> (%g, %g, %g, %g)\n",
+             a->offset, a->stride, a->size, a->type,
+-            n > 0 ? v[0] : 0.f, n > 1 ? v[1] : 0.f, n > 2 ? v[2] : 0.f, n > 3 ? v[3] : 0.f);
++            v[0], v[1], v[2], v[3]);   /* all four: masking by `size` hid whether w survived */
+ }
+ 
+ static void vp_attrs_dbg(const rsx_state* state)
+@@ -6289,6 +6457,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -435,6 +456,35 @@ index 3a3e5db..a309f1e 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
+@@ -6303,6 +6476,28 @@ void rsx_d3d12_backend_present(void)
+             if (s_d3d.draws[_i].is_clear) { clears++; continue; }
+             if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
+         }
++        { /* Which surfaces the batch's draws actually target -- "offscreen=57"
++           * does not say whether they all go to one RT or scatter. */
++          u32 offs[8]; u32 cnt[8]; int nd = 0;
++          for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++) {
++              if (s_d3d.draws[_i].is_clear) continue;
++              u32 o = s_d3d.draws[_i].rt_off; int f = -1;
++              for (int _j = 0; _j < nd; _j++) if (offs[_j] == o) { f = _j; break; }
++              if (f < 0) { if (nd < 8) { offs[nd] = o; cnt[nd] = 1; nd++; } }
++              else cnt[f]++;
++          }
++          { u32 vp = 0, novp = 0;
++            for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++) {
++                if (s_d3d.draws[_i].is_clear) continue;
++                if (s_d3d.draws[_i].is_vp) vp++; else novp++;
++            }
++            /* The execution loop skips anything without is_vp, so a batch full
++             * of !is_vp records is counted, gated and then never drawn. */
++            fprintf(stderr, "[PRESENTGATE] is_vp=%u not_vp=%u%c", vp, novp, 10); }
++          fprintf(stderr, "[PRESENTGATE] targets:");
++          for (int _j = 0; _j < nd; _j++)
++              fprintf(stderr, " 0x%08X x%u", offs[_j], cnt[_j]);
++          fprintf(stderr, "%c", 10); }
+         fprintf(stderr, "[PRESENTGATE] records=%u onscreen=%u offscreen=%u clears=%u"
+                         " has_display=%d seen_content=%d -> render_frame=%s\n",
+                 s_d3d.draw_count, onscreen, offscreen, clears, has_display,
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index 886fbc7..976a05b 100644
 --- a/runtime/ppu/ppu_fs.cpp
