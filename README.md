@@ -824,13 +824,36 @@ wires up correctly — but there is still nothing to show, because **the composi
 itself only runs occasionally**. A whole run often logs no `[NV3089]` line at
 all, and both display buffers read back black.
 
-That is the honest state of it, and it points at the recoveries above. Resyncing
-to `put` keeps the FIFO alive at the cost of every command between here and the
-write head — and the 2D composite is one of the commands being dropped. The
-walker recovers, the frame does not. Making this reliable means not desyncing in
-the first place: the title's `_jsGcmFifoFinish` has to actually succeed, which
-means the label/semaphore handshake completing end to end. It does in a good run
-— `labels: [64]=1`, `ref` publishing, `get == put` — just not dependably.
+And that is not the reason either. `[NV3089]` is gated behind `NV3089_DBG`, so
+its absence from a log meant nothing — a mistake of mine that cost a couple of
+rounds. With it on, the composite runs every frame, in two chunks that together
+span the full 1280:
+
+```
+[NV3089] 1024x352 fmt=0x3 src=0xC1BE0000(pitch 10240) -> dst=0xC0026A80(pitch 5120)
+[NV3089]  256x352 fmt=0x3 src=0xC1BE1000(pitch 10240) -> dst=0xC0027A80(pitch 5120)
+```
+
+which finally names the real problem. `src=0xC1BE0000` is offscreen RT 3 **in
+guest memory**, and the pitch says what it is: 10240 over 1280 pixels is 8 bytes
+each — RGBA16F. But the 3D scene is rendered by D3D12 into GPU textures; nothing
+ever writes those bytes in guest memory. So the composite faithfully copies
+zeros, every frame, and always will.
+
+That is the architectural mismatch underneath all of it: **the scene lives on
+the GPU and the title's compositor reads it from guest RAM.** Not a desync, not
+a dropped command, not a format — the two halves of the frame path are in
+different memories. Closing it means teaching `nv3089_blit` that when its source
+matches a known offscreen D3D12 target it should do a GPU-side composite to the
+backbuffer instead of a CPU copy — with a format conversion, since the source is
+half-float and the backbuffer is 8-bit, so a fullscreen draw rather than a
+`CopyTextureRegion`.
+
+`GCM_GUEST_FB` above is the other half of that and already works; it just has
+nothing to present until the source is real. Retargeting the scene pass straight
+at the backbuffer (`RT_DISPLAY_BY_SIZE=1` at 1280x704) is not a shortcut either:
+four surfaces share those dimensions, so the render-to-texture chain collapses
+and the screen stays black.
 
 That is a piece of emulator-correctness work rather than another fix, and it is
 what stands between this port and a picture. The picture is in turn what the
