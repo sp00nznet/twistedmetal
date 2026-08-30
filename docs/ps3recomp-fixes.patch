@@ -199,7 +199,7 @@ index 23e7f94..8e27930 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..4160a15 100644
+index 3a3e5db..48e4402 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -16,6 +16,7 @@
@@ -650,7 +650,45 @@ index 3a3e5db..4160a15 100644
  }
  
  static void vp_attrs_dbg(const rsx_state* state)
-@@ -6289,6 +6603,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6029,6 +6343,37 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+           u32 _r = 0;
+           if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
+           if (!_r) _r = cellGcmResolveLocated((tex->format & 3) == 1, offset);
++          /* TEX_PROBE=1: the location bits are not always right. This title
++           * binds its menu textures with a location that resolves into main
++           * memory, where the bytes are all zero, while the same raw offset
++           * resolved as LOCAL lands on real data -- so 100k menu draws sample
++           * black and the menu never appears. When the chosen resolution is
++           * empty over a sample and the other one is not, take the other. */
++          { static int _tp = -1;
++            if (_tp < 0) _tp = getenv("TEX_PROBE") ? 1 : 0;
++            if (_tp && vm_base && _r) {
++                u32 alt = cellGcmResolveLocated((tex->format & 3) != 1, offset);
++                if (alt && alt != _r && alt < 0xE0000000u && _r < 0xE0000000u) {
++                    u32 span = width * height / 2;
++                    if (span > 4096) span = 4096;
++                    u32 nz_r = 0, nz_a = 0;
++                    for (u32 i = 0; i < span; i += 7) {
++                        if (vm_base[_r  + i]) nz_r++;
++                        if (vm_base[alt + i]) nz_a++;
++                    }
++                    if (nz_r == 0 && nz_a > 0) {
++                        static u32 seen[32]; static int ns = 0; int known = 0;
++                        for (int k = 0; k < ns; k++) if (seen[k] == offset) known = 1;
++                        if (!known && ns < 32) { seen[ns++] = offset;
++                            fprintf(stderr, "[TEX_PROBE] 0x%08X: %s empty, using %s"
++                                            " (%u non-zero)%c", offset,
++                                    ((tex->format & 3) == 1) ? "local" : "main",
++                                    ((tex->format & 3) == 1) ? "main" : "local",
++                                    nz_a, 10); }
++                        _r = alt;
++                    }
++                }
++            } }
+           s_d3d.cur_texs[unit].off = _r; }
+         s_d3d.cur_texs[unit].raw = offset;
+         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
+@@ -6289,6 +6634,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -662,7 +700,7 @@ index 3a3e5db..4160a15 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
-@@ -6303,6 +6622,28 @@ void rsx_d3d12_backend_present(void)
+@@ -6303,6 +6653,28 @@ void rsx_d3d12_backend_present(void)
              if (s_d3d.draws[_i].is_clear) { clears++; continue; }
              if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
          }

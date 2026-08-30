@@ -1423,6 +1423,56 @@ descriptor in the image, the candidates are a caller the lifter never emitted
 (12% of the code was not lifted — see above) or a computed call from the script
 system that owns `attractModeScript.cpp`.
 
+### The menu's textures are fine (and how that was nearly missed)
+
+The menu draws sample a 1024x1024 B8 atlas at raw offset `0x0AB55580`. Read as a
+main-memory address that buffer is **entirely zero** — 0 of 4096 bytes — which
+looks exactly like "the artwork never arrived" and matches a black render
+target. It is the wrong address. The same raw offset resolved as RSX *local*
+memory (`0xCAB55580`) holds real data, and `TEX_SAVE=1` shows Scaleform filling
+it as the menu builds:
+
+```
+[TEXB8] off=0xCAB55580 1024x1024 nz=348/61680  min=0 max=255
+[TEXB8] off=0xCAB55580 1024x1024 nz=2274/61680 min=0 max=255
+[TEXB8] off=0xCAB55580 1024x1024 nz=6737/61680 min=0 max=255
+```
+
+That is a glyph atlas being rasterised. The backend already resolves this one
+correctly through the format's location bits, so the texture path is **not** the
+bug — but the near-miss is worth recording, because "the texture reads as zero"
+was about to become the fourth wrong conclusion in this file. A raw RSX offset
+means nothing without its location.
+
+Four textures in this title *are* mis-resolved, and a probe finds them:
+`TEX_PROBE=1` resolves the offset both ways when the chosen one samples empty
+and the other does not.
+
+```
+[TEX_PROBE] 0x01190000: local empty, using main (586 non-zero)
+[TEX_PROBE] 0x01191400: local empty, using main (586 non-zero)
+[TEX_PROBE] 0x01F50000: local empty, using main (259 non-zero)
+[TEX_PROBE] 0x01F51400: local empty, using main (269 non-zero)
+```
+
+These are the mirror image of the case `TEX_RESOLVE_AUTO` was written for: the
+guest tags them local and built them in main memory.
+
+So at the menu the assets are present, the atlas is live, the geometry is
+submitted (100,816 draws) and render target `0x00AB0000` still reads back black.
+That puts the remaining fault in the vertex/fragment path — which is exactly
+where [the earlier investigation](#the-draws-were-rendering-the-whole-time) left
+it, with the difference that it can now be reproduced on the surface that
+actually matters instead of on a 68-draw side surface.
+
+Three instruments were added along the way and are worth keeping:
+
+| Knob | What it does |
+|---|---|
+| `TM_MEMDUMP=<hex ea>[,n]` | prints `n` guest bytes once a second with a non-zero count |
+| `RTT_SAVERT_AFTER=<secs>` | triggers the RT dump on wall time, not a frame number |
+| `TEX_PROBE=1` | picks the texture resolution that actually has content |
+
 ### Three instruments that were lying
 
 Worth recording, because each one produced a wrong conclusion that survived for

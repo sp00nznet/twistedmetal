@@ -35,6 +35,7 @@ void     tm_fbdump_tick(void);          /* src/hle_extra.cpp */
 void     tm_ef_kick_tick(void);         /* src/hle_extra.cpp */
 void     tm_loaddone_tick(void);        /* src/hle_extra.cpp */
 void     tm_fifowatch_tick(void);       /* src/hle_extra.cpp */
+void     tm_memdump_tick(void);         /* src/hle_extra.cpp */
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
@@ -210,6 +211,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         tm_ef_kick_tick();  /* TM_EF_KICK=<secs>: probe the stalled SPURS wait */
         tm_loaddone_tick(); /* TM_LOADDONE=<secs>: probe the load-complete byte */
         tm_fifowatch_tick();/* TM_FIFOWATCH=1: watch the RSX put/get/ref */
+        tm_memdump_tick();  /* TM_MEMDUMP=<addr>[,n]: watch guest bytes */
         ULONGLONG now = GetTickCount64();
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {

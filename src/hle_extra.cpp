@@ -720,6 +720,36 @@ void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", fun
 void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
 void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
 void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
+void func_0005A028_lifted(ppu_context* ctx);
+void func_0005A028(ppu_context* ctx) { tm_trace("avi::0005A028", func_0005A028_lifted, ctx); }
+void func_0005A82C_lifted(ppu_context* ctx);
+void func_0005A82C(ppu_context* ctx) { tm_trace("avi::0005A82C", func_0005A82C_lifted, ctx); }
+void func_003D40E0_lifted(ppu_context* ctx);
+void func_003D40E0(ppu_context* ctx) { tm_trace("avi::003D40E0", func_003D40E0_lifted, ctx); }
+void func_003D7BE0_lifted(ppu_context* ctx);
+void func_003D7BE0(ppu_context* ctx) { tm_trace("avi::003D7BE0", func_003D7BE0_lifted, ctx); }
+void func_003F1AF0_lifted(ppu_context* ctx);
+void func_003F1AF0(ppu_context* ctx) { tm_trace("avi::003F1AF0", func_003F1AF0_lifted, ctx); }
+void func_003F33D0_lifted(ppu_context* ctx);
+void func_003F33D0(ppu_context* ctx) { tm_trace("avi::003F33D0", func_003F33D0_lifted, ctx); }
+void func_0066DD48_lifted(ppu_context* ctx);
+void func_0066DD48(ppu_context* ctx) { tm_trace("avi::0066DD48", func_0066DD48_lifted, ctx); }
+void func_002997B8_lifted(ppu_context* ctx);
+void func_002997B8(ppu_context* ctx) { tm_trace("avi::002997B8", func_002997B8_lifted, ctx); }
+void func_0056EF3C_lifted(ppu_context* ctx);
+void func_0056EF3C(ppu_context* ctx) { tm_trace("avi::0056EF3C", func_0056EF3C_lifted, ctx); }
+void func_0056F7B0_lifted(ppu_context* ctx);
+void func_0056F7B0(ppu_context* ctx) { tm_trace("avi::0056F7B0", func_0056F7B0_lifted, ctx); }
+void func_00692924_lifted(ppu_context* ctx);
+void func_00692924(ppu_context* ctx) { tm_trace("avi::00692924", func_00692924_lifted, ctx); }
+void func_00693600_lifted(ppu_context* ctx);
+void func_00693600(ppu_context* ctx) { tm_trace("avi::00693600", func_00693600_lifted, ctx); }
+void func_00693AD0_lifted(ppu_context* ctx);
+void func_00693AD0(ppu_context* ctx) { tm_trace("avi::00693AD0", func_00693AD0_lifted, ctx); }
+void func_00081D88_lifted(ppu_context* ctx);
+void func_00081D88(ppu_context* ctx) { tm_trace("avi::00081D88", func_00081D88_lifted, ctx); }
+void func_001DB6B8_lifted(ppu_context* ctx);
+void func_001DB6B8(ppu_context* ctx) { tm_trace("avi::001DB6B8", func_001DB6B8_lifted, ctx); }
 void func_001DB4FC_lifted(ppu_context* ctx);
 /* The constructor that installs vtable 0x00CE78E0, whose slot 0 is
  * playMovieFile. playMovieFile has no static callers -- it is only ever
@@ -1035,6 +1065,37 @@ extern "C" int32_t cellSpursEventFlagSet(void* eventFlag, uint16_t bits);
  * it through vm_base, which means we can read it the same way. */
 #define GCM_CONTROL_EA 0x20002000u
 
+/* TM_MEMDUMP=<hex guest address>[,<count>] prints that many bytes once a
+ * second. The menu draws sample textures at main-memory addresses such as
+ * 0x0AB55580; if those bytes are zero the geometry is fine and the artwork
+ * simply never arrived, which is a different bug from the renderer dropping
+ * the draws. */
+extern "C" void tm_memdump_tick(void)
+{
+    static int on = -1;
+    static uint32_t addr = 0, count = 32;
+    if (on < 0) {
+        const char* e = getenv("TM_MEMDUMP");
+        on = e ? 1 : 0;
+        if (e) { addr = (uint32_t)strtoul(e, nullptr, 16);
+                 const char* c = strchr(e, 44);
+                 if (c) count = (uint32_t)strtoul(c + 1, nullptr, 0); }
+    }
+    if (!on || !addr) return;
+    static int tick = 0;
+    if ((tick++ % 60) != 0) return;
+    uint32_t nz = 0;
+    fprintf(stderr, "[memdump] 0x%08X:", addr);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t w = vm_read32((addr + i) & ~3u);
+        const uint32_t b = (w >> ((3 - ((addr + i) & 3)) * 8)) & 0xFF;
+        if (b) nz++;
+        if (i < 32) fprintf(stderr, " %02X", (unsigned)b);
+    }
+    fprintf(stderr, "   (%u/%u non-zero)\n", nz, count);
+    fflush(stderr);
+}
+
 extern "C" void tm_fifowatch_tick(void)
 {
     static int on = -1;
@@ -1255,6 +1316,19 @@ void func_0099790C(ppu_context* ctx)
                 { const uint32_t d = inplace ? inplace : dst;
                   static uint32_t lo = 0xFFFFFFFFu, hi = 0;
                   static long long nloc = 0;
+                  /* Same for main memory: the menu samples textures at
+                   * 0x0AB55580 and friends, and those bytes read back as all
+                   * zero, so record whether the archive writes anywhere near
+                   * them. */
+                  if (d < 0xC0000000u) {
+                      static uint32_t mlo = 0xFFFFFFFFu, mhi = 0;
+                      static long long nmain = 0;
+                      if (d < mlo) mlo = d;
+                      if (d + (uint32_t)n > mhi) mhi = d + (uint32_t)n;
+                      if ((++nmain % 256) == 0)
+                          fprintf(stderr, "[edge] main-memory writes: %lld blocks, "
+                                          "0x%08X..0x%08X\n", nmain, mlo, mhi);
+                  }
                   if (d >= 0xC0000000u) {
                       /* The UI texture sits 0x40000 below the lowest address
                        * the archive has been seen to write, so print the first
