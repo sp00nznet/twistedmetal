@@ -72,6 +72,7 @@ TRACE = {
     '000120C4': 'attractScript',
     '00059F6C': 'movieNameForId',
     '001DB604': 'playMovieFile',
+    '001DB4FC': 'ctor of the class whose vtable slot 0 is playMovieFile (vtable 0x00CE78E0)',
     '0014BCA8': 'boot::seq',
     '0020C698': 'WorldLoader::setup',
     '00360B90': 'AL::b90',

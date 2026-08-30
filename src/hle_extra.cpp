@@ -720,6 +720,12 @@ void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", fun
 void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
 void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
 void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
+void func_001DB4FC_lifted(ppu_context* ctx);
+/* The constructor that installs vtable 0x00CE78E0, whose slot 0 is
+ * playMovieFile. playMovieFile has no static callers -- it is only ever
+ * reached through this vtable -- so whether this ctor runs says whether the
+ * object that can play a movie is ever built at all. */
+void func_001DB4FC(ppu_context* ctx) { tm_trace("movieObj::ctor", func_001DB4FC_lifted, ctx); }
 
 void func_0014BCA8_lifted(ppu_context* ctx);
 void func_0020C698_lifted(ppu_context* ctx);

@@ -1383,6 +1383,46 @@ completions, roughly 8 fps).
 `MoviePlayer::openFile` remains at zero calls after ten minutes sitting in
 `MainMenu`, so no attract movie starts on its own.
 
+### Where the movie path actually begins
+
+Tracing back from the goal rather than forward from the boot narrows it to a
+handful of facts, all static and all checkable:
+
+- `MoviePlayer::openFile` (`0x006AC648`) has exactly **one** caller in the whole
+  binary: `playMovieFile` at `0x001DB604`.
+- `playMovieFile` has **no** static callers. Its function descriptor
+  (`0x00F010B0`) appears exactly once in the image, at `0x00CE78E0` — a slot in
+  a table of descriptors, so it is only ever reached through that table.
+- The only code that materialises `0x00CE78E0` is `func_001DB4FC`, immediately
+  above `playMovieFile`, which looks like the constructor that installs the
+  table on an object.
+- `func_001DB4FC` also has no static callers, and a trace on it records **zero
+  calls** in a five-minute run that reaches `MainMenu`.
+
+So nothing that can play a movie is ever constructed. This is upstream of every
+graphics question: it is not that the intro plays and shows nothing, it is that
+the object which would open `USRDIR/movies/*.avi` does not exist yet.
+
+The `.avi` names are all present in the binary, in three separate tables:
+
+```
+0x00C7DD34  ste_mgi mge_dfi df_end c1 ep_1 c2 ep_2 unlock st_mid mg_mid df_mid
+0x00C897B4  ep_1 ep_2 credits c2
+0x00CB2878  st_intro st_mid st_end mg_intro mg_mid mg_end df_intro df_mid df_end
+```
+
+alongside `c:/TMX/Build/packages/RT_BCUS98106/Game/attractModeScript.cpp`, so
+the attract path exists in this build. Ten minutes sitting in `MainMenu` does
+not start it, which is consistent with the menu never becoming interactive:
+render target `0x00AB0000` takes 100,816 draws and still reads back black, and
+injected pad input (`YDKJ_INJECT_PAD`) produces no state transition.
+
+That ordering is the useful part. The next thing to find is what calls
+`func_001DB4FC`, and since it is reached neither statically nor through any
+descriptor in the image, the candidates are a caller the lifter never emitted
+(12% of the code was not lifted — see above) or a computed call from the script
+system that owns `attractModeScript.cpp`.
+
 ### Three instruments that were lying
 
 Worth recording, because each one produced a wrong conclusion that survived for
