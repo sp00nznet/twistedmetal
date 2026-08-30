@@ -1423,6 +1423,66 @@ descriptor in the image, the candidates are a caller the lifter never emitted
 (12% of the code was not lifted — see above) or a computed call from the script
 system that owns `attractModeScript.cpp`.
 
+### Reaching the intro video
+
+```
+[fs] open '/dev_bdvd/PS3_GAME/USRDIR/movies/st_intro.avi' -> fd 52
+Avi   AVC Video Stream 0 w: 1280 h: 720 start: 0 end: 28282500
+Avi Subs Stream 1
+Avi Audio Stream 2 freq: 48000 channels: 6 format: AC3
+Avi Audio Stream 3 freq: 48000 channels: 6 format: AC3
+Avi Audio Stream 4 freq: 48000 channels: 6 format: AC3
+[cellVdec] StartSeq(handle=0)
+[SYS] sys_ppu_thread_create tid=26 name="videoStream"
+[SYS] sys_ppu_thread_create tid=27 name="audioStream"
+[SYS] sys_ppu_thread_create tid=28 name="subtitleStream"
+[SYS] sys_ppu_thread_create tid=30 name="VideoDisplayPS3"
+[SYS] sys_ppu_thread_create tid=31 name="MoviePlayerRingBuffer"
+[SYS] sys_ppu_thread_create tid=32 name="Demuxer"
+[SYS] sys_ppu_thread_create tid=33 name="MoviePlayerSourceFile"
+```
+
+The title opens the campaign intro cinematic, parses its AVI container, and
+brings up the entire movie player: demuxer, ring buffer, source-file reader and
+the video/audio/subtitle stream threads. `MoviePlayer::openFile` had been at zero
+calls through the whole investigation above; the object that owns it had never
+even been constructed.
+
+There is no picture, and that is expected rather than mysterious:
+`cellVdecStartSeq` returns `0x80610101` and `cellAdecStartSeq` returns
+`0x80610201` because ps3recomp's `cellVdec`/`cellAdec` accept access units and
+decode nothing. Decoding H.264 and AC3 is the next piece of work, and it is a
+self-contained one.
+
+Two fixes were needed to get here, on top of the network unblock.
+
+**`sys_ppu_thread_exit` returned to the guest.** On hardware it never returns.
+ps3recomp recorded the exit status, signalled the joiners, and returned
+`CELL_OK`, with a comment saying the thread proc would handle termination after
+return — but the guest calls it from deep inside its thread entry, so execution
+simply carried on past it. One Twisted Metal thread exits from inside a loop and
+so called exit **1,435 times in a single run**, staying alive the whole time.
+`ppu_host_thread_proc` now arms a `setjmp` and the syscall `longjmp`s out to it;
+1,442 exit calls became 16, with 8 clean unwinds.
+`PS3_NO_THREAD_EXIT_UNWIND=1` restores the old behaviour.
+
+**The shell sound bank will not unload.** `WorldLoader::setup` tears the menu
+down before the cinema plays, and `func_00606CE4` blocks in the BRB bank unload
+at `func_009B2574` — named by the string it is handed, `"shell"`. That waits on
+the BRB mixer, which runs as the SPURS job workload `Wws_Job/BrBDblBufWrkld`
+whose PM is not lifted, so it never completes. A movie does not need the shell
+bank torn down, so `TM_SKIP_BANKUNLOAD=1` returns success without doing it. That
+is a workaround, not a fix: the real answer is to run the BRB mixer job.
+
+The full sequence, all of it title-local knobs rather than code changes:
+
+```
+TM_FORCESTATE=00CEF810,100   enter UiMoviesMenu
+TM_FORCECALL=0048266C,120    fire its select handler -> onSelect(st_intro.avi)
+TM_LOADDONE=140              release the load-complete byte the cinema re-clears
+TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
+```
+
 ### Driving the title to the intro: `UiMoviesMenu::onSelect(st_intro.avi)`
 
 The menu cannot be operated — it renders black and takes no pad input — so the

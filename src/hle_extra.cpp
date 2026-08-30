@@ -801,6 +801,27 @@ void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", fun
 void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
 void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
 void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
+void func_009B2574_lifted(ppu_context* ctx);
+/* The cinema load hangs here. func_00606CE4 calls this at 0x00606ED4 right
+ * after naming the bank "shell", so this is the BRB audio bank unload, and it
+ * waits on a mixer that runs as a SPURS job whose PM was never lifted. A movie
+ * does not need the shell bank torn down, so TM_SKIP_BANKUNLOAD=1 returns
+ * success without doing it, to see what the load does next. */
+void func_009B2574(ppu_context* ctx)
+{
+    static int skip = -1;
+    if (skip < 0) skip = getenv("TM_SKIP_BANKUNLOAD") ? 1 : 0;
+    if (skip) {
+        static int n = 0;
+        if (n++ < 4) { fprintf(stderr, "[skip] bank unload 0x009B2574(0x%08X)\n",
+                               (uint32_t)ctx->gpr[3]); fflush(stderr); }
+        ctx->gpr[3] = 0;
+        return;
+    }
+    tm_trace("cw::009B2574", func_009B2574_lifted, ctx);
+}
+void func_009B2784_lifted(ppu_context* ctx);
+void func_009B2784(ppu_context* ctx) { tm_trace("cw::009B2784", func_009B2784_lifted, ctx); }
 void func_00606F78_lifted(ppu_context* ctx);
 void func_00606F78(ppu_context* ctx) { tm_trace("cw::00606F78", func_00606F78_lifted, ctx); }
 void func_00606CE4_lifted(ppu_context* ctx);

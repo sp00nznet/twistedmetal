@@ -72,6 +72,8 @@ TRACE = {
     '000120C4': 'attractScript',
     '00059F6C': 'movieNameForId',
     '001DB604': 'playMovieFile',
+    '009B2574': 'cinema load: untraced library callee',
+    '009B2784': 'cinema load: untraced library callee',
     '00606F78': 'cinema world load chain',
     '00606CE4': 'cinema world load chain',
     '0036168C': 'cinema world load chain',
