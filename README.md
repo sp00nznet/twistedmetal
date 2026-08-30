@@ -459,6 +459,14 @@ Real hardware returns `CELL_OK` with `state = Disconnected` when there is simply
 no connection, so `src/hle_extra.cpp` overrides the NID to say that. 704,666
 calls became 4.
 
+That was not enough, and it took a long time to notice: the title's *other*
+network loop needs the state to actually read `IPObtained`, and a truthful
+`Disconnected` leaves it spinning just as surely as an error does. The boot sat
+there behind the legal screens for the whole of the graphics investigation
+below. See [What was actually blocking the boot](#what-was-actually-blocking-the-boot-network-init)
+— with `IPObtained` reported the state machine reaches `MainMenu` and the draw
+count goes from a handful of quads to 101,208.
+
 ### Pixels: the path works, the content does not arrive
 
 The window was black. It is now presenting, and the reason it looked dead was a
@@ -1304,6 +1312,102 @@ front end needs before its menu will take input: injected pad input
 (`YDKJ_INJECT_PAD`) does not move the menu today, and the movie chain — the
 ArchiveLoader's movies path, the attract script, the `c1.avi`/`ep_1.avi` id
 table, `MoviePlayer::openFile` — is confirmed at zero calls.
+
+### What was actually blocking the boot: network init
+
+Every graphics conclusion above was drawn while the title was wedged, and it was
+not wedged on graphics. After `UiLegal_4` the boot entered `func_00282730` and
+stayed there, logging
+
+```
+[game] Initializing network hardware, 1 unsuccessful attempts.
+[game] Initializing network hardware, 2 unsuccessful attempts.
+...
+[game] Initializing network hardware, 150 unsuccessful attempts.
+```
+
+until the process was killed. The loop polls `cellNetCtlGetState` and leaves
+only when the state reads `IPObtained` (3):
+
+```
+loc_002828F8:  r27++ ; GetState(&state)
+               if (ret >= 0) goto check
+               log("...unsuccessful attempts") ; *(r31+0x18) = r30   /* r30 is 0 */
+check:         if (state == 3) goto done                             /* the only exit */
+               if (r27 > 15) log(...)
+               sleep(r27 >= 120 ? 0.5s : 5s) ; goto loc_002828F8
+```
+
+Neither an error return nor a truthful `Disconnected` breaks it — the error path
+stores `r30`, which is zero, so the loop condition is unchanged and it retries.
+ps3recomp's default is to *fail* the call when offline, which is right for
+LittleBigPlanet (whose connect job exits on `ret < 0`) and wrong here; this repo
+had additionally overridden it to return `CELL_OK` with `Disconnected`, which is
+what real hardware does and also wrong here. Reporting `IPObtained` is what lets
+the loop complete. `TM_NET_STATE` overrides it for testing the other two.
+
+With that one value changed the state machine walks all the way through:
+
+```
+UiLegal_HealthWarning -> UiLegal_1 -> _2 -> _3 -> _4 -> UiNetShutdown -> MainMenu
+```
+
+and settles into a steady frame loop in `MainMenu` (`onEnter` at `0x0047EC50`).
+Draw volume went from a handful of quads to **101,208 draws**, and the render
+target they go to changed with it:
+
+```
+100816 draws  rt=0x00AB0000   tex0 = 0x0AB55580 / 0x0AC55580 / 0x0ACAAB80
+   302 draws  rt=0x01190000
+    68 draws  rt=0x01BE0000   tex0 = 0x02ACD800
+```
+
+Two things follow. The first is that the black DXT1 texture at local memory
+`0x02ACD800`, which the previous section treats as *the* blocker, accounts for
+68 of 101,208 draws. It is a minor element, not the menu. The second is that the
+menu's real textures live at `0x0AB55580` and friends — **main memory**, not RSX
+local memory — so the archive's local-memory writes were never going to be where
+the menu's artwork came from.
+
+`0x02ACD800` is still unexplained but is no longer interesting: the first
+local-memory write of the archive lands at `0xC2B0D800` block 0 and marches
+contiguously upward, so the texture sitting exactly `0x40000` below it is a
+separate, earlier allocation and nothing is being dropped from the stream.
+
+Render target `0x00AB0000` (1280x704) still reads back all black at frame 600,
+which is around the moment the menu is entered. Whether it stays black once the
+menu has settled is not yet measured: the frame counter only reaches ~600 in a
+560-second run, because the flip wait now dominates (7.9 million polls for 3,382
+completions, roughly 8 fps).
+
+`MoviePlayer::openFile` remains at zero calls after ten minutes sitting in
+`MainMenu`, so no attract movie starts on its own.
+
+### Three instruments that were lying
+
+Worth recording, because each one produced a wrong conclusion that survived for
+a long time.
+
+**Strings read as ASCII.** The title stores localised text as UTF-16BE. `tm_gstr`
+read it as ASCII, stopped on the leading zero byte, and reported every string as
+empty — which made `Movie::c('', '')` look like a movie player being handed a
+nameless file. It is really `Movie::c("EXIT GAME NETWORK", "Disconnecting from
+the game network ...")`, a dialog, and the function is not a movie player at all.
+
+**`%^` parsed as a conversion.** The Ui state machine formats
+`"!@#$%^&* %s::onEnter() triggered at [%f]"`. The log renderer scanned forward
+from `%` to the next conversion character, walked over `^&* `, and consumed the
+class name as the argument — so every transition printed as a bare number and no
+state could be identified by name. Only accept a real flag/width/length run
+after `%`; anything else is literal.
+
+**Vtable slots read as code addresses.** They are PPC64 function descriptors.
+Dereferencing them is what turned `vtable=0x00CEF690 [ 00F06528 ... ]` into
+`[ 0047F8F8 ... 0047EC50 ]` and identified the final state as `MainMenu`.
+
+With those three fixed, `func_004AA780` — labelled `IntroMovie::onEnter` in
+`post_lift.py` and treated as the intro path in everything above — turns out to
+be `UiNetShutdown`. There is no evidence the intro movie state was ever entered.
 
 ### Finding a message when the cross-reference cannot
 

@@ -61,8 +61,8 @@ TRACE = {
     '005BA908': 'UiState::enter',
     '005BB358': 'UiState::update',
     '005CAEA0': 'UiState::setTimer',
-    '004AA780': 'IntroMovie::onEnter',
-    '004AAA98': 'IntroMovie::update',
+    '004AA780': 'UiNetShutdown::onEnter (NOT IntroMovie -- its own log string names it)',
+    '004AAA98': 'UiNetShutdown::update',
     '006AD8E8': 'MoviePlayer::a',
     '006ADA38': 'MoviePlayer::b',
     '004B6270': 'Movie::c',
@@ -84,7 +84,7 @@ TRACE = {
     '0064C410': 'loadBar::finish -- sets the load-complete byte',
     '0010E57C': 'setLoadDone -- the other writer of that byte',
     '0036204C': 'AL::204c',
-    '004AA5D8': 'IntroMovie::update tail -- (7, <name?>)',
+    '004AA5D8': 'a fourth log(level, fmt, ...)',
     '0034F060': 'stringTable::get(table, id) -- names the intro movie',
 }
 

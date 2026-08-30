@@ -1250,6 +1250,13 @@ void func_0099790C(ppu_context* ctx)
                   static uint32_t lo = 0xFFFFFFFFu, hi = 0;
                   static long long nloc = 0;
                   if (d >= 0xC0000000u) {
+                      /* The UI texture sits 0x40000 below the lowest address
+                       * the archive has been seen to write, so print the first
+                       * destinations: if the stream is meant to start there and
+                       * the opening blocks go missing, this shows it. */
+                      if (nloc < 8)
+                          fprintf(stderr, "[edge] local write #%lld -> 0x%08X + %d\n",
+                                  nloc, d, n);
                       if (d < lo) lo = d;
                       if (d + (uint32_t)n > hi) hi = d + (uint32_t)n;
                       if ((++nloc % 256) == 0)
