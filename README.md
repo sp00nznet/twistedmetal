@@ -1483,6 +1483,64 @@ TM_LOADDONE=140              release the load-complete byte the cinema re-clears
 TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
 ```
 
+### Why everything renders black: one fragment program
+
+The menu draws 100,816 textured quads with a live glyph atlas into a render
+target that reads back black. The reason turns out to be short.
+
+Every draw in the run used the **same** fragment program, `0x00EC2B02`. Dumping
+its ucode from guest memory and decoding the first instruction by hand:
+
+```
+1E 81 01 40  00 02 1C 9C  C8 00 00 01  C8 00 00 01
+w0 = 0x01401E81   FP_END set        -- a one-instruction program
+w1 = 0x1C9C0002   reg type 2 = CONST -- its operand is an inline constant
+```
+
+One instruction, output a constant — which is exactly what the decompiler
+emitted (`h[0] = fp_k[0].xxxx`). And the constant that follows it in the ucode
+is sixteen zero bytes. So every draw in the game output `(0,0,0,0)`. The screen
+was black because the shader said black.
+
+The title does not really have one fragment program. `NV4097_SET_SHADER_PROGRAM`
+(method `0x08E4`) was **being thrown away**, because it arrives on RSX
+subchannel 1 and the FIFO drain routes everything with `subch != 0` to the 2D
+engine handler, which silently discards what it does not recognise. That is the
+defect recorded earlier in this file from a `GCM2D_TRACE` histogram — subchannel
+1 carrying NV4097 methods — and it was dismissed on a test that measured the
+wrong surface at a point in the boot where the title had not even reached its
+menu. The test was worthless; the finding was right.
+
+`GCM_SUBCH1_3D=1` routes subchannel 1 to the 3D engine as well. With it:
+
+```
+[FPK] distinct fp #1 = 0x00EC2B02      <- the only one without the fix
+[FPK] distinct fp #2 = 0x00FDDC82
+[FPK] distinct fp #3 = 0x08BA4782
+...  ten and counting
+```
+
+The renderer is now being given the shaders the title actually programmed,
+instead of one stale default. This is the single biggest correctness fix to the
+graphics path so far, and it was found by asking a question that should have
+been asked much earlier: not "why is the surface black" but "what colour does
+the shader compute".
+
+The proper fix is to track `SET_OBJECT` binds so the subchannel-to-engine map is
+read from the FIFO rather than assumed. `GCM_SUBCH1_3D` is the heuristic version
+of that and is what every run should now use.
+
+#### The remaining blocker is a GPU hang
+
+The device is removed with `DXGI_ERROR_DEVICE_HUNG` — a TDR — and it now has a
+window: a readback of the menu render target succeeds at **40 seconds** and
+fails at **68 seconds**, so the hang lands while the UI first renders in
+earnest. It is not draw volume (`DRAW_LIMIT=32` changes nothing), not a shader
+loop (every `for` in the dumped VP and FP HLSL is `[unroll]` with a fixed trip
+count), and the D3D12 debug layer reports no validation error before the
+removal. Until it is fixed, no readback of the menu can be taken after the
+menu exists, which is why there is still no screenshot of it here.
+
 ### Getting past the intro, and where attract mode actually lives
 
 Three findings, and together they say the intro is not what stands in the way.

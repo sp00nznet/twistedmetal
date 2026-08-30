@@ -636,6 +636,28 @@ static uint32_t tm_find_state(uint32_t vt)
     return 0;
 }
 
+/* TM_FORCESTATE=list prints every UI state object that actually exists. Only
+ * some of the 93 vtables in the image are ever instantiated, so forcing one by
+ * vtable finds nothing unless the title built it. A UI state is recognisable
+ * without knowing its class: vtable slot 4 always resolves to 0x005CB92C. */
+static void tm_list_states(void)
+{
+    int n = 0;
+    for (uint32_t a = 0x17E00000u; a < 0x18400000u; a += 4) {
+        const uint32_t vt = vm_read32(a);
+        if (vt < 0x00CE0000u || vt >= 0x00CF2000u || (vt & 3)) continue;
+        const uint32_t d4 = vm_read32(vt + 16);
+        if (d4 < 0x00E00000u || d4 >= 0x00F80000u) continue;
+        if (vm_read32(d4) != 0x005CB92Cu) continue;
+        const uint32_t d3 = vm_read32(vt + 12), d0 = vm_read32(vt + 0);
+        fprintf(stderr, "[states] obj=0x%08X vtable=0x%08X onEnter=0x%06X update=0x%06X\n",
+                a, vt, d3 ? vm_read32(d3) : 0, d0 ? vm_read32(d0) : 0);
+        n++;
+    }
+    fprintf(stderr, "[states] %d live UI state objects\n", n);
+    fflush(stderr);
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx);
 static uint32_t g_forced_state = 0;
 
@@ -657,6 +679,8 @@ static bool tm_force_state(ppu_context* ctx)
 
     if (armed && !done && g_ui_machine && el >= secs) {
         done = 1;
+        { const char* e = getenv("TM_FORCESTATE");
+          if (e && strcmp(e, "list") == 0) { tm_list_states(); return false; } }
         const uint32_t st = tm_find_state(vt);
         g_forced_state = st;
         fprintf(stderr, "[forcestate] vtable 0x%08X -> state 0x%08X (machine 0x%08X)\n",
