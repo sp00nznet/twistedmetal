@@ -84,6 +84,8 @@ TRACE = {
     '0064C410': 'loadBar::finish -- sets the load-complete byte',
     '0010E57C': 'setLoadDone -- the other writer of that byte',
     '0036204C': 'AL::204c',
+    '004AA5D8': 'IntroMovie::update tail -- (7, <name?>)',
+    '0034F060': 'stringTable::get(table, id) -- names the intro movie',
 }
 
 # Guest fragments the lifter emitted without a fall-through edge, mapped to the

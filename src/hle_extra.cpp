@@ -261,6 +261,20 @@ static const char* tm_gstr(uint32_t ea, char* buf, size_t cap)
 {
     if (!ea) return "(null)";
     size_t i = 0;
+    /* The title's localised text is UTF-16BE, so an ASCII read stops on the
+     * leading zero byte and reports every string as empty. Detect that and
+     * transcode the Latin-1 range, which covers every name we look at. */
+    if ((vm_read32(ea & ~3u) >> ((3 - (ea & 3)) * 8) & 0xFF) == 0) {
+        for (; i + 1 < cap; i++) {
+            const uint32_t a = ea + i * 2;
+            const uint32_t hi = (vm_read32(a & ~3u) >> ((3 - (a & 3)) * 8)) & 0xFF;
+            const uint32_t lo = (vm_read32((a + 1) & ~3u) >> ((3 - ((a + 1) & 3)) * 8)) & 0xFF;
+            if (!hi && !lo) break;
+            buf[i] = hi ? '?' : (char)lo;
+        }
+        buf[i] = 0;
+        return buf;
+    }
     for (; i + 1 < cap; i++) {
         uint32_t w = vm_read32((ea + i) & ~3u);
         char c = (char)((w >> ((3 - ((ea + i) & 3)) * 8)) & 0xFF);
@@ -290,9 +304,17 @@ static void tm_game_log(ppu_context* ctx)
         fprintf(stderr, "[game] ");
     for (const char* p = fmt; *p; p++) {
         if (*p != '%') { fputc(*p, stderr); continue; }
-        const char* spec = p++;
-        while (*p && !strchr("diouxXeEfgGcspn%", *p)) p++;
-        if (*p == '%') { fputc('%', stderr); continue; }
+        /* The Ui state machine's format strings start "!@#$%^&* %s::onEnter",
+         * so a scan that skips forward to the next conversion character walks
+         * straight over "^&* " and consumes the class name as the argument to
+         * a spec that was never there. Only accept a run of real printf flags,
+         * width, precision and length modifiers; anything else is literal. */
+        const char* spec = p;
+        const char* q = p + 1;
+        while (*q && strchr("-+ #0123456789.hlLqjzt'", *q)) q++;
+        if (*q == '%') { fputc('%', stderr); p = q; continue; }
+        if (!*q || !strchr("diouxXeEfgGcspn", *q)) { fputc('%', stderr); continue; }
+        p = q;
         uint64_t a = (argi <= 10) ? ctx->gpr[argi++] : 0;
         switch (*p) {
         case 's': fprintf(stderr, "%s", tm_gstr((uint32_t)a, sbuf, sizeof sbuf)); break;
@@ -582,7 +604,13 @@ void func_005BA908(ppu_context* ctx)
         const uint32_t st = (uint32_t)ctx->gpr[4];
         const uint32_t vt = st ? vm_read32(st) : 0;
         fprintf(stderr, "[trace] UiState::enter state=0x%08X vtable=0x%08X [", st, vt);
-        for (uint32_t i = 0; i < 10 && vt; i++) fprintf(stderr, " %08X", vm_read32(vt + i * 4));
+        /* The vtable holds PPC64 function descriptors, so the slot value is
+         * not the code address -- dereference it to get the entry point, which
+         * is what names the state against the lifted functions. */
+        for (uint32_t i = 0; i < 10 && vt; i++) {
+            const uint32_t d = vm_read32(vt + i * 4);
+            fprintf(stderr, " %08X", d ? vm_read32(d) : 0);
+        }
         fprintf(stderr, " ]\n");
     }
     tm_trace("UiState::enter", func_005BA908_lifted, ctx);
@@ -627,6 +655,42 @@ void func_004AAA98(ppu_context* ctx)
   else func_004AAA98_lifted(ctx); }
 void func_006AD8E8(ppu_context* ctx) { tm_trace("MoviePlayer::a", func_006AD8E8_lifted, ctx); }
 void func_006ADA38(ppu_context* ctx) { tm_trace("MoviePlayer::b", func_006ADA38_lifted, ctx); }
+void func_004AA5D8_lifted(ppu_context* ctx);
+/* Called from IntroMovie::update once its timer expires, as (7, 0x00CBECA0).
+ * If that pointer is a movie name this is the call that should start one. */
+void func_004AA5D8(ppu_context* ctx)
+{
+    if (tm_trace_on()) {
+        char b[128];
+        fprintf(stderr, "[trace] introTail(%d, 0x%08X '%s')\n", (int)ctx->gpr[3],
+                (uint32_t)ctx->gpr[4], tm_gstr((uint32_t)ctx->gpr[4], b, sizeof b));
+        fflush(stderr);
+    }
+    func_004AA5D8_lifted(ctx);
+}
+void func_0034F060_lifted(ppu_context* ctx);
+/* stringTable::get(table, id). IntroMovie::onEnter asks it for ids 0x400 and
+ * 0x401 and hands both to Movie::c, which is what would name the file to play.
+ * Both come back empty, so print the id, the returned pointer and its first
+ * bytes to see whether the table is unpopulated or the lookup misses. */
+void func_0034F060(ppu_context* ctx)
+{
+    const uint32_t tbl = (uint32_t)ctx->gpr[3], id = (uint32_t)ctx->gpr[4];
+    func_0034F060_lifted(ctx);
+    if (tm_trace_on()) {
+        const uint32_t r = (uint32_t)ctx->gpr[3];
+        char sb[64]; char hex[64] = {0};
+        for (int i = 0; i < 8 && r; i++) {
+            const uint32_t w = vm_read32((r + i) & ~3u);
+            snprintf(hex + i * 3, 4, "%02X ",
+                     (unsigned)((w >> ((3 - ((r + i) & 3)) * 8)) & 0xFF));
+        }
+        fprintf(stderr, "[trace] strTable(0x%08X, 0x%X) = 0x%08X '%s' [%s]\n",
+                tbl, id, r, tm_gstr(r, sb, sizeof sb), hex);
+        fflush(stderr);
+    }
+}
+
 /* The last call IntroMovie::onEnter makes, with two heap pointers that look
  * like strings -- if this is "play this movie", they name it. */
 void func_004B6270(ppu_context* ctx)
@@ -727,14 +791,25 @@ void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lift
  * title does call. Report the truth and let the game go offline.
  * ------------------------------------------------------------------------- */
 #define CELL_NET_CTL_STATE_Disconnected 0
+#define CELL_NET_CTL_STATE_IPObtained   3
 
+/* Reporting Disconnected truthfully is not enough: the title's network-init
+ * loop at 0x00282730 leaves only when the state reads IPObtained. Neither a
+ * Disconnected state nor an error return breaks it -- both land in the same
+ * retry, which is where the boot sat logging "Initializing network hardware,
+ * N unsuccessful attempts" forever, making the legal screens the last thing
+ * it ever showed. Report IPObtained so the loop completes and the boot goes
+ * on; TM_NET_STATE overrides it for testing the other paths. */
 static void cellNetCtlGetState(ppu_context* ctx)
 {
     const uint32_t state = (uint32_t)ctx->gpr[3];
     if (!state) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80130102; return; }
-    vm_write32(state, CELL_NET_CTL_STATE_Disconnected);
+    static int want = -1;
+    if (want < 0) { const char* e = getenv("TM_NET_STATE");
+                    want = e ? atoi(e) : CELL_NET_CTL_STATE_IPObtained; }
+    vm_write32(state, (uint32_t)want);
     static long long n = 0;
-    if (n++ < 3) fprintf(stderr, "[cellNetCtl] GetState() -> OK, Disconnected\n");
+    if (n++ < 3) fprintf(stderr, "[cellNetCtl] GetState() -> OK, state=%d\n", want);
     ctx->gpr[3] = 0;
 }
 
