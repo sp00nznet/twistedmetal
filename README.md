@@ -1574,6 +1574,59 @@ file: every readback taken after the menu exists fails, because
 `CreateCommittedResource` for the readback buffer returns failure once the
 device is gone.
 
+### Reaching attract mode
+
+```
+[attract] world ctor #1: factory 0x00F06F98 -> 0x00EFD8A8
+[trace]   -> attractScript(0x014BE734, ...) from 0x003A8780
+[trace]   <- attractScript = 0x15B5C560
+[game] GeomPageMgr::init(UI World Main, 21474236)
+[game] VehicleMgr::loadNewVehicle() called, requesting dbId=910, for pi=0
+[game] setReservedSlotId() time=27250 player 0 addr=1667b00 setting reserved slot ID=255
+[game] VehicleMgr::loadNewVehicle() called, requesting dbId=901, for pi=1
+...                                                          pi=2 .. pi=10
+[game] GeomPageMgr::init(vehicleMainMemstack, ...)
+[game] GeomPageMgr::init(fodderCarMainMemstack, ...)
+[game] GeomPageMgr::init(semiTrailerMainMemstack, ...)
+```
+
+`AttractModeScript::create` runs, its world is constructed, and the script
+populates it with a full AI roster — eleven players, vehicle database ids 901 to
+919 — and brings up the vehicle, traffic-car and semi-trailer geometry pools.
+`VehicleMgr::loadNewVehicle` appears **44 times** here and **zero times in every
+other run in this repo's history**, including the nine-minute menu idle and the
+forced `WorldLoader::loadGame` runs. Nothing in the UI path loads a vehicle;
+this is the game world.
+
+#### How
+
+Three things had to line up, and the first two are recorded in the sections
+above: the network unblock to get out of the legal screens, and the discovery
+that `WorldLoader::loadGame` takes a **script factory function pointer** rather
+than a world name.
+
+The third is where the factory is consumed. `loadGame` only *stores* it, at
+`+0x3F8` of the world object; `func_0020C7F8` later reads that slot and passes
+it as the **seventh argument (r9)** to `func_003A82C8`, the world constructor.
+Forcing `loadGame` with the attract descriptor does not work — by the time it
+runs, the world already in flight was constructed from a factory captured
+earlier, which is why `func_000120C4` stayed at zero calls through all of that.
+
+Substituting at the point of use does work. `TM_ATTRACT=<n>` replaces `r9` with
+`0x00EFD8A8` — the `.opd` descriptor of `AttractModeScript::create` — on the
+nth world construction:
+
+```
+TM_ATTRACT=1 FP_OFF=1 GCM_SUBCH1_3D=1 FLOW_CONDKICK=1 \
+TM_SKIP_BANKUNLOAD=1 TM_LOADDONE=140 ./build/twistedmetal.exe input/EBOOT.ELF
+```
+
+`FP_OFF=1` is there because the GPU TDR otherwise removes the device around 40-68
+seconds and the frame loop then crawls; with the guest-FP draws skipped the run
+is stable long enough to get here. So this reaches attract mode's *simulation*
+— world, script, vehicles, players — while the picture still waits on the
+renderer work described above.
+
 ### The attract world: how it is selected, and how far it now gets
 
 Attract mode is not a UI state and not a data script. It is a **world script**,

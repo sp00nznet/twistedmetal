@@ -905,30 +905,42 @@ void func_00059F6C_lifted(ppu_context* ctx);
 void func_001DB604_lifted(ppu_context* ctx);
 void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", func_0036255C_lifted, ctx); }
 void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
+void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
+void func_00799B5C_lifted(ppu_context* ctx);
+void func_00799B5C(ppu_context* ctx) { tm_trace("movie video-stream path", func_00799B5C_lifted, ctx); }
+void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
+void func_002B8F38_lifted(ppu_context* ctx);
+void func_002B8F38(ppu_context* ctx) { tm_trace("scriptFactory", func_002B8F38_lifted, ctx); }
 void func_0020C7F8_lifted(ppu_context* ctx);
 void func_0020C7F8(ppu_context* ctx) { tm_trace("world::0020C7F8", func_0020C7F8_lifted, ctx); }
 void func_003A82C8_lifted(ppu_context* ctx);
-void func_003A82C8(ppu_context* ctx) { tm_trace("world::003A82C8", func_003A82C8_lifted, ctx); }
-void func_002B8F38_lifted(ppu_context* ctx);
-void func_002B8F38(ppu_context* ctx) { tm_trace("scriptFactory", func_002B8F38_lifted, ctx); }
-void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
-void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
-void func_00799B5C_lifted(ppu_context* ctx);
-void func_00799B5C(ppu_context* ctx) { tm_trace("vid::00799B5C", func_00799B5C_lifted, ctx); }
+/* The world constructor. It receives the world's script factory in r9 --
+ * WorldLoader::loadGame stores that pointer at +0x3F8 and func_0020C7F8 passes
+ * it straight through. TM_ATTRACT=<n> substitutes the descriptor of
+ * AttractModeScript::create (func_000120C4, .opd entry 0x00EFD8A8) on the nth
+ * world construction, so the world is built with the attract script instead of
+ * whatever it was going to use. */
+void func_003A82C8(ppu_context* ctx)
+{
+    static int want = -1;
+    if (want < 0) { const char* e = getenv("TM_ATTRACT"); want = e ? atoi(e) : 0; }
+    if (want) {
+        static int n = 0;
+        n++;
+        if (n >= want) {
+            fprintf(stderr, "[attract] world ctor #%d: factory 0x%08X -> 0x00EFD8A8\n",
+                    n, (uint32_t)ctx->gpr[9]);
+            fflush(stderr);
+            ctx->gpr[9] = 0x00EFD8A8u;
+        }
+    }
+    tm_trace("world::003A82C8", func_003A82C8_lifted, ctx);
+}
 void func_0079A634_lifted(ppu_context* ctx);
 /* The movie video stream. It returns 155 without decoding whenever
- * *(this+0xC0) is zero, so print the object to see what is missing. */
+ * *(this+0xC0) -- the vdec handle -- is zero. */
 void func_0079A634(ppu_context* ctx)
 {
-    static int n = 0;
-    if (n < 6) {
-        const uint32_t o = (uint32_t)ctx->gpr[3];
-        fprintf(stderr, "[vid] stream=0x%08X +0xC0=0x%08X +0xC4=0x%08X +0xCC=0x%08X"
-                        " +0xB8=0x%08X +0xBC=0x%08X arg=0x%08X\n",
-                o, vm_read32(o + 0xC0), vm_read32(o + 0xC4), vm_read32(o + 0xCC),
-                vm_read32(o + 0xB8), vm_read32(o + 0xBC), (uint32_t)ctx->gpr[4]);
-        fflush(stderr); n++;
-    }
     tm_trace("vid::0079A634", func_0079A634_lifted, ctx);
 }
 void func_00799EF0_lifted(ppu_context* ctx);
