@@ -1423,6 +1423,81 @@ descriptor in the image, the candidates are a caller the lifter never emitted
 (12% of the code was not lifted — see above) or a computed call from the script
 system that owns `attractModeScript.cpp`.
 
+### Driving the title to the intro: `UiMoviesMenu::onSelect(st_intro.avi)`
+
+The menu cannot be operated — it renders black and takes no pad input — so the
+movie path was exercised by driving the state machine directly. Two knobs do it,
+both issued from inside `UiState::update` so the transition happens on the UI
+thread with a live stack:
+
+```
+TM_FORCESTATE=<vtable hex>[,seconds]   enter the state built on that vtable
+TM_FORCECALL=<guest addr>[,seconds]    then call that function on the state object
+```
+
+Finding the target was a matter of asking which UI states reach
+`WorldLoader::loadCinema`. Two do, and their vtables name them:
+
+```
+vtable 0x00CEF810  onEnter 0x004822E8  slot7 0x0048266C -> loadCinema
+vtable 0x00CF1420  onEnter 0x004D30D8  slot7 0x004D44E0 -> loadCinema
+```
+
+`TM_FORCESTATE=00CEF810` lands on a live state object at `0x180CF7D0`, and the
+strings it immediately looks up say exactly what it is:
+
+```
+strTable(0x2B18) = 'Sweet Tooth'
+strTable(0x2B19) = 'Mr. Grimm'
+strTable(0x2B1A) = 'Dollface'
+strTable(0x0CB4) = 'PREV/NEXT'
+strTable(0x0C80) = ' SELECT'
+strTable(0x0C94) = ' BACK'
+```
+
+Then `TM_FORCECALL=0048266C` runs its select handler, and the title says:
+
+```
+[game] UiMoviesMenu::onSelect(st_intro.avi)
+[game] 170101 ms WorldLoader::loadCinema
+[game] CommonBank::Unload() : Unloading "shell"...
+```
+
+**It names the intro cinematic and loads the cinema world.** That is the movie
+path running for the first time — `WorldLoader::loadCinema` had been at zero
+calls through every previous investigation.
+
+One gate had to be released to get that far: the load-complete byte at
+`0x0190FC89`, which the cinema path re-clears, so `TM_LOADDONE` now writes it on
+every tick rather than once.
+
+#### Where it stops
+
+`WorldLoader::setup` is entered and never returns. The chain, each step
+confirmed by trace rather than by reading:
+
+```
+WorldLoader::setup 0x0020C698
+  -> 0x003C24B4
+    -> 0x003A8A20
+      -> 0x003A87C4
+        -> virtual call on *(this+0x144) slot 5  =  0x004BDA30
+          -> 0x006107E8
+            -> 0x00606F78
+              -> 0x00606CE4      <-- never returns
+```
+
+`func_00606CE4` gets as far as `0x0060E500` (returns 0) and then blocks. It does
+not reach any of its FIOS callees (`0x0076B66C`, `0x00361750`) — those are traced
+and never fire. The main thread reports no hot-read spin, so it is blocked in a
+synchronisation primitive rather than polling, while three FIOS worker threads
+spin at `0x007714FC` on flags at `0x4000186C` / `0x4003263C` / `0x40043C6C`
+waiting for work that is never posted. Those spins do not occur in a normal run.
+
+That shape — a loader blocked on a wait while its workers idle — is the same
+class of defect as the FIOS scheduler constructor bug fixed earlier, where
+`find_functions` truncated `func_0076C534` and the workers were never built.
+
 ### The menu's textures are fine (and how that was nearly missed)
 
 The menu draws sample a 1024x1024 B8 atlas at raw offset `0x0AB55580`. Read as a

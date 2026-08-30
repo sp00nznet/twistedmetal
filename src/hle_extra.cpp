@@ -598,8 +598,12 @@ void func_005CAEA0_lifted(ppu_context* ctx);
  * onEnter (UiLegal_3's is 0x00474710) names the slot, and the same slot then
  * names every other state the machine walks into -- including whatever it does
  * instead of the intro movie. */
+/* The UI state machine pointer, captured from UiState::enter(machine, new,
+ * prev). tm_force_state() needs it to drive a transition itself. */
+static uint32_t g_ui_machine = 0;
 void func_005BA908(ppu_context* ctx)
 {
+    g_ui_machine = (uint32_t)ctx->gpr[3];
     if (tm_trace_on()) {
         const uint32_t st = (uint32_t)ctx->gpr[4];
         const uint32_t vt = st ? vm_read32(st) : 0;
@@ -615,8 +619,85 @@ void func_005BA908(ppu_context* ctx)
     }
     tm_trace("UiState::enter", func_005BA908_lifted, ctx);
 }
+/* TM_FORCESTATE=<vtable hex>[,seconds] drives the state machine into the state
+ * built on that vtable. Two of them reach WorldLoader::loadCinema and so the
+ * campaign intro movies: 0x00CEF810 (onEnter 0x004822E8) and 0x00CF1420
+ * (onEnter 0x004D30D8). The menu cannot be operated yet -- it renders black and
+ * takes no pad input -- so this is the only way to exercise the movie path.
+ * The transition is issued from inside UiState::update so it happens on the UI
+ * thread with a live stack, and that update is skipped for the one frame. */
+static uint32_t tm_find_state(uint32_t vt)
+{
+    for (uint32_t a = 0x17E00000u; a < 0x18400000u; a += 4)
+        if (vm_read32(a) == vt) return a;
+    return 0;
+}
+
+extern "C" void ps3_indirect_call(ppu_context* ctx);
+static uint32_t g_forced_state = 0;
+
+static bool tm_force_state(ppu_context* ctx)
+{
+    static int armed = -1;
+    static uint32_t vt = 0, secs = 150;
+    static int done = 0;
+    if (armed < 0) {
+        const char* e = getenv("TM_FORCESTATE");
+        armed = e ? 1 : 0;
+        if (e) { vt = (uint32_t)strtoul(e, nullptr, 16);
+                 const char* c = strchr(e, 44);
+                 if (c) secs = (uint32_t)strtoul(c + 1, nullptr, 0); }
+    }
+    static clock_t t0 = 0;
+    if (armed && !t0) t0 = clock();
+    const uint32_t el = t0 ? (uint32_t)((clock() - t0) / CLOCKS_PER_SEC) : 0;
+
+    if (armed && !done && g_ui_machine && el >= secs) {
+        done = 1;
+        const uint32_t st = tm_find_state(vt);
+        g_forced_state = st;
+        fprintf(stderr, "[forcestate] vtable 0x%08X -> state 0x%08X (machine 0x%08X)\n",
+                vt, st, g_ui_machine);
+        fflush(stderr);
+        if (st) {
+            ctx->gpr[3] = g_ui_machine;
+            ctx->gpr[4] = st;
+            ctx->gpr[5] = 0;
+            func_005BA908_lifted(ctx);
+            return true;
+        }
+    }
+
+    /* TM_FORCECALL=<guest address>[,seconds] then invokes that function on the
+     * state object -- the campaign select screen stores the chosen character in
+     * its own fields, so its "select" handler (0x0048266C) needs nothing but
+     * `this` to start the campaign and, with it, the intro cinematic. */
+    static int carmed = -1;
+    static uint32_t cfn = 0, csecs = 0;
+    static int cdone = 0;
+    if (carmed < 0) {
+        const char* e = getenv("TM_FORCECALL");
+        carmed = e ? 1 : 0;
+        if (e) { cfn = (uint32_t)strtoul(e, nullptr, 16);
+                 const char* c = strchr(e, 44);
+                 csecs = c ? (uint32_t)strtoul(c + 1, nullptr, 0) : secs + 10; }
+    }
+    if (carmed && !cdone && g_forced_state && el >= csecs) {
+        cdone = 1;
+        fprintf(stderr, "[forcecall] 0x%08X(this=0x%08X)\n", cfn, g_forced_state);
+        fflush(stderr);
+        ctx->gpr[3] = g_forced_state;
+        ctx->gpr[4] = 0;
+        ctx->ctr = cfn;
+        ps3_indirect_call(ctx);
+        return true;
+    }
+    return false;
+}
+
 void func_005BB358(ppu_context* ctx)
-{ static int n = 0;
+{ if (tm_force_state(ctx)) return;
+  static int n = 0;
   if (tm_trace_on() && (n++ < 4 || tm_trace_verbose())) tm_trace("UiState::update", func_005BB358_lifted, ctx);
   else func_005BB358_lifted(ctx); }
 void func_005CAEA0(ppu_context* ctx) { tm_trace("UiState::setTimer", func_005CAEA0_lifted, ctx); }
@@ -720,6 +801,95 @@ void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", fun
 void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
 void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
 void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
+void func_00606F78_lifted(ppu_context* ctx);
+void func_00606F78(ppu_context* ctx) { tm_trace("cw::00606F78", func_00606F78_lifted, ctx); }
+void func_00606CE4_lifted(ppu_context* ctx);
+void func_00606CE4(ppu_context* ctx) { tm_trace("cw::00606CE4", func_00606CE4_lifted, ctx); }
+void func_0036168C_lifted(ppu_context* ctx);
+void func_0036168C(ppu_context* ctx) { tm_trace("cw::0036168C", func_0036168C_lifted, ctx); }
+void func_00361750_lifted(ppu_context* ctx);
+void func_00361750(ppu_context* ctx) { tm_trace("cw::00361750", func_00361750_lifted, ctx); }
+void func_005F8FF4_lifted(ppu_context* ctx);
+void func_005F8FF4(ppu_context* ctx) { tm_trace("cw::005F8FF4", func_005F8FF4_lifted, ctx); }
+void func_00606B6C_lifted(ppu_context* ctx);
+void func_00606B6C(ppu_context* ctx) { tm_trace("cw::00606B6C", func_00606B6C_lifted, ctx); }
+void func_00607670_lifted(ppu_context* ctx);
+void func_00607670(ppu_context* ctx) { tm_trace("cw::00607670", func_00607670_lifted, ctx); }
+void func_0060E500_lifted(ppu_context* ctx);
+void func_0060E500(ppu_context* ctx) { tm_trace("cw::0060E500", func_0060E500_lifted, ctx); }
+void func_00617730_lifted(ppu_context* ctx);
+void func_00617730(ppu_context* ctx) { tm_trace("cw::00617730", func_00617730_lifted, ctx); }
+void func_007675D0_lifted(ppu_context* ctx);
+void func_007675D0(ppu_context* ctx) { tm_trace("cw::007675D0", func_007675D0_lifted, ctx); }
+void func_0076B66C_lifted(ppu_context* ctx);
+void func_0076B66C(ppu_context* ctx) { tm_trace("cw::0076B66C", func_0076B66C_lifted, ctx); }
+void func_004BDA30_lifted(ppu_context* ctx);
+void func_004BDA30(ppu_context* ctx) { tm_trace("cw::004BDA30", func_004BDA30_lifted, ctx); }
+void func_00681630_lifted(ppu_context* ctx);
+void func_00681630(ppu_context* ctx) { tm_trace("cw::00681630", func_00681630_lifted, ctx); }
+void func_005A0AA0_lifted(ppu_context* ctx);
+void func_005A0AA0(ppu_context* ctx) { tm_trace("cw::005A0AA0", func_005A0AA0_lifted, ctx); }
+void func_005A9034_lifted(ppu_context* ctx);
+void func_005A9034(ppu_context* ctx) { tm_trace("cw::005A9034", func_005A9034_lifted, ctx); }
+void func_005A92A0_lifted(ppu_context* ctx);
+void func_005A92A0(ppu_context* ctx) { tm_trace("cw::005A92A0", func_005A92A0_lifted, ctx); }
+void func_006A1FC8_lifted(ppu_context* ctx);
+void func_006A1FC8(ppu_context* ctx) { tm_trace("cw::006A1FC8", func_006A1FC8_lifted, ctx); }
+void func_001111EC_lifted(ppu_context* ctx);
+void func_001111EC(ppu_context* ctx) { tm_trace("cw::001111EC", func_001111EC_lifted, ctx); }
+void func_003C00FC_lifted(ppu_context* ctx);
+void func_003C00FC(ppu_context* ctx) { tm_trace("cw::003C00FC", func_003C00FC_lifted, ctx); }
+void func_006107E8_lifted(ppu_context* ctx);
+void func_006107E8(ppu_context* ctx) { tm_trace("cw::006107E8", func_006107E8_lifted, ctx); }
+void func_005B1D64_lifted(ppu_context* ctx);
+void func_005B1D64(ppu_context* ctx) { tm_trace("cw::005B1D64", func_005B1D64_lifted, ctx); }
+void func_000CBC3C_lifted(ppu_context* ctx);
+void func_000CBC3C(ppu_context* ctx) { tm_trace("cw::000CBC3C", func_000CBC3C_lifted, ctx); }
+void func_003499E0_lifted(ppu_context* ctx);
+void func_003499E0(ppu_context* ctx) { tm_trace("cw::003499E0", func_003499E0_lifted, ctx); }
+void func_003A87C4_lifted(ppu_context* ctx);
+/* The cinema world setup hangs here, at the virtual call on *(this+0x144)
+ * slot 5. Resolve and print that target so the hang has a guest address. */
+void func_003A87C4(ppu_context* ctx)
+{
+    const uint32_t self = (uint32_t)ctx->gpr[3];
+    const uint32_t obj  = self ? vm_read32(self + 0x144) : 0;
+    const uint32_t vt   = obj ? vm_read32(obj) : 0;
+    const uint32_t desc = vt ? vm_read32(vt + 0x14) : 0;
+    fprintf(stderr, "[cinema] this=0x%08X *(+0x144)=0x%08X vtable=0x%08X"
+                    " slot5=0x%08X -> 0x%08X\n",
+            self, obj, vt, desc, desc ? vm_read32(desc) : 0);
+    fflush(stderr);
+    tm_trace("cin::003A87C4", func_003A87C4_lifted, ctx);
+}
+void func_003A9050_lifted(ppu_context* ctx);
+void func_003A9050(ppu_context* ctx) { tm_trace("cin::003A9050", func_003A9050_lifted, ctx); }
+void func_003AA034_lifted(ppu_context* ctx);
+void func_003AA034(ppu_context* ctx) { tm_trace("cin::003AA034", func_003AA034_lifted, ctx); }
+void func_003BE230_lifted(ppu_context* ctx);
+void func_003BE230(ppu_context* ctx) { tm_trace("cin::003BE230", func_003BE230_lifted, ctx); }
+void func_003BE810_lifted(ppu_context* ctx);
+void func_003BE810(ppu_context* ctx) { tm_trace("cin::003BE810", func_003BE810_lifted, ctx); }
+void func_004DDCE0_lifted(ppu_context* ctx);
+void func_004DDCE0(ppu_context* ctx) { tm_trace("cin::004DDCE0", func_004DDCE0_lifted, ctx); }
+void func_004DDD04_lifted(ppu_context* ctx);
+void func_004DDD04(ppu_context* ctx) { tm_trace("cin::004DDD04", func_004DDD04_lifted, ctx); }
+void func_004DDFD0_lifted(ppu_context* ctx);
+void func_004DDFD0(ppu_context* ctx) { tm_trace("cin::004DDFD0", func_004DDFD0_lifted, ctx); }
+void func_00667DF8_lifted(ppu_context* ctx);
+void func_00667DF8(ppu_context* ctx) { tm_trace("cin::00667DF8", func_00667DF8_lifted, ctx); }
+void func_00669F8C_lifted(ppu_context* ctx);
+void func_00669F8C(ppu_context* ctx) { tm_trace("cin::00669F8C", func_00669F8C_lifted, ctx); }
+void func_003C24B4_lifted(ppu_context* ctx);
+void func_003C24B4(ppu_context* ctx) { tm_trace("setup::003C24B4", func_003C24B4_lifted, ctx); }
+void func_003A8A20_lifted(ppu_context* ctx);
+void func_003A8A20(ppu_context* ctx) { tm_trace("setup::003A8A20", func_003A8A20_lifted, ctx); }
+void func_004DCB4C_lifted(ppu_context* ctx);
+void func_004DCB4C(ppu_context* ctx) { tm_trace("setup::004DCB4C", func_004DCB4C_lifted, ctx); }
+void func_003A78C8_lifted(ppu_context* ctx);
+void func_003A78C8(ppu_context* ctx) { tm_trace("setup::003A78C8", func_003A78C8_lifted, ctx); }
+void func_003622B0_lifted(ppu_context* ctx);
+void func_003622B0(ppu_context* ctx) { tm_trace("setup::003622B0", func_003622B0_lifted, ctx); }
 void func_0005A028_lifted(ppu_context* ctx);
 void func_0005A028(ppu_context* ctx) { tm_trace("avi::0005A028", func_0005A028_lifted, ctx); }
 void func_0005A82C_lifted(ppu_context* ctx);
@@ -1142,10 +1312,12 @@ extern "C" void tm_loaddone_tick(void)
     if (!t0) { t0 = now; return; }
     if (now - t0 < (unsigned)secs) return;
     static int done = 0;
-    if (done) return;
+    /* Keep writing it. The cinema load path re-clears this byte, so a
+     * one-shot poke released the spin once and it stalled again. */
+    const int first = !done;
     done = 1;
     vm_write8(0x0190FC89u, 1);
-    fprintf(stderr, "[probe] set load-complete byte 0x0190FC89 = 1 after %d s\n", secs);
+    if (first) fprintf(stderr, "[probe] set load-complete byte 0x0190FC89 = 1 after %d s\n", secs);
     fflush(stderr);
 }
 
