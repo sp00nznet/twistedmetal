@@ -199,7 +199,7 @@ index 23e7f94..8e27930 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..48e4402 100644
+index 3a3e5db..c7cf570 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -16,6 +16,7 @@
@@ -602,7 +602,7 @@ index 3a3e5db..48e4402 100644
                  s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                      dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                  /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
-@@ -4419,8 +4712,27 @@ static void render_frame(void)
+@@ -4419,14 +4712,37 @@ static void render_frame(void)
      static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
      { const char* sv = getenv("RTT_SAVERT");
        static int _done = 0;
@@ -630,9 +630,36 @@ index 3a3e5db..48e4402 100644
 +                   (unsigned)s_d3d.frame_count); fflush(stdout); } }
 +      if (sv && !_done && _due) {
          int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
++        fprintf(stderr, "[RTT_SAVERT] rt=%d res=%p\n", rt, rt >= 0 ? (void*)s_d3d.off_rt[rt].res : NULL);
          if (rt >= 0 && s_d3d.off_rt[rt].res) {
              OffRT* r = &s_d3d.off_rt[rt];
-@@ -4474,6 +4786,8 @@ static void render_frame(void)
+             u32 bpp = (r->dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 :
+                       (r->dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
+             u32 pitch = (r->w * bpp + 255) & ~255u;
++            fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
++                    rt, r->w, r->h, bpp, pitch, (int)r->dxgi,
++                    (unsigned long long)((u64)pitch * r->h));
+             if (!s_rtsave_buf) {
+                 D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+                 D3D12_RESOURCE_DESC rd = {0};
+@@ -4439,6 +4755,7 @@ static void render_frame(void)
+                     D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                     &IID_ID3D12Resource, (void**)&s_rtsave_buf);
+             }
++            if (!s_rtsave_buf) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
+             if (s_rtsave_buf) {
+                 off_rt_transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                 D3D12_TEXTURE_COPY_LOCATION cdst = {0}, csrc = {0};
+@@ -4456,6 +4773,8 @@ static void render_frame(void)
+                 s_rtsave_state = 1;
+                 s_rtsave_w = r->w; s_rtsave_h = r->h;
+                 s_rtsave_pitch = pitch; s_rtsave_dxgi = r->dxgi;
++                fprintf(stderr, "[RTT_SAVERT] copy queued: rt=%d %ux%u pitch=%u\n",
++                        rt, r->w, r->h, pitch);
+                 _done = 1;
+             }
+         }
+@@ -4474,6 +4793,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
@@ -641,7 +668,15 @@ index 3a3e5db..48e4402 100644
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -5064,7 +5378,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
+@@ -4572,6 +4893,7 @@ skip_dump_consider: ;
+     }
+ 
+     if (s_rtsave_state) {
++        fprintf(stderr, "[RTT_SAVERT] writing rt_save.bmp %ux%u\n", s_rtsave_w, s_rtsave_h);
+         if (!dumping) { double _g = perf_on() ? perf_now() : 0.0;
+                         wait_for_gpu();
+                         if (perf_on()) s_perf_gpu += perf_now() - _g; }
+@@ -5064,7 +5386,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
      const rsx_vertex_attrib* a = &state->vertex_attribs[0];
      fprintf(stderr, "[VTXPOS] a0 off=0x%X stride=%u size=%u type=%u -> (%g, %g, %g, %g)\n",
              a->offset, a->stride, a->size, a->type,
@@ -650,7 +685,7 @@ index 3a3e5db..48e4402 100644
  }
  
  static void vp_attrs_dbg(const rsx_state* state)
-@@ -6029,6 +6343,37 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+@@ -6029,6 +6351,37 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
            u32 _r = 0;
            if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
            if (!_r) _r = cellGcmResolveLocated((tex->format & 3) == 1, offset);
@@ -688,7 +723,7 @@ index 3a3e5db..48e4402 100644
            s_d3d.cur_texs[unit].off = _r; }
          s_d3d.cur_texs[unit].raw = offset;
          s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
-@@ -6289,6 +6634,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6642,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -700,7 +735,7 @@ index 3a3e5db..48e4402 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
-@@ -6303,6 +6653,28 @@ void rsx_d3d12_backend_present(void)
+@@ -6303,6 +6661,28 @@ void rsx_d3d12_backend_present(void)
              if (s_d3d.draws[_i].is_clear) { clears++; continue; }
              if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
          }

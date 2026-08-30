@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern "C" {
 void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -109,6 +110,21 @@ struct Slot {
 };
 
 Slot g_slot[MAX_SLOTS];
+
+/* Playback stops after a couple of seconds; these say which side stops. */
+long long g_n_decode = 0, g_n_picout = 0, g_n_getitem = 0, g_n_getpic = 0, g_n_empty = 0;
+void vdec_stats(const char* why)
+{
+    static clock_t last = 0;
+    const clock_t now = clock();
+    if (last && (now - last) < 5 * CLOCKS_PER_SEC) return;
+    last = now;
+    fprintf(stderr, "[vdec] %s: DecodeAu=%lld PICOUT=%lld GetPicItem=%lld(empty %lld)"
+                    " GetPicture=%lld pending=%d\n",
+            why, g_n_decode, g_n_picout, g_n_getitem, g_n_empty, g_n_getpic,
+            tm_vdec_pending(0));
+    fflush(stderr);
+}
 
 int dbg()
 {
@@ -295,6 +311,8 @@ void cellVdecDecodeAu(ppu_context* ctx)
     const uint64_t user  = vm_read64(au + 0x18);
 
     s->au_num++;
+    g_n_decode++;
+    vdec_stats("decode");
     if (dbg() && s->au_num <= 8)
         fprintf(stderr, "[vdec] AU %u addr=0x%08X size=%u pts=%llu  %02X %02X %02X %02X %02X %02X\n",
                 s->au_num, start, size, (unsigned long long)pts,
@@ -312,6 +330,7 @@ void cellVdecDecodeAu(ppu_context* ctx)
         s->pic_start = start; s->pic_size = size;
         s->pic_pts = pts; s->pic_dts = dts; s->pic_user = user;
         s->have_pic = 1;
+        g_n_picout++;
         callback(s, h, MSG_PICOUT, 0);
     }
     ctx->gpr[3] = 0;
@@ -324,7 +343,10 @@ void cellVdecGetPicItem(ppu_context* ctx)
     Slot* s = slot_of(ctx, &h, &i);
     const uint32_t out = (uint32_t)ctx->gpr[4];
     if (!s || !out) { ctx->gpr[3] = (uint64_t)(int64_t)VDEC_ERROR_ARG; return; }
+    g_n_getitem++;
     if (!tm_vdec_pending(i) || !s->scratch) {
+        g_n_empty++;
+        vdec_stats("item-empty");
         ctx->gpr[3] = (uint64_t)(int64_t)VDEC_ERROR_EMPTY;
         return;
     }
@@ -417,6 +439,8 @@ void cellVdecGetPicture(ppu_context* ctx)
     if ((n++ % 60) == 0)
         fprintf(stderr, "[vdec] GetPicture #%lld fmt=%u %dx%d -> 0x%08X\n", n, fmt, w, hgt, out);
 
+    g_n_getpic++;
+    vdec_stats("getpic");
     tm_vdec_pop(i);
     s->have_pic = 0;
     ctx->gpr[3] = 0;
@@ -456,7 +480,12 @@ void cellAdecOpenEx(ppu_context* ctx)
 {
     const uint32_t cb     = (uint32_t)ctx->gpr[5];
     const uint32_t handle = (uint32_t)ctx->gpr[6];
-    AdecSlot* a = &g_adec[0];
+    /* The AVI carries three AC3 streams and the player opens one decoder per
+     * stream, so handing every caller slot 0 made them share state. */
+    int ai = -1;
+    for (int k = 0; k < MAX_SLOTS; k++) if (!g_adec[k].in_use) { ai = k; break; }
+    if (ai < 0) { ctx->gpr[3] = (uint64_t)(int64_t)VDEC_ERROR_ARG; return; }
+    AdecSlot* a = &g_adec[ai];
     memset(a, 0, sizeof(*a));
     a->in_use = 1;
     if (cb) { a->cb_opd = vm_read32(cb + 0x00); a->cb_arg = vm_read32(cb + 0x04); }
@@ -472,7 +501,7 @@ void cellAdecOpenEx(ppu_context* ctx)
         a->item      = mem + msz - 0x100;
         for (uint32_t o = 0; o < a->pcm_bytes; o += 4) vm_write32(a->pcm_buf + o, 0);
     }
-    if (handle) vm_write32(handle, ADEC_HANDLE_BASE);
+    if (handle) vm_write32(handle, ADEC_HANDLE_BASE + (uint32_t)ai);
     fprintf(stderr, "[adec] OpenEx: cb=0x%08X arg=0x%08X -> handle 0 (AUs acknowledged, no PCM)\n",
             a->cb_opd, a->cb_arg);
     ctx->gpr[3] = 0;

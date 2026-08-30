@@ -1483,6 +1483,82 @@ TM_LOADDONE=140              release the load-complete byte the cinema re-clears
 TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
 ```
 
+### Decoding it: H.264 on the Media Foundation MFT
+
+The intro decodes. A frame pulled straight out of the decoder is the real
+thing — the Calypso Industries tape recorder on gravel under a storm sky,
+correct colours, correct geometry, legible text.
+
+ps3recomp's `cellVdec` accepts access units and decodes nothing, so the work was
+a decoder plus the four things standing between the title and it.
+
+**The `Ex` entry points.** ps3recomp registers `cellVdecOpen`, `DecodeAu`,
+`GetPicture` and friends; the title calls the *Ex* variants, which nothing
+registered. `cellVdecQueryAttrEx` therefore returned an unresolved-NID error,
+the game read a memory requirement of zero — `Allocating 0 k for Vdec` — and
+never opened the decoder, after which `cellVdecStartSeq` failed with
+`CELL_VDEC_ERROR_ARG`. The NIDs came out of the import table rather than a
+database: stubs are laid out per module and sorted by NID, so the unregistered
+entries sitting *inside* the cellVdec and cellAdec runs are the missing ones.
+
+```
+0xC982A84A cellVdecQueryAttrEx    0x0053E2D8 cellVdecOpenEx
+0x7E4A4A49 cellAdecQueryAttrEx    0x8B5551A4 cellAdecOpenEx
+```
+
+**Handle zero.** With the decoder open the title still never asked it to decode
+anything. It stores the vdec handle at `+0xC0` of its video-stream object and
+treats zero as "no decoder": `func_0079A634` returned status 155 without ever
+calling `cellVdecDecodeAu`, so the AVI streamed, the demuxer ran, audio flowed,
+and the video decoder sat idle. Slot 0 is a perfectly legal index and a useless
+handle. Handles are now `0x0DEC0000 + slot`, mapped back on entry.
+
+**The audio handshake.** The player waits for every stream to report ready
+before it starts, so with AC3 unimplemented it printed `MoviePlayer SyncLoaded
+timed out!` forever. `cellAdec` now accepts AUs and answers `GetPcmItem`/`GetPcm`
+with silence. There is no audio; there is a video.
+
+**Two misdeclared APIs.** ps3recomp gives `cellVdecGetPicture` the signature of
+`cellVdecGetPicItem` — the real one is `(handle, const CellVdecPicFormat*, u8*
+outBuff)` — and its `CellVdecPicItem` is an invented layout rather than the PS3
+one. Both are re-implemented in `src/vdec_hle.cpp` against the real ABI.
+
+Decoding uses the stock **Microsoft H264 Video Decoder MFT**, an OS component,
+so there is no new dependency — `mfplat`/`mfuuid` ship with Windows. The title
+feeds Annex-B access units (`00 00 00 01 41 ...`), the MFT returns NV12, and
+`cellVdecGetPicture` converts to whatever the title asks for. It asks for
+RGBA32 at 1280x720 and takes delivery straight into RSX local memory.
+
+#### What actually happens on screen
+
+The pipeline is complete and every stage was measured:
+
+```
+cellFsRead  32 KB at a time, position advancing   (TM_FSREADS=52)
+DecodeAu=111 PICOUT=111 GetPicItem=111 GetPicture=111   -- balanced, no drops
+frame -> local memory 0x0DFCD880
+4891 draws bind tex0=0x0DFCD880 into RT 0x01BE0000
+[NV3089] 1024x352 src=0xC1BE0000 -> dst=0xC0026A80    -- composited to the display buffer
+```
+
+So the title decodes the cinematic, uploads it, draws it and composites it. It
+sustains about 7 frames a second for roughly fifteen seconds — a little over a
+hundred frames of the intro — and then the **GPU device is removed**:
+
+```
+[D3D12-IQ] RemoveDevice: DXGI_ERROR_DEVICE_HUNG -- the TDR mechanism has been triggered
+[D3D12] wait_for_gpu STUCK 2s: want 25758 got 25756
+PSO FAIL (fp=0x08BA4702, 0x887A0005)
+```
+
+after which every D3D call fails and the frame loop crawls. That TDR is **not
+the movie's doing** — it happens just the same in menu-only runs with the movie
+path never touched (`887A0005` appears 6-16 times in runs with zero
+`GetPicture` calls). It is the same D3D12 backend that renders the menu black,
+and it is the next thing to fix. The readback paths that would have confirmed
+the picture on screen fail for the same reason: `CreateCommittedResource` for a
+7 MB readback buffer returns failure because the device is already gone.
+
 ### Driving the title to the intro: `UiMoviesMenu::onSelect(st_intro.avi)`
 
 The menu cannot be operated — it renders black and takes no pad input — so the
