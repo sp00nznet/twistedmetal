@@ -102,8 +102,11 @@ static void probe_cellSpursSendSignal(ppu_context* ctx);
 static void probe_cellGcmGetFlipStatus(ppu_context* ctx);
 static void probe_EventFlagWait(ppu_context* ctx);
 
+extern "C" void tm_vdec_register(void);   /* src/vdec_hle.cpp */
+
 extern "C" void tm_hle_register_extra(void)
 {
+    tm_vdec_register();
     ps3_hle_register_ctx(0xA3E3BE68u, "sys_ppu_thread_once",      sys_ppu_thread_once);
     ps3_hle_register_ctx(0x42B23552u, "sys_prx_register_library", sys_prx_register_library);
     ps3_hle_register_ctx(0x626E8518u, "cellGcmMapEaIoAddressWithFlags",
@@ -801,6 +804,28 @@ void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", fun
 void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
 void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
 void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
+void func_00799B5C_lifted(ppu_context* ctx);
+void func_00799B5C(ppu_context* ctx) { tm_trace("vid::00799B5C", func_00799B5C_lifted, ctx); }
+void func_0079A634_lifted(ppu_context* ctx);
+/* The movie video stream. It returns 155 without decoding whenever
+ * *(this+0xC0) is zero, so print the object to see what is missing. */
+void func_0079A634(ppu_context* ctx)
+{
+    static int n = 0;
+    if (n < 6) {
+        const uint32_t o = (uint32_t)ctx->gpr[3];
+        fprintf(stderr, "[vid] stream=0x%08X +0xC0=0x%08X +0xC4=0x%08X +0xCC=0x%08X"
+                        " +0xB8=0x%08X +0xBC=0x%08X arg=0x%08X\n",
+                o, vm_read32(o + 0xC0), vm_read32(o + 0xC4), vm_read32(o + 0xCC),
+                vm_read32(o + 0xB8), vm_read32(o + 0xBC), (uint32_t)ctx->gpr[4]);
+        fflush(stderr); n++;
+    }
+    tm_trace("vid::0079A634", func_0079A634_lifted, ctx);
+}
+void func_00799EF0_lifted(ppu_context* ctx);
+void func_00799EF0(ppu_context* ctx) { tm_trace("vid::00799EF0", func_00799EF0_lifted, ctx); }
+void func_0079A1D8_lifted(ppu_context* ctx);
+void func_0079A1D8(ppu_context* ctx) { tm_trace("vid::0079A1D8", func_0079A1D8_lifted, ctx); }
 void func_009B2574_lifted(ppu_context* ctx);
 /* The cinema load hangs here. func_00606CE4 calls this at 0x00606ED4 right
  * after naming the bank "shell", so this is the BRB audio bank unload, and it

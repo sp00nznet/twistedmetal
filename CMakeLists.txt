@@ -32,6 +32,8 @@ add_executable(twistedmetal
     "${CMAKE_CURRENT_SOURCE_DIR}/src/boot_main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/hle_extra.cpp"     # imports the runtime lacks
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tm_inflate.cpp"    # host DEFLATE for the SPU decompressor
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vdec_mf.cpp"       # H.264 for cellVdec, on the Media Foundation MFT
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vdec_hle.cpp"      # the cellVdec*Ex entry points the title actually calls
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"        # vm + ELF loader + run
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"           # NID -> handler dispatch
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"        # boot-critical CRT
@@ -55,7 +57,8 @@ target_include_directories(twistedmetal PRIVATE
 target_link_libraries(twistedmetal PRIVATE "${PS3RECOMP_RUNTIME_LIB}")
 if(WIN32)
     target_link_libraries(twistedmetal PRIVATE
-        ws2_32 bcrypt xinput ole32 d3d12 dxgi dxguid d3dcompiler)
+        ws2_32 bcrypt xinput ole32 d3d12 dxgi dxguid d3dcompiler
+        mfplat mfuuid)   # Media Foundation H.264 decoder (system component)
     # Every guest call is a host call, so recompiled call chains nest deeply.
     # Reserve 256 MB for the main thread; spawned threads get theirs in
     # sys_ppu_thread_create.

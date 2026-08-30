@@ -78,3 +78,7 @@ _stage/
 
 # Generated SPU workload registry (references the gitignored lifted SPU C)
 src/gen/spu_workloads.c
+
+# decoded video frames dumped by TM_VDEC_DUMP (game content)
+vdec_frame.bmp
+vdec_frame.png
