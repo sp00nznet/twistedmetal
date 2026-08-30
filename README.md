@@ -1541,6 +1541,39 @@ count), and the D3D12 debug layer reports no validation error before the
 removal. Until it is fixed, no readback of the menu can be taken after the
 menu exists, which is why there is still no screenshot of it here.
 
+#### Narrowing the GPU hang
+
+The TDR is what now stops everything, so it is worth recording exactly what it
+is and is not. One measurement note first: `887A0005` in a log is **not** a
+reliable count of device removals — it is the code the *PSO creation* failure
+reports once the device is already gone, so a configuration that builds no
+guest PSOs shows zero occurrences whether or not the device died. The signal to
+grep for is `DEVICE_HUNG` / `RemoveDevice` from `D3D12_IQ=1`.
+
+With that:
+
+| configuration | `DEVICE_HUNG` |
+|---|---|
+| default | 1 |
+| `FP_OFF=1` (guest-FP draws skipped entirely) | **0** |
+| `VP_BYPASS=1` | 1 |
+| `DRAW_LIMIT=4` | **0** |
+| `DRAW_LIMIT=8` / `16` / `32` / `64` | 1 |
+| `FP_KILL=<addr>` for six different programs | 1 each |
+| `DRAW_SKIP_TEX=2ACD800` | 1 |
+
+So it is cumulative work in the guest-FP draw path, not one shader and not one
+texture. Every `for` in the dumped VP and FP HLSL is `[unroll]` with a fixed
+trip count, no program decodes to an implausible size (1-75 instructions), and
+the debug layer reports no validation error before the removal. A readback of
+the menu render target succeeds at 40 seconds and fails at 68, so it lands while
+the UI first renders in earnest.
+
+That last point is also why there is still no screenshot of the menu in this
+file: every readback taken after the menu exists fails, because
+`CreateCommittedResource` for the readback buffer returns failure once the
+device is gone.
+
 ### Getting past the intro, and where attract mode actually lives
 
 Three findings, and together they say the intro is not what stands in the way.
