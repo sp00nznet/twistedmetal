@@ -1483,6 +1483,50 @@ TM_LOADDONE=140              release the load-complete byte the cinema re-clears
 TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
 ```
 
+### Getting past the intro, and where attract mode actually lives
+
+Three findings, and together they say the intro is not what stands in the way.
+
+**`st_intro.avi` is 565 MB.** The AVI header reports `end: 28282500`, which read
+as microseconds is 28 seconds — it is not. The file is half a gigabyte, and at
+the seven frames a second this port sustains it cannot be watched to its end.
+`TM_FSEOF=<fd>,<bytes>` truncates a descriptor so the demuxer sees EOF early;
+the decode stops where told, but the player does not treat a short read as
+end-of-movie. `cellVdecEndSeq` is never called and the cinema keeps polling the
+movie object (`func_001DB6B8`, which stays 0), so the title waits for a movie
+that will not finish.
+
+**There is no attract state to reach.** The binary holds 61 `Ui*` class names
+and 93 UI-state vtables, and none of them is an attract or title state:
+
+```
+UiLegal_HealthWarning -> UiLegal_1..4 -> UiNetShutdown -> UiMainMenu
+```
+
+`UiMainMenu` *is* the startup screen on this build. Attract mode is not a state
+at all — it is `attractModeScript.cpp`, a script, and the binary has a `UiScript`
+class to run it. It would be started from the main menu on an idle timer.
+
+**Which means attract needs the menu, and the menu needs the renderer.** Idling
+nine minutes in `UiMainMenu` with the decoder working produces no attract, no
+`WorldLoader::loadCinema` and no `MoviePlayer::openFile`. That is consistent
+with everything else: the menu draws 100,816 quads with a live glyph atlas into
+a render target that reads back black, and it takes no pad input.
+
+The GPU side is worth stating precisely, because it is now the common blocker:
+
+- The device is removed with `DXGI_ERROR_DEVICE_HUNG` — a TDR — in **every**
+  long run, including menu-only runs that never touch the movie path.
+- It is not draw volume: `DRAW_LIMIT=32` changes nothing, still 16 removals.
+- It is not a shader loop: every `for` in the dumped VP and FP HLSL is
+  `[unroll]` with a fixed trip count.
+- It lands 26-88% of the way through a run, so the black menu is *not*
+  downstream of it — the menu is already black long before.
+
+So the order of work is: fix the D3D12 backend, and the menu, the input, the
+attract script and a watchable intro all follow from it. The video decoder is
+done and is not the thing holding this up.
+
 ### Decoding it: H.264 on the Media Foundation MFT
 
 The intro decodes. A frame pulled straight out of the decoder is the real

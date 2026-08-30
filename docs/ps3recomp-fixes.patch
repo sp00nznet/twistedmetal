@@ -765,7 +765,7 @@ index 3a3e5db..c7cf570 100644
                          " has_display=%d seen_content=%d -> render_frame=%s\n",
                  s_d3d.draw_count, onscreen, offscreen, clears, has_display,
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index 886fbc7..f718af6 100644
+index 886fbc7..9205301 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
 @@ -312,6 +312,28 @@ static void cellFsClose(ppu_context* ctx)
@@ -797,12 +797,26 @@ index 886fbc7..f718af6 100644
  static void cellFsRead(ppu_context* ctx)
  {
      int fd          = (int)(uint32_t)ctx->gpr[3];
-@@ -322,8 +344,17 @@ static void cellFsRead(ppu_context* ctx)
+@@ -322,8 +344,31 @@ static void cellFsRead(ppu_context* ctx)
      uint64_t raw_nbytes = ctx->gpr[5];
      long fpos_before = ftell(g_files[fd]);
      if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
 +    fs_prefault(buf, nbytes);
      size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
++    /* TM_FSEOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
++     * The intro cinematic is 28 seconds and this port renders it at a few frames
++     * a second, so it cannot be watched to its end -- truncating the stream makes
++     * the demuxer see EOF and the movie finish, which is what advances the title
++     * to whatever follows the intro. Deliberately a testing knob, not a fix. */
++    { static int efd = -2; static long elim = 0;
++      if (efd == -2) { const char* e = getenv("TM_FSEOF");
++          if (e) { efd = atoi(e); const char* c = strchr(e, 44); elim = c ? atol(c + 1) : 0; }
++          else efd = -1; }
++      if (efd >= 0 && fd == efd && elim > 0 && fpos_before >= elim) {
++          static int once = 0;
++          if (!once++) fprintf(stderr, "[fs] TM_FSEOF: fd=%d truncated at %ld bytes\n", fd, elim);
++          n = 0;
++      } }
      if (g_fd_usm[fd] && getenv("YDKJ_USMRD")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
 +    /* TM_FSREADS=<fd>: log every read on one descriptor. YDKJ_FSDBG caps at 20
 +     * lines and they are all spent before a movie ever opens, so it cannot
@@ -815,7 +829,7 @@ index 886fbc7..f718af6 100644
      if (getenv("YDKJ_FSDBG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
  #ifdef _WIN32
      if (getenv("YDKJ_FSDBG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
-@@ -348,6 +379,7 @@ static void cellFsWrite(ppu_context* ctx)
+@@ -348,6 +393,7 @@ static void cellFsWrite(ppu_context* ctx)
      uint64_t nbytes = ctx->gpr[5];
      uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
      if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
