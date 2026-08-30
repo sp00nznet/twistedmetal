@@ -1574,6 +1574,62 @@ file: every readback taken after the menu exists fails, because
 `CreateCommittedResource` for the readback buffer returns failure once the
 device is gone.
 
+### The attract world: how it is selected, and how far it now gets
+
+Attract mode is not a UI state and not a data script. It is a **world script**,
+and the machinery around it is now mapped.
+
+`func_000120C4` is `AttractModeScript::create()` — it allocates a 0x1D28 object
+through the allocator that takes a file and line (`attractModeScript.cpp:45`),
+constructs it, stores vtable `0x00CE3360` at offset 0, and sets a script-type
+global at `0x0119C508` to 2. `func_002B8F38` has the identical shape and is the
+factory the title normally uses, so this is a family: `CampaignScript`,
+`CinematicScript`, `VideoScript`, `GameModeScript`, `UiScript` and the rest.
+
+`WorldLoader::loadGame` takes **the factory itself** as its first argument. The
+`0x00F01FC8` the game passes is not a world name — it is a PPC64 function
+descriptor in `.opd` whose entry is `func_002B8F38`. So the attract world is
+the same call with the descriptor of `func_000120C4`, at `0x00EFD8A8`.
+
+`TM_FORCEWORLD=<seconds>[,game|,direct|,attract]` performs the transition the
+movie itself makes when it ends. `func_001DB6B8` — the movie object's update —
+finishes with
+
+```
+if (*(u8*)0x00F3810C) func_0010EC08(*(u32*)0x00F4A248);   /* back to the UI */
+else                  func_0010EB0C(*(u32*)0x00F4A248);   /* load the world  */
+```
+
+and `func_0010EB0C` is the only caller of `WorldLoader::loadGame`. With
+`,direct` and `,attract` that call now runs, and **`WorldLoader::loadGame`
+completes for the first time** — it had been at zero calls through every
+investigation in this file:
+
+```
+[forceworld] WorldLoader::loadGame(0x00EFD8A8) = AttractModeScript::create
+[game] 191878 ms WorldLoader::loadGame
+[game] CommonBank::Unload() : Unloading "shell"...
+[game] CommonBank::Load() : Loading bank "menu"... 91328 bytes
+```
+
+Two dead ends recorded so the next attempt does not repeat them. Going through
+the dispatcher (`,game`) does not reach `loadGame`: `func_0010EB0C` switches on
+a level type at `mgr+0x5454` and only 2, 3 or 4 fall through to it — the
+comparisons are signed and against 6, 4, 1 and 8, so 1 returns — and the menu
+holds none of those, while `func_003C2AD4` runs before the value is read. And
+the gate at `0x01541648` reads `0xFFFFFFFF`, which is negative, so the
+first-branch shortcut is never taken either.
+
+#### Where it stops
+
+`loadGame` only *stores* the factory, at `+0x3F8` of the world object. The
+script is instantiated later: `func_0020C7F8` reads that slot and passes it as
+the seventh argument to `func_003A82C8`, the world constructor. In a forced run
+`func_0020C7F8` executes 28,666 times and `func_003A82C8` twice, but
+`func_000120C4` is never entered — so the world constructed is not the one whose
+factory was just stored. The remaining step is to make the world construction
+run against the stored factory rather than the one already in flight.
+
 ### Getting past the intro, and where attract mode actually lives
 
 Three findings, and together they say the intro is not what stands in the way.

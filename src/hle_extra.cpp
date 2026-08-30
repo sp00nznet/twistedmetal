@@ -674,7 +674,7 @@ static bool tm_force_state(ppu_context* ctx)
                  if (c) secs = (uint32_t)strtoul(c + 1, nullptr, 0); }
     }
     static clock_t t0 = 0;
-    if (armed && !t0) t0 = clock();
+    if (!t0) t0 = clock();   /* runs even without TM_FORCESTATE */
     const uint32_t el = t0 ? (uint32_t)((clock() - t0) / CLOCKS_PER_SEC) : 0;
 
     if (armed && !done && g_ui_machine && el >= secs) {
@@ -718,6 +718,85 @@ static bool tm_force_state(ppu_context* ctx)
         ctx->ctr = cfn;
         ps3_indirect_call(ctx);
         return true;
+    }
+
+    /* TM_FORCEWORLD=<seconds> runs the transition the movie itself performs
+     * when it finishes. func_001DB6B8 (the movie object's update) ends with
+     *
+     *     if (*(u8*)0x00F3810C) func_0010EC08(*(u32*)0x00F4A248);
+     *     else                  func_0010EB0C(*(u32*)0x00F4A248);
+     *
+     * and func_0010EB0C is the only caller of WorldLoader::loadGame, which is
+     * what loads the world whose script is attractModeScript. The intro is
+     * 565 MB and cannot be played to its end here, so the movie never reaches
+     * this by itself. */
+    static int warmed = -1;
+    static uint32_t wsecs = 0;
+    static int wdone = 0;
+    if (warmed < 0) {
+        const char* e = getenv("TM_FORCEWORLD");
+        warmed = e ? 1 : 0;
+        wsecs = e ? (uint32_t)strtoul(e, nullptr, 0) : 0;
+    }
+    if (warmed && !wdone && el >= wsecs) {
+        wdone = 1;
+        const uint32_t mgr  = vm_read32(0x00F4A248u);
+        const uint32_t flag = vm_read8(0x00F3810Cu);
+        /* TM_FORCEWORLD=<secs>,game takes the loadGame branch whatever the flag
+         * says. The byte at 0x00F3810C selects "back to the UI" (0x0010EC08)
+         * over "load the next world" (0x0010EB0C), and it reads 1 at the menu,
+         * so honouring it just reloads the shell. */
+        const char* wa = getenv("TM_FORCEWORLD");
+        const int want_game = wa && strstr(wa, "game") != nullptr;
+        const uint32_t fn   = (flag && !want_game) ? 0x0010EC08u : 0x0010EB0Cu;
+        fprintf(stderr, "[forceworld] flag=%u -> func_%08X(0x%08X)\n", flag, fn, mgr);
+        fflush(stderr);
+        /* func_0010EB0C switches on a level type at mgr+0x5454 and only reaches
+         * WorldLoader::loadGame for 1, 4 or 6 -- anything else returns without
+         * loading. At the menu it holds none of those, so set one first.
+         * TM_FORCEWORLD=<secs>,game,<n> picks it; default 1. */
+        if (mgr) {
+            if (want_game) {
+                uint32_t lt = 1;
+                const char* c = wa ? strrchr(wa, 44) : nullptr;
+                if (c && c[1] >= '0' && c[1] <= '9') lt = (uint32_t)strtoul(c + 1, nullptr, 0);
+                fprintf(stderr, "[forceworld] levelType %u -> %u, gate 0x01541648=%u\n",
+                        vm_read32(mgr + 0x5454), lt, vm_read32(0x01541648u));
+                vm_write32(mgr + 0x5454, lt);
+            }
+            /* TM_FORCEWORLD=<secs>,direct skips the dispatcher entirely and
+             * calls WorldLoader::loadGame(0x00F01FC8) -- the exact call
+             * func_0010EB0C makes on its first branch. Going through the
+             * dispatcher depends on a level type that the menu does not hold
+             * and that func_003C2AD4 may rewrite before it is read. */
+            /* TM_FORCEWORLD=<secs>,attract loads the world whose script is
+             * AttractModeScript. WorldLoader::loadGame takes a script *factory*
+             * -- the 0x00F01FC8 the game passes is a PPC64 function descriptor
+             * in .opd (entry 0x002B8F38), not a world name -- so the attract
+             * world is the same call with the descriptor of
+             * AttractModeScript::create (func_000120C4) at 0x00EFD8A8. */
+            if (wa && strstr(wa, "attract")) {
+                fprintf(stderr, "[forceworld] WorldLoader::loadGame(0x00EFD8A8)"
+                                " = AttractModeScript::create\n");
+                fflush(stderr);
+                ctx->gpr[3] = 0x00EFD8A8u;
+                ctx->ctr = 0x0020C26Cu;
+                ps3_indirect_call(ctx);
+                return true;
+            }
+            if (wa && strstr(wa, "direct")) {
+                fprintf(stderr, "[forceworld] direct WorldLoader::loadGame(0x00F01FC8)\n");
+                fflush(stderr);
+                ctx->gpr[3] = 0x00F01FC8u;
+                ctx->ctr = 0x0020C26Cu;
+                ps3_indirect_call(ctx);
+                return true;
+            }
+            ctx->gpr[3] = mgr;
+            ctx->ctr = fn;
+            ps3_indirect_call(ctx);
+            return true;
+        }
     }
     return false;
 }
@@ -826,6 +905,12 @@ void func_00059F6C_lifted(ppu_context* ctx);
 void func_001DB604_lifted(ppu_context* ctx);
 void func_0036255C(ppu_context* ctx) { tm_trace("ArchiveLoader::moviesPath", func_0036255C_lifted, ctx); }
 void func_000120C4(ppu_context* ctx) { tm_trace("attractScript", func_000120C4_lifted, ctx); }
+void func_0020C7F8_lifted(ppu_context* ctx);
+void func_0020C7F8(ppu_context* ctx) { tm_trace("world::0020C7F8", func_0020C7F8_lifted, ctx); }
+void func_003A82C8_lifted(ppu_context* ctx);
+void func_003A82C8(ppu_context* ctx) { tm_trace("world::003A82C8", func_003A82C8_lifted, ctx); }
+void func_002B8F38_lifted(ppu_context* ctx);
+void func_002B8F38(ppu_context* ctx) { tm_trace("scriptFactory", func_002B8F38_lifted, ctx); }
 void func_00059F6C(ppu_context* ctx) { tm_trace("movieNameForId", func_00059F6C_lifted, ctx); }
 void func_001DB604(ppu_context* ctx) { tm_trace("playMovieFile", func_001DB604_lifted, ctx); }
 void func_00799B5C_lifted(ppu_context* ctx);
