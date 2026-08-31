@@ -193,6 +193,8 @@ extern "C" uint32_t rsx_live_draw_get_frames(void);
 extern "C" uint32_t rsx_live_draw_get_last_draws(void);
 extern "C" void     rsx_live_draw_flush(void);
 extern "C" void     rsx_live_draw_present(uint32_t buffer_id);
+extern "C" int      rsx_live_draw_debug_dump_surface(uint32_t location, uint32_t offset,
+                                                    const char* path);
 
 /* Resolve (location, offset) to host memory for the engine. location 0 is RSX
  * local VRAM, 1 is main/IO memory; the engine promises its callers the whole
@@ -300,6 +302,26 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                      * flips through a different path, so drive presentation on
                      * the same ~60Hz tick that used to drive the D3D12 backend. */
                     rsx_live_draw_present(0);
+                    /* TM_LIVE_DUMP=<secs>,<hex offset>: ask the engine to write
+                     * one of its tracked surfaces out, so "is it drawing" is
+                     * answerable from its own resources rather than a readback
+                     * of the generic backend that is not even running. */
+                    { static int armed = -1; static uint32_t off = 0, secs = 0;
+                      static int done = 0;
+                      if (armed < 0) { const char* e = getenv("TM_LIVE_DUMP");
+                          armed = e ? 1 : 0;
+                          if (e) { secs = (uint32_t)strtoul(e, nullptr, 0);
+                                   const char* c = strchr(e, 44);
+                                   off = c ? (uint32_t)strtoul(c + 1, nullptr, 16) : 0x10000u; } }
+                      if (armed && !done) {
+                          static ULONGLONG t0 = 0;
+                          if (!t0) t0 = GetTickCount64();
+                          if (GetTickCount64() - t0 >= (ULONGLONG)secs * 1000) {
+                              done = 1;
+                              const int r = rsx_live_draw_debug_dump_surface(0, off, "live_surface.bmp");
+                              fprintf(stderr, "[live] dump surface loc0:0x%08X -> %d\n", off, r);
+                              fflush(stderr);
+                          } } }
                     /* Is the engine actually receiving the stream? Frames only
                      * advance when it sees a flip; draws only when geometry
                      * reaches it. Both zero means the feed is not connected. */

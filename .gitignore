@@ -85,3 +85,6 @@ vdec_frame.png
 
 # runtime scratch: live-draw present telemetry and shader cache
 scratch/
+
+live_surface.bmp
+live_surface.png

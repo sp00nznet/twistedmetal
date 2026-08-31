@@ -1557,6 +1557,57 @@ is never called from this tree's `cellGcmSetDisplayBuffer`, and its target reads
 `clip=0,0+720x480` — the video-out mode rather than the 1280x704 surfaces the
 title actually renders into.
 
+#### Getting it to draw
+
+The engine draws. Its own counters, after the menu is up:
+
+```
+packets[seen=191783 queued=191783]
+groups[seen=73209 exec=73096 empty=18872 drop{fetch=0 degen=0 prim=112 pso=0 ring=0 surface=1}]
+clears[guest=3135 badsurf=0]  textures[cached=22/1024 decodefail=6]
+```
+
+Three things had to be found to get here.
+
+**The title draws indexed.** The first measurement said 16,375 `VERTEX_BEGIN_END`
+and 4 `DRAW_ARRAYS`, which read as "no geometry ever reaches it". That run simply
+ended before the menu: counting the whole boot shows `DRAW_INDEX_ARRAY` (0x1824)
+is the dominant kick — 10,498 and climbing against 245 `DRAW_ARRAYS` — and
+indexed draws only start once the UI comes up. `RSX_LIVE_FEED_DBG=1` prints the
+three counts for any run, live engine or not.
+
+**Presentation had to be driven.** Upstream self-presents on flip method
+`0xE944`; this title flips elsewhere, so nothing ever presented and frames stayed
+at zero. Driving `rsx_live_draw_present()` from the same 60Hz tick that used to
+drive the old backend fixed that.
+
+**Display buffers had to be registered.** The engine reported *"flip 0 has no
+registered/rendered scanout"* and fell back to whatever surface was current,
+because `cellGcmSetDisplayBuffer` only ever told the old backend.
+`rsx_live_draw_set_display_buffer` is now called alongside it, and the engine
+picks up both buffers:
+
+```
+[live-draw] display buffer 0 = loc0:0x00010000 pitch=5120 720x480
+[live-draw] display buffer 1 = loc0:0x00556000 pitch=5120 720x480
+```
+
+The engine also honours the guest's clears with the guest's own colours —
+dumping its tracked surfaces mid-run gives `0x00AB0000` filled `(253,98,98)` and
+`0x01BE0000` filled `(16,164,0)`, both 1280x704, both exactly what the title
+cleared them to. `rsx_live_draw_debug_dump_surface` writes PPM, not BMP.
+
+**Where it stops.** `empty=12187` of `13480` groups. The engine forms a draw
+group per `VERTEX_BEGIN_END` pair and most of them carry no geometry, which
+matches the raw method counts — far more begin/end pairs than batch methods. So
+the surfaces clear correctly and a minority of real draws execute, but the bulk
+of the title's geometry is not arriving as the engine expects it. `drop{fetch=0}`
+says this is not vertex fetch failing; the groups are empty before that.
+
+That is the next thing to chase, and it is a good place to be: the question has
+moved from "why is everything black" to "why do most begin/end pairs carry no
+batch", which the engine's own counters can answer.
+
 ### What caner's Yakuza fork says about the renderer
 
 [canersaka/Yakuza-Dead-Souls-EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)

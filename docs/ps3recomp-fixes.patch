@@ -11,7 +11,7 @@ index e8407e3..26601b0 100644
  # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
  list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 23e7f94..d2165fe 100644
+index 23e7f94..8a1888d 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -8,6 +8,7 @@
@@ -241,24 +241,24 @@ index 23e7f94..d2165fe 100644
 +                 * It wants the raw method with its subchannel bits -- it
 +                 * canonicalises with & 0x1FFC itself. */
 +                { static int live = -1;
-+                  if (live < 0) { live = rsx_live_draw_enabled();
-+                      printf("[live-feed] gate=%d (dispatch reached)\n", live);
-+                      fflush(stdout); }
-+                  if (live) { rsx_live_draw_method((subch << 13) | m, vm_read32(dea));
-+                      static long long fed = 0; static long long next = 1;
-+                      static int fdbg = -1;
-+                      if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
-+                      /* Are the draw-kick methods reaching it at all?
-+                       * 0x1808 VERTEX_BEGIN_END, 0x1814 vertex batch,
-+                       * 0x1824 index batch. */
-+                      { const u32 cm = m & 0x1FFCu;
-+                        if (fdbg && (cm == 0x1808u || cm == 0x1814u || cm == 0x1824u)) {
-+                            static long long dk[3]; static long long dn = 1;
-+                            dk[cm == 0x1808u ? 0 : (cm == 0x1814u ? 1 : 2)]++;
-+                            if (++dn <= 3 || dn % 8192 == 0)
-+                                printf("[live-feed] begin_end=%lld vtx_batch=%lld idx_batch=%lld\n", dk[0], dk[1], dk[2]); } }
-+                      if (fdbg && ++fed == next) { next *= 8;
-+                          printf("[live-feed] %lld methods fed (last m=0x%04X subch=%u)\n", fed, m, subch); fflush(stdout); } } }
++                  if (live < 0) live = rsx_live_draw_enabled();
++                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
++
++                /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
++                 * for any run, live engine or not, so the method stream and the
++                 * backend's draw callbacks can be compared in one measurement. */
++                { static int fdbg = -1;
++                  if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
++                  if (fdbg) {
++                      static long long n_be = 0, n_va = 0, n_ia = 0, tick = 0;
++                      const u32 cm = m & 0x1FFCu;
++                      if      (cm == 0x1808u) n_be++;
++                      else if (cm == 0x1814u) n_va++;
++                      else if (cm == 0x1824u) n_ia++;
++                      if (((++tick) % 200000) == 0)
++                          printf("[feed] begin_end=%lld draw_arrays=%lld draw_index=%lld\n",
++                                 n_be, n_va, n_ia), fflush(stdout);
++                  } }
 +
 +                if (subch == 0 || (subch == 1 && !s1_2d)) {
                      rsx_process_method(&s_state, m, vm_read32(dea));
@@ -284,8 +284,21 @@ index 23e7f94..d2165fe 100644
      /* Publish progress: get chases put; ref advances at most ONE queued fence
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
+@@ -1316,6 +1512,12 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
+     s_display_buffers[bufferId].height = height;
+     s_display_buffer_set[bufferId] = 1;
+ 
++    /* Tell the live engine too, or it has no registered scanout to present and
++     * falls back to whatever surface happens to be current. Display buffers are
++     * always in RSX local memory (location 0). */
++    if (rsx_live_draw_enabled())
++        rsx_live_draw_set_display_buffer(bufferId, 0, offset, pitch, width, height);
++
+     return CELL_OK;
+ }
+ 
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..fea137e 100644
+index 3a3e5db..a262594 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -16,6 +16,7 @@
@@ -861,7 +874,35 @@ index 3a3e5db..fea137e 100644
  }
  
  static void vp_attrs_dbg(const rsx_state* state)
-@@ -6029,6 +6408,37 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+@@ -5599,6 +5978,13 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
+ 
+ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+ {
++    /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
++     * carries no draw batches" can be checked against "the backend is told
++     * to draw" in the same run. */
++    { static int dbg = -1; if (dbg < 0) dbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
++      if (dbg) { static long long n = 0;
++          if (((++n) % 20000) == 0)
++              printf("[backend] arrays callbacks=%lld (prim=%u count=%u)\n", n, primitive, count), fflush(stdout); } }
+     (void)ud;
+     /* Log the first 20 calls in detail, then every 1000th to show liveness
+      * without flooding. */
+@@ -5841,6 +6227,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+ 
+ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
+ {
++    /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
++     * carries no draw batches" can be checked against "the backend is told
++     * to draw" in the same run. */
++    { static int dbg = -1; if (dbg < 0) dbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
++      if (dbg) { static long long n = 0;
++          if (((++n) % 20000) == 0)
++              printf("[backend] indexed callbacks=%lld (prim=%u count=%u)\n", n, primitive, count), fflush(stdout); } }
+     (void)ud;
+     static int log_count = 0;
+     if (log_count < 8) {
+@@ -6029,6 +6422,37 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
            u32 _r = 0;
            if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
            if (!_r) _r = cellGcmResolveLocated((tex->format & 3) == 1, offset);
@@ -899,7 +940,7 @@ index 3a3e5db..fea137e 100644
            s_d3d.cur_texs[unit].off = _r; }
          s_d3d.cur_texs[unit].raw = offset;
          s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
-@@ -6289,6 +6699,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6713,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -911,7 +952,7 @@ index 3a3e5db..fea137e 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
-@@ -6303,6 +6718,28 @@ void rsx_d3d12_backend_present(void)
+@@ -6303,6 +6732,28 @@ void rsx_d3d12_backend_present(void)
              if (s_d3d.draws[_i].is_clear) { clears++; continue; }
              if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
          }
