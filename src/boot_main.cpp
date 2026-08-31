@@ -174,6 +174,40 @@ extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 
+/* Live NV4097->D3D12 engine (libs/video/rsx_live_draw.c, from caner /
+ * canersaka's Yakuza: Dead Souls port). Selected with RSX_LIVE_DRAW=1. It
+ * binds a swap chain to a window the null backend opens and then owns
+ * presentation, so the generic rsx_d3d12_backend is left out of the picture
+ * entirely rather than run alongside it. */
+extern "C" int   rsx_live_draw_enabled(void);
+extern "C" int   rsx_live_draw_init(void* hwnd, uint32_t w, uint32_t h,
+                                    const uint8_t* (*guest_ptr)(void*, uint32_t,
+                                                                uint32_t, uint32_t),
+                                    void* user);
+extern "C" int   rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" int   rsx_null_backend_pump_messages(void);
+extern "C" void* rsx_null_backend_get_hwnd(void);
+extern "C" void  rsx_null_backend_suppress_present(int on);
+extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
+extern "C" uint32_t rsx_live_draw_get_frames(void);
+extern "C" uint32_t rsx_live_draw_get_last_draws(void);
+extern "C" void     rsx_live_draw_flush(void);
+extern "C" void     rsx_live_draw_present(uint32_t buffer_id);
+
+/* Resolve (location, offset) to host memory for the engine. location 0 is RSX
+ * local VRAM, 1 is main/IO memory; the engine promises its callers the whole
+ * min_bytes span is readable, so validate the interval, not just its start. */
+static const uint8_t* tm_live_guest_ptr(void* user, uint32_t location,
+                                        uint32_t offset, uint32_t min_bytes)
+{
+    (void)user;
+    if (!vm_base) return nullptr;
+    const uint32_t ea = cellGcmResolveLocated(location == 0, offset);
+    if (!ea || ea == 0xFFFFFFFFu) return nullptr;
+    if ((uint64_t)ea + min_bytes > 0x100000000ull) return nullptr;
+    return (const uint8_t*)vm_base + ea;
+}
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     /* Size the backend to the surface the GAME renders, not to the video mode.
@@ -191,7 +225,26 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     uint32_t rsx_w = 1280, rsx_h = 704;
     if (const char* e = getenv("TM_RSX_W")) rsx_w = (uint32_t)strtoul(e, 0, 0);
     if (const char* e = getenv("TM_RSX_H")) rsx_h = (uint32_t)strtoul(e, 0, 0);
-    int rsx_ok = (rsx_d3d12_backend_init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
+    /* RSX_LIVE_DRAW=1 selects the live NV4097->D3D12 engine: the null backend
+     * opens the window, the engine binds its swap chain to that HWND and takes
+     * over presentation. Otherwise the generic D3D12 backend runs as before. */
+    const int live = rsx_live_draw_enabled();
+    int rsx_ok = 0;
+    if (live) {
+        rsx_ok = (rsx_null_backend_init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
+        if (rsx_ok) {
+            const int r = rsx_live_draw_init(rsx_null_backend_get_hwnd(), rsx_w, rsx_h,
+                                             tm_live_guest_ptr, nullptr);
+            if (r == 0) {
+                rsx_null_backend_suppress_present(1);
+                fprintf(stderr, "[rsx] live-draw engine up (D3D12); GDI present suppressed\n");
+            } else {
+                fprintf(stderr, "[rsx] live-draw init FAILED (%d) -- GDI present only\n", r);
+            }
+        }
+    } else {
+        rsx_ok = (rsx_d3d12_backend_init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
+    }
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
      * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded
@@ -222,11 +275,14 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
         if (rsx_ok) {
-            if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
+            /* The live engine presents through its own swap chain on the null
+             * backend's window, so pump that window's messages instead. */
+            if ((live ? rsx_null_backend_pump_messages()
+                      : rsx_d3d12_backend_pump_messages()) != 0) { rsx_ok = 0; }
             if (getenv("TM_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
-                ULONGLONG t0=GetTickCount64(); rsx_d3d12_backend_present(); ULONGLONG t1=GetTickCount64();
+                ULONGLONG t0=GetTickCount64(); if (!live) rsx_d3d12_backend_present(); ULONGLONG t1=GetTickCount64();
                 s_presms += (t1-t0);
                 if (s_win==0) s_win=now;
                 if (now - s_win >= 1000) {
@@ -235,7 +291,28 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                     s_pf=0; s_pres=0; s_presms=0; s_win=now;
                 }
             } else {
-                rsx_d3d12_backend_present();     /* present (may block/throttle) */
+                /* The live engine self-presents on the guest's flip method, so
+                 * there is nothing to drive from here when it owns the window. */
+                if (!live) rsx_d3d12_backend_present();
+                else {
+                    /* Upstream the engine self-presents when it sees the guest's
+                     * flip method (0xE944, established from Yakuza). This title
+                     * flips through a different path, so drive presentation on
+                     * the same ~60Hz tick that used to drive the D3D12 backend. */
+                    rsx_live_draw_present(0);
+                    /* Is the engine actually receiving the stream? Frames only
+                     * advance when it sees a flip; draws only when geometry
+                     * reaches it. Both zero means the feed is not connected. */
+                    static ULONGLONG last = 0;
+                    const ULONGLONG now = GetTickCount64();
+                    if (now - last >= 2000) {
+                        last = now;
+                        fprintf(stderr, "[live] frames=%u last_draws=%u\n",
+                                rsx_live_draw_get_frames(),
+                                rsx_live_draw_get_last_draws());
+                        fflush(stderr);
+                    }
+                }
             }
         }
     }

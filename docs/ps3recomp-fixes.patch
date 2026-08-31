@@ -1,8 +1,28 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e8407e3..26601b0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,6 +39,7 @@ file(GLOB_RECURSE HLE_SOURCES
+     "libs/font/*.c"
+     "libs/misc/*.c"
+     "libs/hardware/*.c"
++    "runtime/diag/*.c"      # yz_frontier_trace, used by the live draw engine
+ )
+ # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
+ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 23e7f94..f7b79f4 100644
+index 23e7f94..d2165fe 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -566,9 +566,28 @@ static atomic_int s_gcm_pending = 0;
+@@ -8,6 +8,7 @@
+  * Actual rendering is handled elsewhere -- this module just tracks state.
+  */
+ 
++#include "rsx_live_draw.h"
+ #include "cellGcmSys.h"
+ #include "../../runtime/platform/win32_compat.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+@@ -566,9 +567,28 @@ static atomic_int s_gcm_pending = 0;
  
  /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
   * and mark a vblank+flip tick pending for the main thread to deliver. */
@@ -31,7 +51,7 @@ index 23e7f94..f7b79f4 100644
      GCM_PENDING_SET(3);
  }
  
-@@ -655,6 +674,7 @@ unsigned long long ps3_ms_now(void)
+@@ -655,6 +675,7 @@ unsigned long long ps3_ms_now(void)
  #endif
  }
  
@@ -39,7 +59,7 @@ index 23e7f94..f7b79f4 100644
  static u32 s_fifo_getoff  = 0;
  static u32 s_fifo_calloff = 0;
  
-@@ -986,6 +1006,51 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+@@ -986,6 +1007,51 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
                  "-- not taken, drain stops here\n", kind, target, word);
  }
  
@@ -91,7 +111,7 @@ index 23e7f94..f7b79f4 100644
  static void gcm_ref_push_at(u32 v, u32 getoff)
  {
      { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-@@ -1141,6 +1206,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1141,6 +1207,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
              break;
          }
          u32 w = vm_read32(ea);
@@ -101,7 +121,7 @@ index 23e7f94..f7b79f4 100644
          u32 type = w >> 29;
  
          if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
-@@ -1161,13 +1229,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1161,13 +1230,29 @@ static void gcm_rsx_process_fifo_unlocked(void)
                if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                 s_fifo_getoff, w & 0x1FFFFFFCu, put); }
              { u32 tgt = w & 0x1FFFFFFCu;
@@ -133,7 +153,7 @@ index 23e7f94..f7b79f4 100644
                s_fifo_calloff = s_fifo_getoff + 4;
                s_fifo_getoff  = tgt; }
              continue;
-@@ -1200,11 +1284,85 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1200,11 +1285,109 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                    k << 2, hist[k], tot[k], 10);
                    }
                } }
@@ -216,11 +236,35 @@ index 23e7f94..f7b79f4 100644
 +                 */
 +                static int s1_2d = -1;
 +                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
++                /* Mirror the whole method stream into the live NV4097->D3D12
++                 * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
++                 * It wants the raw method with its subchannel bits -- it
++                 * canonicalises with & 0x1FFC itself. */
++                { static int live = -1;
++                  if (live < 0) { live = rsx_live_draw_enabled();
++                      printf("[live-feed] gate=%d (dispatch reached)\n", live);
++                      fflush(stdout); }
++                  if (live) { rsx_live_draw_method((subch << 13) | m, vm_read32(dea));
++                      static long long fed = 0; static long long next = 1;
++                      static int fdbg = -1;
++                      if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
++                      /* Are the draw-kick methods reaching it at all?
++                       * 0x1808 VERTEX_BEGIN_END, 0x1814 vertex batch,
++                       * 0x1824 index batch. */
++                      { const u32 cm = m & 0x1FFCu;
++                        if (fdbg && (cm == 0x1808u || cm == 0x1814u || cm == 0x1824u)) {
++                            static long long dk[3]; static long long dn = 1;
++                            dk[cm == 0x1808u ? 0 : (cm == 0x1814u ? 1 : 2)]++;
++                            if (++dn <= 3 || dn % 8192 == 0)
++                                printf("[live-feed] begin_end=%lld vtx_batch=%lld idx_batch=%lld\n", dk[0], dk[1], dk[2]); } }
++                      if (fdbg && ++fed == next) { next *= 8;
++                          printf("[live-feed] %lld methods fed (last m=0x%04X subch=%u)\n", fed, m, subch); fflush(stdout); } } }
++
 +                if (subch == 0 || (subch == 1 && !s1_2d)) {
                      rsx_process_method(&s_state, m, vm_read32(dea));
                      /* NV406E_SET_REFERENCE: queue the fence value for PACED
                       * publication (gcm_ref_publish below) instead of letting a
-@@ -1221,6 +1379,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1221,6 +1404,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
          s_fifo_getoff += 4;                    /* unknown word: skip */
      }
  
@@ -241,7 +285,7 @@ index 23e7f94..f7b79f4 100644
       * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
       * value stays observable to equality-waiters. The wrap recycle path polls
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 3a3e5db..b614f19 100644
+index 3a3e5db..fea137e 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -16,6 +16,7 @@
@@ -295,9 +339,16 @@ index 3a3e5db..b614f19 100644
      if (getenv("VP_BYPASS")) {
          static const char anchor[] =
              "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
-@@ -2031,6 +2061,12 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+@@ -2029,8 +2059,18 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+             fprintf(stderr, "[CUBEKEY] fp=0x%X cube_mask=0x%X (distinct pairs=%d)%c",
+                     fp_addr, cube_mask, ns, 10); } } }
      static char hlsl[32768];
-     int n = rsx_fp_decompile(vm_base + off, 4096, hlsl, sizeof(hlsl), exp32);
+-    int n = rsx_fp_decompile(vm_base + off, 4096, hlsl, sizeof(hlsl), exp32);
++    /* Signature changed when the newer decompiler was adopted: the third
++     * parameter is now SET_SHADER_CONTROL, not an exports-32 flag. This
++     * backend does not track that register, so let the decompiler infer it. */
++    (void)exp32;
++    int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
      if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
 +    /* FP_LIST=1: every program the title actually compiles, with its size. A
 +     * fragment program that hangs the GPU shows up here as an implausible
@@ -308,7 +359,7 @@ index 3a3e5db..b614f19 100644
      if (getenv("FP_DUMP")) { static int _d=0; if (_d++ < 4) {
          FILE* f = fopen("fp_dump.hlsl", _d==1 ? "w" : "a");
          if (f) {
-@@ -2188,6 +2224,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+@@ -2188,6 +2228,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
              char* semi = strchr(rp, ';');
              if (semi) {
                  char rep[160];
@@ -325,7 +376,7 @@ index 3a3e5db..b614f19 100644
                  snprintf(rep, sizeof rep,
                           "_po.c0 = rsx_tex%d.Sample(rsx_samp%d, input.tc0.xy * rsx_texscale[%d].xy)",
                           _un, _un, _un);
-@@ -2409,6 +2455,17 @@ static u32 tex_csum(const u8* base, u32 nbytes)
+@@ -2409,6 +2459,17 @@ static u32 tex_csum(const u8* base, u32 nbytes)
  
  static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
  {
@@ -343,10 +394,12 @@ index 3a3e5db..b614f19 100644
      extern uint8_t* vm_base;
  
      if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
-@@ -3038,6 +3095,30 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+@@ -3037,7 +3098,31 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                               dr->fp_addr & ~0x3u);
              if (vm_base && foff != 0xFFFFFFFFu)
-                 rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], FP_MAX_CONSTS);
+-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], FP_MAX_CONSTS);
++                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
 +            /* FPK_DBG=1: the fragment constants as the shader will see them.
 +             * A program whose only output is fp_k[0].xxxx renders black if
 +             * those constants never arrive, which looks identical from the
@@ -374,7 +427,7 @@ index 3a3e5db..b614f19 100644
          }
      }
      char* dst = (char*)s_d3d.vp_cb_mapped
-@@ -3053,10 +3134,10 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+@@ -3053,10 +3138,10 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
          int last_nz = -1;
          for (int i = 0; i < RSX_MAX_VERTEX_CONSTANTS * 4; i++)
              if (c[i] > 1e-9f || c[i] < -1e-9f) last_nz = i / 4;
@@ -387,7 +440,7 @@ index 3a3e5db..b614f19 100644
      /* DUCK_CB=<hex tex0 offset>: the constants as they land in the per-draw
       * constant buffer for that texture's draws -- i.e. exactly what the shader
       * samples, not what the CPU-side rsx_state holds. Those two agreeing is an
-@@ -3215,10 +3296,24 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+@@ -3215,10 +3300,24 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
      if (!w) w = s_d3d.width;
      if (!h) h = s_d3d.height;
      DXGI_FORMAT want_fmt = rsx_surface_dxgi(rsx_fmt);
@@ -412,7 +465,7 @@ index 3a3e5db..b614f19 100644
          r->res->lpVtbl->Release(r->res); r->res = NULL;   /* dims/format changed */
          if (r->up) { r->up->lpVtbl->Release(r->up); r->up = NULL; }
      } else {
-@@ -3228,6 +3323,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+@@ -3228,6 +3327,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
              for (int i = 0; i < MAX_OFF_RTS; i++)
                  if (!s_d3d.off_rt[i].used) { slot = i; break; }
              if (slot < 0) return -1;
@@ -420,7 +473,7 @@ index 3a3e5db..b614f19 100644
              s_d3d.off_rt[slot].res->lpVtbl->Release(s_d3d.off_rt[slot].res);
              s_d3d.off_rt[slot].res = NULL;
              if (s_d3d.off_rt[slot].up) {
-@@ -3505,6 +3601,157 @@ static void screen_copy_capture(u32 fi)
+@@ -3505,6 +3605,157 @@ static void screen_copy_capture(u32 fi)
  
  }
  
@@ -578,7 +631,7 @@ index 3a3e5db..b614f19 100644
  static void render_frame(void)
  {
      double _rf0 = perf_on() ? perf_now() : 0.0;
-@@ -4165,6 +4412,8 @@ static void render_frame(void)
+@@ -4165,6 +4416,8 @@ static void render_frame(void)
              D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
              s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
              int cur_rt = -1;                       /* target A: -1 = backbuffer */
@@ -587,7 +640,7 @@ index 3a3e5db..b614f19 100644
              int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
              double _rec0 = perf_on() ? perf_now() : 0.0;
              int seen_small_vp = 0, captured = 0;
-@@ -4191,6 +4440,10 @@ static void render_frame(void)
+@@ -4191,6 +4444,10 @@ static void render_frame(void)
                  /* Render-to-texture: retarget when this op's surfaces differ.
                   * Depth is a single shared buffer, so clear it per switch. */
                  int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
@@ -598,7 +651,7 @@ index 3a3e5db..b614f19 100644
                  int wantm[3];
                  for (int _m = 0; _m < 3; _m++)
                      wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
-@@ -4211,18 +4464,74 @@ static void render_frame(void)
+@@ -4211,18 +4468,74 @@ static void render_frame(void)
                          rh[nrt++] = off_rt_rtv(wantm[_m]);
                      }
                      D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
@@ -674,7 +727,7 @@ index 3a3e5db..b614f19 100644
                      for (int _m = 0; _m < 3; _m++)
                          if (cur_m[_m] >= 0) {
                              D3D12_CPU_DESCRIPTOR_HANDLE rhm = off_rt_rtv(cur_m[_m]);
-@@ -4258,6 +4567,8 @@ static void render_frame(void)
+@@ -4258,6 +4571,8 @@ static void render_frame(void)
                      D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
                                        (LONG)(dvp.TopLeftX + dvp.Width),
                                        (LONG)(dvp.TopLeftY + dvp.Height)};
@@ -683,7 +736,7 @@ index 3a3e5db..b614f19 100644
                      s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
                      s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &dsc);
                  }
-@@ -4281,6 +4592,41 @@ static void render_frame(void)
+@@ -4281,6 +4596,41 @@ static void render_frame(void)
                      s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
                          s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
                          + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
@@ -725,7 +778,7 @@ index 3a3e5db..b614f19 100644
                  s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                      dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                  /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
-@@ -4419,14 +4765,37 @@ static void render_frame(void)
+@@ -4419,14 +4769,37 @@ static void render_frame(void)
      static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
      { const char* sv = getenv("RTT_SAVERT");
        static int _done = 0;
@@ -765,7 +818,7 @@ index 3a3e5db..b614f19 100644
              if (!s_rtsave_buf) {
                  D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
                  D3D12_RESOURCE_DESC rd = {0};
-@@ -4439,6 +4808,7 @@ static void render_frame(void)
+@@ -4439,6 +4812,7 @@ static void render_frame(void)
                      D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                      &IID_ID3D12Resource, (void**)&s_rtsave_buf);
              }
@@ -773,7 +826,7 @@ index 3a3e5db..b614f19 100644
              if (s_rtsave_buf) {
                  off_rt_transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
                  D3D12_TEXTURE_COPY_LOCATION cdst = {0}, csrc = {0};
-@@ -4456,6 +4826,8 @@ static void render_frame(void)
+@@ -4456,6 +4830,8 @@ static void render_frame(void)
                  s_rtsave_state = 1;
                  s_rtsave_w = r->w; s_rtsave_h = r->h;
                  s_rtsave_pitch = pitch; s_rtsave_dxgi = r->dxgi;
@@ -782,7 +835,7 @@ index 3a3e5db..b614f19 100644
                  _done = 1;
              }
          }
-@@ -4474,6 +4846,8 @@ static void render_frame(void)
+@@ -4474,6 +4850,8 @@ static void render_frame(void)
        if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
      if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
  skip_dump_consider: ;
@@ -791,7 +844,7 @@ index 3a3e5db..b614f19 100644
      int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                     && s_d3d.dump_skip_left == 0);
      { static int mind2 = -1;
-@@ -4572,6 +4946,7 @@ skip_dump_consider: ;
+@@ -4572,6 +4950,7 @@ skip_dump_consider: ;
      }
  
      if (s_rtsave_state) {
@@ -799,7 +852,7 @@ index 3a3e5db..b614f19 100644
          if (!dumping) { double _g = perf_on() ? perf_now() : 0.0;
                          wait_for_gpu();
                          if (perf_on()) s_perf_gpu += perf_now() - _g; }
-@@ -5064,7 +5439,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
+@@ -5064,7 +5443,7 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
      const rsx_vertex_attrib* a = &state->vertex_attribs[0];
      fprintf(stderr, "[VTXPOS] a0 off=0x%X stride=%u size=%u type=%u -> (%g, %g, %g, %g)\n",
              a->offset, a->stride, a->size, a->type,
@@ -808,7 +861,7 @@ index 3a3e5db..b614f19 100644
  }
  
  static void vp_attrs_dbg(const rsx_state* state)
-@@ -6029,6 +6404,37 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+@@ -6029,6 +6408,37 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
            u32 _r = 0;
            if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
            if (!_r) _r = cellGcmResolveLocated((tex->format & 3) == 1, offset);
@@ -846,7 +899,7 @@ index 3a3e5db..b614f19 100644
            s_d3d.cur_texs[unit].off = _r; }
          s_d3d.cur_texs[unit].raw = offset;
          s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
-@@ -6289,6 +6695,11 @@ void rsx_d3d12_backend_present(void)
+@@ -6289,6 +6699,11 @@ void rsx_d3d12_backend_present(void)
              has_display = 1;
              break;
          }
@@ -858,7 +911,7 @@ index 3a3e5db..b614f19 100644
      if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
  
      /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
-@@ -6303,6 +6714,28 @@ void rsx_d3d12_backend_present(void)
+@@ -6303,6 +6718,28 @@ void rsx_d3d12_backend_present(void)
              if (s_d3d.draws[_i].is_clear) { clears++; continue; }
              if (s_d3d.draws[_i].rt_off) offscreen++; else onscreen++;
          }
@@ -887,6 +940,1737 @@ index 3a3e5db..b614f19 100644
          fprintf(stderr, "[PRESENTGATE] records=%u onscreen=%u offscreen=%u clears=%u"
                          " has_display=%d seen_content=%d -> render_frame=%s\n",
                  s_d3d.draw_count, onscreen, offscreen, clears, has_display,
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 253eaca..4118fa2 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -9,25 +9,10 @@
+  * below so this file is self-documenting.
+  */
+ 
+-#include <stdlib.h>   /* getenv, atoi */
++#include <stdlib.h>
+ #include "rsx_fp_decompiler.h"
+ #include <stdio.h>
+ #include <string.h>
+-#include <math.h>
+-
+-/* Format one FP constant lane as an HLSL float literal. NaN/Inf constants
+- * (a light-pass FP embeds them; %g prints the bare tokens "nan"/"inf" which
+- * HLSL rejects -- X3004 undeclared identifier -> the whole PS fails to compile
+- * and its pass renders black) are reproduced bit-exactly via asfloat(). */
+-static void fp_fmt_float(float v, char* buf, size_t n)
+-{
+-    if (isnan(v) || isinf(v)) {
+-        u32 bits; memcpy(&bits, &v, 4);
+-        snprintf(buf, n, "asfloat(0x%08Xu)", bits);
+-    } else {
+-        snprintf(buf, n, "%g", (double)v);
+-    }
+-}
+ 
+ /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
+ #define FP_END              (1u << 0)
+@@ -60,6 +45,22 @@ static void fp_fmt_float(float v, char* buf, size_t n)
+ #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
+ #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
+ 
++/* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
++ * The NV40 fragment ISA predicates each instruction on a condition register
++ * (CC0/CC1). Layout verified against RPCS3's RSXFragmentProgram.h SRC0 union
++ * (exec_if_lt@18, exec_if_eq@19, exec_if_gr@20, cond_swizzle@21..28,
++ * cond_mod_reg_index@30, cond_reg_index@31) and OPDEST.set_cond@8. All three
++ * exec bits set (0b111) == unconditional (the default); none set == never.
++ * Dropped entirely until now: MEASURED present in 4 of this capture's 43
++ * fragment programs (scratch/a010_reports/fragment/, cond_detail_out.txt) —
++ * genuine SET_CC→exec_if producer/consumer pairs (incl. conditional TEX). */
++#define FP_EXEC_IF_LT       (1u << 18)
++#define FP_EXEC_IF_EQ       (1u << 19)
++#define FP_EXEC_IF_GR       (1u << 20)
++#define FP_COND_SWZ_SHIFT   21          /* X@21 Y@23 Z@25 W@27, 2 bits each */
++#define FP_COND_MOD_REG     (1u << 30)  /* set_cond WRITE target: cc0/cc1     */
++#define FP_COND_REG         (1u << 31)  /* exec_if READ source:   cc0/cc1     */
++
+ /* ---- Opcodes ------------------------------------------------------------ */
+ enum {
+     OP_NOP=0x00, OP_MOV=0x01, OP_MUL=0x02, OP_ADD=0x03, OP_MAD=0x04,
+@@ -116,12 +117,10 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
+         u32 w2 = rsx_fp_read_word(ucode + off + 8);
+         u32 w3 = rsx_fp_read_word(ucode + off + 12);
+         off += 16;
+-        /* A CONST source pulls an inline 16-byte constant slot (branch
+-         * instructions reuse the src words as jump offsets -- no constant). */
+-        if (!(w2 & FP_BRANCH) &&
+-            (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+-             ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+-             ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST)) {
++        /* A CONST source pulls an inline 16-byte constant slot. */
++        if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
++            ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
++            ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
+             if (off + 16 <= max_bytes) off += 16;
+         }
+         if (w0 & FP_END) return off;
+@@ -129,6 +128,151 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
+     return 0;
+ }
+ 
++static int fp_instruction_has_constant(u32 w1, u32 w2, u32 w3)
++{
++    return
++        ((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) ==
++            FP_REG_TYPE_CONST ||
++        ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) ==
++            FP_REG_TYPE_CONST ||
++        ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) ==
++            FP_REG_TYPE_CONST;
++}
++
++int rsx_fp_collect_constants(
++    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out)
++{
++    if (!ucode || !out)
++        return -1;
++    memset(out, 0, sizeof(*out));
++
++    u32 off = 0;
++    while (off + 16 <= max_bytes) {
++        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
++        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        off += 16;
++        if (fp_instruction_has_constant(w1, w2, w3)) {
++            if (off + 16 > max_bytes ||
++                out->count >= RSX_FP_MAX_INLINE_CONSTANTS)
++                return -1;
++            for (u32 component = 0; component < 4; ++component)
++                out->values[out->count][component] =
++                    rsx_fp_read_word(ucode + off + component * 4);
++            out->count++;
++            off += 16;
++        }
++        if (w0 & FP_END)
++            return (int)out->count;
++    }
++    return -1;
++}
++
++static u64 fp_hash_bytes(const void* data, u32 size, u64 hash)
++{
++    const u8* bytes = (const u8*)data;
++    for (u32 i = 0; i < size; ++i) {
++        hash ^= bytes[i];
++        hash *= 1099511628211ull;
++    }
++    return hash;
++}
++
++u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed)
++{
++    if (!ucode)
++        return 0;
++    static const u32 structural_tag = 0x31535046u; /* "FPS1" */
++    u64 hash = fp_hash_bytes(&structural_tag, sizeof(structural_tag), seed);
++    u32 off = 0;
++    u32 instruction_count = 0;
++    u32 constant_count = 0;
++    while (off + 16 <= max_bytes) {
++        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
++        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        hash = fp_hash_bytes(ucode + off, 16, hash);
++        instruction_count++;
++        off += 16;
++        if (fp_instruction_has_constant(w1, w2, w3)) {
++            if (off + 16 > max_bytes ||
++                constant_count >= RSX_FP_MAX_INLINE_CONSTANTS)
++                return 0;
++            constant_count++;
++            off += 16;
++        }
++        if (w0 & FP_END) {
++            hash = fp_hash_bytes(
++                &instruction_count, sizeof(instruction_count), hash);
++            hash = fp_hash_bytes(
++                &constant_count, sizeof(constant_count), hash);
++            return hash;
++        }
++    }
++    return 0;
++}
++
++u64 rsx_fp_literal_source_hash(
++    const u8* ucode, u32 max_bytes, u64 seed)
++{
++    const u64 structural =
++        rsx_fp_structural_hash(ucode, max_bytes, seed);
++    if (!structural)
++        return 0;
++    rsx_fp_constant_block constants;
++    if (rsx_fp_collect_constants(ucode, max_bytes, &constants) < 0)
++        return 0;
++    u64 hash = structural;
++    for (u32 slot = 0; slot < constants.count; ++slot) {
++        float value[4];
++        for (u32 component = 0; component < 4; ++component)
++            memcpy(
++                &value[component],
++                &constants.values[slot][component],
++                sizeof(value[component]));
++        char literal[128];
++        const int length = snprintf(
++            literal, sizeof(literal), "float4(%g,%g,%g,%g)",
++            value[0], value[1], value[2], value[3]);
++        if (length < 0 || (u32)length >= sizeof(literal))
++            return 0;
++        hash = fp_hash_bytes(literal, (u32)length, hash);
++    }
++    return hash;
++}
++
++int rsx_fp_constant_ring_plan(
++    u32 used, u32 capacity, u32 data_bytes,
++    u32* out_offset, u32* out_allocation_bytes)
++{
++    if (!out_offset || !out_allocation_bytes || data_bytes == 0)
++        return -1;
++    if (data_bytes > 0xFFFFFF00u)
++        return -1;
++    const u32 allocation = (data_bytes + 255u) & ~255u;
++    if (allocation > capacity)
++        return -1;
++    if (used > capacity || allocation > capacity - used)
++        return 0;
++    *out_offset = used;
++    *out_allocation_bytes = allocation;
++    return 1;
++}
++
++int rsx_vertex_constant_ring_plan(
++    u32 used, u32 capacity, u32 block_bytes, u32* out_offset)
++{
++    if (!out_offset || block_bytes == 0 || (block_bytes & 255u) != 0 ||
++        block_bytes > capacity)
++        return -1;
++    if (used > capacity || block_bytes > capacity - used)
++        return 0;
++    *out_offset = used;
++    return 1;
++}
++
+ /* Bounded string appender. */
+ typedef struct { char* p; u32 cap; u32 len; int ok; } Out;
+ 
+@@ -185,42 +329,22 @@ static const char* input_expr(u32 input_src)
+ }
+ 
+ /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
+-/* FP_CONSTBUF=0 restores the old behaviour of compiling inline constants as
+- * HLSL literals. On (default) they become fp_k[] lookups in the per-draw
+- * constant buffer, which makes the compiled shader invariant under the guest
+- * re-patching those constants -- the thing that forced the pipeline cache to
+- * key on a hash of the ucode bytes. */
+-static int fp_constbuf_on(void)
+-{
+-    static int v = -1;
+-    if (v < 0) { const char* e = getenv("FP_CONSTBUF"); v = (e && *e == '0') ? 0 : 1; }
+-    return v;
+-}
+-
+ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
+-                     int k_idx, char* buf, u32 bufsz)
++                     int buffered, u32 constant_slot, char* buf, u32 bufsz)
+ {
+     char base[96];
+     if (s->type == FP_REG_TYPE_TEMP) {
+-        /* h and r are modelled as SEPARATE register files. On hardware the
+-         * h pairs overlay r bit-wise (h0 = r0.xy bits, h1 = r0.zw bits), so
+-         * cgc code like dbgfont's [r0.w = coverage; h0 = colour; r0.w *=
+-         * h0.w] works because the h0 write leaves r0.w's bits intact --
+-         * a lane-wise alias (h[N] = r[N>>1]) clobbers it (cellmark text
+-         * flooded white). Value-level cross-view reads are rare; keep the
+-         * files separate and select the export bank via SET_SHADER_CONTROL. */
+         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
+     } else if (s->type == FP_REG_TYPE_INPUT) {
+         snprintf(base, sizeof(base), "%s", input_expr(input_src));
+     } else { /* CONST */
+-        if (has_k && fp_constbuf_on() && k_idx >= 0) {
+-            snprintf(base, sizeof(base), "fp_k[%d]", k_idx);
+-        } else if (has_k) {
+-            char c0[24], c1[24], c2[24], c3[24];
+-            fp_fmt_float(k[0], c0, sizeof c0); fp_fmt_float(k[1], c1, sizeof c1);
+-            fp_fmt_float(k[2], c2, sizeof c2); fp_fmt_float(k[3], c3, sizeof c3);
+-            snprintf(base, sizeof(base), "float4(%s,%s,%s,%s)", c0, c1, c2, c3);
+-        } else
++        if (buffered && has_k)
++            snprintf(
++                base, sizeof(base), "fp_constants[%u]", constant_slot);
++        else if (has_k)
++            snprintf(base, sizeof(base), "float4(%g,%g,%g,%g)",
++                     k[0], k[1], k[2], k[3]);
++        else
+             snprintf(base, sizeof(base), "float4(0,0,0,0)");
+     }
+ 
+@@ -246,81 +370,34 @@ static void dest_mask(u32 op0, char* m)
+     m[n] = '\0';
+ }
+ 
+-/* FNV-1a over a program's INSTRUCTION words only, skipping the inline constant
+- * slots. With constants hoisted into fp_k[] the compiled shader does not depend
+- * on their values, so including them in the pipeline key made it change every
+- * time the title re-patched a constant -- which is exactly what thrashed the
+- * cache. */
+-u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
+-{
+-    u32 h = 2166136261u;
+-    if (!ucode) return h;
+-    u32 off = 0;
+-    while (off + 16 <= max_bytes) {
+-        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+-        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+-        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+-        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+-        for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
+-        off += 16;
+-        int is_branch = (w2 & FP_BRANCH) != 0;
+-        int has_k = !is_branch &&
+-            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
+-        if (has_k) off += 16;            /* skip the constant, do not hash it */
+-        if (w0 & FP_END) break;
+-    }
+-    return h;
+-}
++/* CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS: when set, fragment output is fp32
++ * (color = r0); when clear, output is fp16 (color = h0). Matches RPCS3
++ * FragmentProgramDecompiler::BuildCode (gcm_enums.h). */
++#define FP_CTRL_32BIT_EXPORTS 0x40u
+ 
+-/* Walk a program the same way the decompiler does and copy out its inline
+- * constants in the SAME order the decompiler assigns fp_k[] indices. The backend
+- * calls this per draw, so re-patched constants take effect without recompiling. */
+-int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out)
++int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
+ {
+-    if (!ucode || !out) return 0;
+-    u32 off = 0; int n = 0;
+-    while (off + 16 <= max_bytes) {
+-        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+-        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+-        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+-        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+-        off += 16;
+-        int is_branch = (w2 & FP_BRANCH) != 0;
+-        int has_k = !is_branch &&
+-            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
+-             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
+-        if (has_k) {
+-            if (off + 16 <= max_bytes) {
+-                for (int i = 0; i < 4; i++) {
+-                    u32 cw = rsx_fp_read_word(ucode + off + i * 4);
+-                    if (n < max_out) memcpy(&out[n * 4 + i], &cw, 4);
+-                }
+-                off += 16;
+-            }
+-            if (n < max_out) n++;
+-        }
+-        if (w0 & FP_END) break;
+-    }
+-    { static int dbg = -1;
+-      if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
+-      if (dbg) { static int m = 0; if (m++ < 3) {
+-        fprintf(stderr, "[FPK] %d consts%c", n, 10);
+-        for (int _q = 0; _q < n; _q++)
+-            fprintf(stderr, "   k[%2d] = (%g %g %g %g)%c", _q, out[_q*4+0],
+-                    out[_q*4+1], out[_q*4+2], out[_q*4+3], 10); } }
+-    }
+-    return n;
++    return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
+ }
+ 
+-int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+-                     int exports32)
++static int rsx_fp_decompile_internal(
++    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
++    int buffered, char* out, u32 out_size, u32* out_constant_count)
+ {
+-    int n_consts = 0;   /* fp_k[] slots assigned so far */
+     if (!ucode || !out || out_size == 0) return -1;
+ 
++    u32 buffered_constant_count = 0;
++    if (buffered) {
++        rsx_fp_constant_block constants;
++        const int result =
++            rsx_fp_collect_constants(ucode, max_bytes, &constants);
++        if (result < 0)
++            return -1;
++        buffered_constant_count = constants.count;
++    }
++    if (out_constant_count)
++        *out_constant_count = buffered_constant_count;
++
+     Out o = { out, out_size, 0, 1 };
+ 
+     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
+@@ -331,58 +408,56 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+         "    float4 fog : FOG;\n"
+         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
+         "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+-        "};\n"
+-        /* 4 discrete texture/sampler registers (t0-t3/s0-s3) rather than a [16]
+-         * array: the backend's root signature binds a 4-descriptor SRV table +
+-         * 4 static samplers, and an array declaration would require all 16
+-         * registers valid on tier-1 hardware. RSX FPs in practice use units
+-         * 0-3; higher units clamp to 3 in the TEX emission below. */
+-        "Texture2D    rsx_tex0 : register(t0); Texture2D rsx_tex1 : register(t1);\n"
+-        "Texture2D    rsx_tex2 : register(t2); Texture2D rsx_tex3 : register(t3);\n"
+-        /* Per-draw texcoord scale (b1): RSX textures with the UNnormalized
+-         * flag are sampled in texel space; the backend supplies 1/size for
+-         * those units and 1.0 for normalized ones. */
+-        "cbuffer FPTex : register(b1) { float4 rsx_texscale[4]; float4 rsx_alphatest;"
+-        " float4 fp_k[64]; };\n"
+-        "SamplerState rsx_samp0 : register(s0); SamplerState rsx_samp1 : register(s1);\n"
+-        "SamplerState rsx_samp2 : register(s2); SamplerState rsx_samp3 : register(s3);\n"
+-        "struct PSOut { float4 c0:SV_Target0; float4 c1:SV_Target1;\n"
+-        "               float4 c2:SV_Target2; float4 c3:SV_Target3; };\n"
+-        "PSOut main(PSInput input) {\n"
++        "};\n");
++    /* Texture bank. With no cube units (the default) emit the exact legacy
++     * array declaration so 2D-only programs are byte-identical. When any unit
++     * is a cubemap, declare each unit individually at its t-register so the
++     * cube units can be TextureCube while the rest stay Texture2D. */
++    if (tex_cube_mask == 0) {
++        out_puts(&o, "Texture2D    rsx_tex[16] : register(t0);\n");
++    } else {
++        char decl[64];
++        for (u32 u = 0; u < 16; u++) {
++            snprintf(decl, sizeof(decl), "%s rsx_tex%u : register(t%u);\n",
++                     ((tex_cube_mask >> u) & 1u) ? "TextureCube" : "Texture2D  ", u, u);
++            out_puts(&o, decl);
++        }
++    }
++    out_puts(&o,
++        "SamplerState rsx_samp[16] : register(s0);\n"
++    );
++    if (buffered) {
++        char constants_decl[192];
++        snprintf(
++            constants_decl, sizeof(constants_decl),
++            "cbuffer PSConstants : register(b1) {\n"
++            "    float4 fp_constants[%u];\n"
++            "    float4 fp_alpha;\n"
++            "};\n",
++            buffered_constant_count ? buffered_constant_count : 1u);
++        out_puts(&o, constants_decl);
++    }
++    out_puts(&o,
++        "float4 main(PSInput input) : SV_TARGET {\n"
+         "    float4 r[48]; float4 h[48];\n"
+         /* Fully initialise both register files: RSX programs routinely read a
+          * register lane before writing it (the hardware reads undefined), but
+          * HLSL rejects use-before-init (error X4000). Zero everything. */
+         "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
+-        /* NV40 FP condition registers: set_cond instructions latch their
+-         * result; later instructions execute per-lane where the (swizzled)
+-         * cc value passes the exec_if_lt/eq/gr test. */
+-        "    float4 cc0 = (float4)0, cc1 = (float4)0;\n");
++        /* Condition-code registers for exec_if predication / set_cond. Reset
++         * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
++        "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
+ 
+     int wrote_r0 = 0, wrote_h0 = 0;
+     int count = 0;
+     u32 off = 0;
+-    /* Structured-branch bookkeeping (IFE): close/else points by ucode byte
+-     * offset. Stacks are small -- RSX FPs nest shallowly. */
+-    u32 else_offs[16]; int n_else = 0;
+-    u32 end_offs[16];  int n_end = 0;
++    u32 constant_slot = 0;
+ 
+     while (off + 16 <= max_bytes) {
+         u32 w0 = rsx_fp_read_word(ucode + off + 0);
+         u32 w1 = rsx_fp_read_word(ucode + off + 4);
+         u32 w2 = rsx_fp_read_word(ucode + off + 8);
+         u32 w3 = rsx_fp_read_word(ucode + off + 12);
+-
+-        /* Close pending else/endif blocks that land at this offset. */
+-        if (n_else > 0 && else_offs[n_else-1] == off) {
+-            out_puts(&o, "    } else {\n");
+-            n_else--;
+-        }
+-        while (n_end > 0 && end_offs[n_end-1] == off) {
+-            out_puts(&o, "    } }\n");
+-            n_end--;
+-        }
+-
+         off += 16;
+         count++;
+ 
+@@ -391,63 +466,45 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
+         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
+ 
++        /* Execution condition (exec_if) + condition-code write (set_cond).
++         * Faithful to RPCS3 FragmentProgramDecompiler {GetRawCond, AddCodeCond,
++         * SetDst}: all-set == unconditional, none-set == never, otherwise a
++         * per-component select of the result vs the destination, gated by a
++         * sign test of the cond-swizzled CC register. */
++        int exec_lt   = (w1 & FP_EXEC_IF_LT) ? 1 : 0;
++        int exec_eq   = (w1 & FP_EXEC_IF_EQ) ? 1 : 0;
++        int exec_gr   = (w1 & FP_EXEC_IF_GR) ? 1 : 0;
++        int is_uncond = (exec_lt && exec_eq && exec_gr);
++        int is_never  = (!exec_lt && !exec_eq && !exec_gr);
++        int set_cond  = (w0 & FP_COND_WRITE) ? 1 : 0;
++        u32 cc_read   = (w1 & FP_COND_REG)     ? 1u : 0u;
++        u32 cc_write  = (w1 & FP_COND_MOD_REG) ? 1u : 0u;
++        static const char comp_c[4] = {'x','y','z','w'};
++        char cswz[5];
++        for (int ci = 0; ci < 4; ci++)
++            cswz[ci] = comp_c[(w1 >> (FP_COND_SWZ_SHIFT + 2 * ci)) & 3];
++        cswz[4] = '\0';
++        /* HLSL comparison operator for the exec_if sign mask (matches the
++         * oracle's SGE/SLE/SNE/SGT/SLT/SEQ selection in GetRawCond). */
++        const char* cmp_op = "==";
++        if      (exec_gr && exec_eq) cmp_op = ">=";
++        else if (exec_lt && exec_eq) cmp_op = "<=";
++        else if (exec_gr && exec_lt) cmp_op = "!=";
++        else if (exec_gr)            cmp_op = ">";
++        else if (exec_lt)            cmp_op = "<";
++        else                         cmp_op = "==";  /* exec_eq only */
++
+         Src s0, s1, s2;
+         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
+         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
+         decode_src(w3, 0,                &s2);
+ 
+-        /* Per-instruction predication (SRC0 word): exec_if_lt/eq/gr @18-20,
+-         * cond swizzle @21-28, cond_mod reg @30 (set_cond target), cond reg
+-         * @31 (gate source). exec=7 -> unconditional; exec=0 -> never runs. */
+-        u32 exec_cond = (w1 >> 18) & 7u;
+-        int cond_reg  = (int)((w1 >> 31) & 1u);
+-        int cond_mod  = (int)((w1 >> 30) & 1u);
+-        int set_cond  = (w0 & FP_COND_WRITE) ? 1 : 0;
+-        char cswz[5];
+-        {
+-            static const char comp2[4] = {'x','y','z','w'};
+-            for (int i = 0; i < 4; i++) cswz[i] = comp2[(w1 >> (21 + 2*i)) & 3];
+-            cswz[4] = 0;
+-        }
+-        /* Result scale modifier (SRC1 word bits 28-30): the value is scaled
+-         * before saturation/write. demosaic's parity math is floor(coord)/2
+-         * then frac() -- without the /2 the parity network is constant 0. */
+-        u32 scale_bits = (w2 >> 28) & 7u;
+-        const char* scale = NULL;
+-        switch (scale_bits) {
+-        case 1: scale = " _v = _v * 2.0;";   break;
+-        case 2: scale = " _v = _v * 4.0;";   break;
+-        case 3: scale = " _v = _v * 8.0;";   break;
+-        case 5: scale = " _v = _v * 0.5;";   break;
+-        case 6: scale = " _v = _v * 0.25;";  break;
+-        case 7: scale = " _v = _v * 0.125;"; break;
+-        default: break;
+-        }
+-
+-        /* FP_CC_OFF=1: treat every predicated write as unconditional. Isolates
+-         * "the condition register is wrong / its inputs are garbage" from "the
+-         * gate itself is mis-decoded" -- both show up as unlit black geometry. */
+-        { static int _cc = -1; if (_cc < 0) { const char* e = getenv("FP_CC_OFF");
+-              _cc = e ? atoi(e) : 0; }
+-          if (_cc && exec_cond != 0) exec_cond = 7; }
+-        const char* cmp = NULL;   /* NULL = unconditional */
+-        switch (exec_cond) {
+-        case 1: cmp = "< 0";  break;
+-        case 2: cmp = "== 0"; break;
+-        case 3: cmp = "<= 0"; break;
+-        case 4: cmp = "> 0";  break;
+-        case 5: cmp = "!= 0"; break;
+-        case 6: cmp = ">= 0"; break;
+-        default: break;       /* 7 unconditional, 0 never */
+-        }
+-
+         /* Inline constant: any CONST source pulls the next 16 bytes as a
+          * float4 literal and advances past it. */
+         float k[4] = {0,0,0,0};
+         int has_k = 0;
+-        if (!is_branch &&
+-            (s0.type == FP_REG_TYPE_CONST || s1.type == FP_REG_TYPE_CONST ||
+-             s2.type == FP_REG_TYPE_CONST)) {
++        if (s0.type == FP_REG_TYPE_CONST || s1.type == FP_REG_TYPE_CONST ||
++            s2.type == FP_REG_TYPE_CONST) {
+             if (off + 16 <= max_bytes) {
+                 for (int i = 0; i < 4; i++) {
+                     u32 cw = rsx_fp_read_word(ucode + off + i * 4);
+@@ -458,38 +515,21 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+             has_k = 1;
+         }
+ 
+-        /* One inline constant slot per instruction; all three sources of that
+-         * instruction reference the same slot. */
+-        int k_idx = -1;
+-        if (has_k) { k_idx = n_consts; if (n_consts < FP_MAX_CONSTS) n_consts++; }
+         char a[200], b[200], c[200];
+-        emit_src(&s0, input_src, k, has_k, k_idx, a, sizeof(a));
+-        emit_src(&s1, input_src, k, has_k, k_idx, b, sizeof(b));
+-        emit_src(&s2, input_src, k, has_k, k_idx, c, sizeof(c));
++        emit_src(
++            &s0, input_src, k, has_k, buffered, constant_slot,
++            a, sizeof(a));
++        emit_src(
++            &s1, input_src, k, has_k, buffered, constant_slot,
++            b, sizeof(b));
++        emit_src(
++            &s2, input_src, k, has_k, buffered, constant_slot,
++            c, sizeof(c));
++        if (has_k)
++            constant_slot++;
+ 
+         if (is_branch) {
+-            /* Branch opcodes live in a second table (base | 0x40): 0x42 = IFE
+-             * (if/else/endif); SRC1/SRC2 carry the else and endif ucode byte
+-             * offsets. Others (LOOP/REP/CAL) still unhandled. */
+-            if (opcode == 0x02 /* IFE = 0x42 & 0x3F */) {
+-                /* SRC1/SRC2 store the else/endif targets in words (<< 2 for
+-                 * ucode byte offsets); bit 31 of SRC1 is the branch flag. */
+-                u32 else_b = (w2 & 0x7FFFFFFFu) << 2;
+-                u32 end_b  = (w3 & 0x7FFFFFFFu) << 2;
+-                char bl[220];
+-                if (cmp)
+-                    snprintf(bl, sizeof(bl),
+-                             "    { float4 _cs = cc%d.%s; if (any(_cs %s)) {\n",
+-                             cond_reg, cswz, cmp);
+-                else
+-                    snprintf(bl, sizeof(bl), "    { if (true) {\n");
+-                out_puts(&o, bl);
+-                if (n_end < 16) end_offs[n_end++] = end_b;
+-                if (else_b != end_b && else_b > off && n_else < 16)
+-                    else_offs[n_else++] = else_b;
+-            } else {
+-                out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
+-            }
++            out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
+             if (w0 & FP_END) break;
+             continue;
+         }
+@@ -510,48 +550,35 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
+         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+-        case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt((%s).x)", a); break;
++        /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
++         * (oracle: RPCS3 FragmentProgramDecompiler.cpp, "RSQ ignores the sign
++         * of the inputs (Metro Last Light, GTA4)"). The strict form NaN'd the
++         * normal-map Z-reconstruction (1-x²-y² measurably negative for most
++         * pixels, median -0.0078) and poisoned the whole lighting chain — the
++         * s25-s27 black/blue character class (scratch/s26_fp_bisect.md s27
++         * part 4; two independent shader pairs confirmed). */
++        case OP_RSQ: snprintf(rhs, sizeof(rhs), "rsqrt(abs((%s).x))", a); break;
+         case OP_EX2: snprintf(rhs, sizeof(rhs), "exp2((%s).x)", a); break;
+-        /* Screen-space derivatives. HLSL has these natively; dropping them left
+-         * the destination holding a stale value, silently corrupting whatever
+-         * effect differentiates a coordinate (edge/threshold and filtering work
+-         * both do). 26 DDX + 24 DDY across this title's shaders. */
+-        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+-        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
+-        /* LIF (0x3C) is NV40's LIT. Evidence from this title's shaders: the
+-         * write mask is always .yz -- LIT's x and w results are the constant
+-         * 1.0, so Cg masks them off -- and the source arrives swizzled .xyzz
+-         * with .x a dot product, .y the diffuse term and .z already holding
+-         * log2(specular) * power, i.e. the LG2/MUL half of a pow() the compiler
+-         * emitted separately. So the remaining work is LIT's exponentiate and
+-         * its "only if facing the light" gate:
+-         *     dst = (1, max(s.x,0), s.x > 0 ? exp2(s.z) : 0, 1)
+-         * Dropping it left .z holding log2(spec)*power -- a wrong, typically
+-         * negative, specular fed straight into the lighting sum. */
+-        case OP_LIF:
+-            /* FP_LIT_OFF=1: emit nothing for LIT, reproducing the pre-fix
+-             * behaviour. Lets "did implementing LIT introduce this?" be answered
+-             * directly instead of inferred. */
+-            { static int off = -1;
+-              if (off < 0) { const char* e = getenv("FP_LIT_OFF"); off = e ? atoi(e) : 0; }
+-              if (off) { handled = 0; break; } }
+-            /* Clamp the exponent. Hardware LIT bounds the specular power to
+-             * +/-128; here the compiler has already folded log2(NdotH)*power
+-             * into .z, so an NdotH that rounds above 1 makes that positive and
+-             * exp2 explodes, saturating a channel. In this title's wall shader
+-             * the power is 100, and the blown result was leaking into the
+-             * colour sum as a magenta cast. */
+-            snprintf(rhs, sizeof(rhs),
+-                     "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0)"
+-                     " ? exp2(clamp((%s).z, -128.0, 128.0)) : 0.0, 1.0)",
+-                     a, a, a);
+-            break;
+         case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
+         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
+         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
+         case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
+         case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
+-        case OP_DIVSQ: snprintf(rhs, sizeof(rhs), "(%s) / sqrt((%s).x)", a, b); break;
++        /* Real RSX DIVSQ shares RSQ's sign-ignoring sqrt on the denominator
++         * (oracle: RPCS3 FragmentProgramDecompiler.cpp's _builtin_sqrt macro,
++         * reused by _builtin_divsq) AND forces the result to exactly 0,
++         * component-wise, wherever the NUMERATOR component is 0 -- even if
++         * the denominator is also 0 (oracle: same file, "DIVSQ is not
++         * compliant. Result is 0 if numerator is 0 regardless of
++         * denominator", FragmentProgramDecompiler.cpp:1076). Using a true
++         * per-component select (HLSL vector `?:`, not lerp/mix) avoids NaN
++         * contamination from the 0/0 branch, matching the oracle's own note
++         * on why it can't use a blend here. */
++        case OP_DIVSQ:
++            snprintf(rhs, sizeof(rhs),
++                     "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
++                     a, a, b);
++            break;
+         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
+         case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
+         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
+@@ -564,149 +591,389 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
+         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
+         case OP_TEX:
+-            snprintf(rhs, sizeof(rhs),
+-                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy * rsx_texscale[%u].xy)",
+-                     tex_unit & 3u, tex_unit & 3u, a, tex_unit & 3u);
++            if ((tex_cube_mask >> tex_unit) & 1u)
++                /* Cubemap: sample with the full 3-component direction vector. */
++                snprintf(rhs, sizeof(rhs),
++                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
++            else if (tex_cube_mask)
++                snprintf(rhs, sizeof(rhs),
++                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
++            else
++                snprintf(rhs, sizeof(rhs),
++                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+             break;
+         case OP_TXP:
+-            snprintf(rhs, sizeof(rhs),
+-                     "rsx_tex%u.Sample(rsx_samp%u, (%s).xy / (%s).w * rsx_texscale[%u].xy)",
+-                     tex_unit & 3u, tex_unit & 3u, a, a, tex_unit & 3u);
++            if ((tex_cube_mask >> tex_unit) & 1u)
++                /* Projective divide is meaningless for a cube lookup; sample
++                 * the direction directly. */
++                snprintf(rhs, sizeof(rhs),
++                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
++            else if (tex_cube_mask)
++                snprintf(rhs, sizeof(rhs),
++                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
++                         tex_unit, tex_unit, a, a);
++            else
++                snprintf(rhs, sizeof(rhs),
++                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
++                         tex_unit, tex_unit, a, a);
+             break;
+-        case OP_KIL: {
+-            if (exec_cond != 0) {
+-                char kl[220];
+-                if (cmp)
+-                    snprintf(kl, sizeof(kl),
+-                             "    { float4 _cs = cc%d.%s; if (any(_cs %s)) discard; }\n",
+-                             cond_reg, cswz, cmp);
+-                else
+-                    snprintf(kl, sizeof(kl), "    discard;\n");
+-                out_puts(&o, kl);
++        case OP_KIL:
++            /* Fragment kill. Predicated by the same exec_if condition as any
++             * other instruction (RPCS3 FragmentProgramDecompiler case
++             * RSX_FP_OPCODE_KIL: AddFlowOp("discard") under GetCond());
++             * unconditional encodings discard outright. Dropping this (the
++             * old TODO) rendered every alpha-cutout material as a solid
++             * quad. */
++            if (is_never) {
++                rhs[0] = '\0';
++            } else if (is_uncond) {
++                out_puts(&o, "    discard;\n");
++            } else {
++                char kil[128];
++                snprintf(kil, sizeof(kil),
++                         "    if (any(cc%u.%s %s (float4)0)) discard;\n",
++                         cc_read, cswz, cmp_op);
++                out_puts(&o, kil);
+             }
+-            handled = 0;
+-            break; }
++            handled = 0;   /* no destination write */
++            break;
+         default:
+-            /* Report the dst register/mask and the raw words too: "unhandled
+-             * opcode X" alone is not enough to implement it -- what it writes
+-             * and what it reads is what tells you the semantics. */
+-            /* FP_CENSUS: tally unhandled opcodes across EVERY program compiled,
+-             * not just whichever one is being dumped. A decode gap shows up as
+-             * wrong shading on whatever happens to use it, so a census is how
+-             * you find them all at once instead of one surface at a time. */
+-            { static u32 cen[256]; static int reg = 0;
+-              if (opcode < 256) cen[opcode]++;
+-              if (!reg) { reg = 1; }
+-              { static int cap = -1; static u32 n = 0;
+-                if (cap < 0) { const char* e = getenv("FP_CENSUS"); cap = e ? atoi(e) : 0; }
+-                if (cap && ++n % (u32)cap == 0) {
+-                    fprintf(stderr, "[FPCENSUS] unhandled opcodes so far:");
+-                    for (int i = 0; i < 256; i++) if (cen[i])
+-                        fprintf(stderr, " %s(0x%02X)x%u", rsx_fp_opcode_name(i), i, cen[i]);
+-                    fprintf(stderr, "%c", 10);
+-                } } }
+-            { char _tb[256]; char _mm[5]; dest_mask(w0, _mm);
+-              snprintf(_tb, sizeof _tb,
+-                       "    /* TODO: unhandled FP opcode %s (0x%02X) dst=%s%u.%s"
+-                       " src0=%s src1=%s src2=%s w=%08X %08X %08X %08X */%c",
+-                       rsx_fp_opcode_name(opcode), opcode,
+-                       (w0 & FP_OUT_HALF) ? "h" : "r",
+-                       (unsigned)((w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT),
+-                       _mm[0] ? _mm : "xyzw", a, b, c, w0, w1, w2, w3, 10);
+-              out_puts(&o, _tb); }
++            out_puts(&o, "    /* TODO: unhandled FP opcode ");
++            out_puts(&o, rsx_fp_opcode_name(opcode));
++            out_puts(&o, " */\n");
+             handled = 0;
+             break;
+         }
+ 
+-        if (handled && exec_cond != 0 && (!(w0 & FP_OUT_NONE) || set_cond)) {
++        int has_dest = !(w0 & FP_OUT_NONE);
++        if (handled && (has_dest || set_cond)) {
+             u32 dst_idx = (w0 & FP_OUT_REG_MASK) >> FP_OUT_REG_SHIFT;
+             int dst_half = (w0 & FP_OUT_HALF) ? 1 : 0;
+-            const char* rf = dst_half ? "h" : "r";
++            const char* reg = dst_half ? "h" : "r";
+             char m[5];
+             dest_mask(w0, m);
+ 
+-            /* Broadcast the result to float4 first so the write-mask picks
+-             * the CORRESPONDING components: `dst.w = rhs` would HLSL-truncate
+-             * a vector rhs to its .x, but NV40 writes rhs.w to dst.w. Scalar
++            const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
++            /* NV40 per-instruction result-scale modifier (SRC1 word bits
++             * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
++             * result BEFORE saturate (RPCS3 FragmentProgramDecompiler.cpp
++             * SetDst, RSXFragmentProgram.h SRC1.scale:3). Dropped entirely
++             * until s32: draw 1625's two-tap box filter (÷2 on the final
++             * ADD) summed unaveraged -- the flat 2x composite gain behind
++             * the whiteout/overbright class (scratch/s32_gain_hunt.md). */
++            u32 res_scale = (w2 >> 28) & 0x7u;
++            static const char* scale_txt[8] = { "", " * 2.0", " * 4.0", " * 8.0",
++                                                "", " / 2.0", " / 4.0", " / 8.0" };
++
++            /* Broadcast the result to float4 first so the write-mask picks the
++             * CORRESPONDING components: `dst.w = rhs` would HLSL-truncate a
++             * vector rhs to its .x, but NV40 writes rhs.w to dst.w. Scalar
+              * results (DPx/RCP/...) replicate, which is also the hardware
+              * behavior. */
+-            char line[2048];
+-            int pos = 0;
+-            const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
+-            pos += snprintf(line + pos, sizeof(line) - pos,
+-                            "    { float4 _v = (float4)(%s);%s%s",
+-                            rhs, scale ? scale : "", sat);
+-            if (cmp)
+-                pos += snprintf(line + pos, sizeof(line) - pos,
+-                                " float4 _cs = cc%d.%s;", cond_reg, cswz);
+-            if (!(w0 & FP_OUT_NONE)) {
+-                if (cmp) {
+-                    /* Per-lane predicated write: lane L updates only where
+-                     * the swizzled cc lane passes the test. */
+-                    for (const char* L = m; *L; L++)
+-                        pos += snprintf(line + pos, sizeof(line) - pos,
+-                                        " %s[%u].%c = (_cs.%c %s) ? _v.%c : %s[%u].%c;",
+-                                        rf, dst_idx, *L, *L, cmp, *L, rf, dst_idx, *L);
+-                } else {
+-                    pos += snprintf(line + pos, sizeof(line) - pos,
+-                                    " %s[%u].%s = _v.%s;", rf, dst_idx, m, m);
++            if (has_dest && is_uncond && !set_cond) {
++                /* Common unconditional path — kept byte-identical so the 39
++                 * non-predicated programs in this capture emit unchanged. */
++                char line[800];
++                snprintf(line, sizeof(line),
++                         "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
++                         rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
++                out_puts(&o, line);
++            } else {
++                /* Predicated and/or CC-writing instruction. */
++                char buf[1200];
++                snprintf(buf, sizeof(buf),
++                         "    { float4 _v = (float4)(%s)%s;%s\n",
++                         rhs, scale_txt[res_scale], sat);
++                out_puts(&o, buf);
++                if (has_dest) {
++                    if (is_uncond) {
++                        snprintf(buf, sizeof(buf),
++                                 "      %s[%u].%s = _v.%s;\n", reg, dst_idx, m, m);
++                    } else if (is_never) {
++                        snprintf(buf, sizeof(buf),
++                                 "      /* exec_if=none: write suppressed */\n");
++                    } else {
++                        /* Per-component select gated by the CC sign test.
++                         * lerp(dst, _v, mask) == mask ? _v : dst since the
++                         * mask is exactly 0.0/1.0 from the bool->float cast. */
++                        snprintf(buf, sizeof(buf),
++                                 "      float4 _p = (float4)((cc%u).%s %s (float4)0.0);\n"
++                                 "      %s[%u].%s = lerp(%s[%u].%s, _v.%s, _p.%s);\n",
++                                 cc_read, cswz, cmp_op,
++                                 reg, dst_idx, m, reg, dst_idx, m, m, m);
++                    }
++                    out_puts(&o, buf);
+                 }
+-            }
+-            if (set_cond) {
+-                if (cmp) {
+-                    for (const char* L = m; *L; L++)
+-                        pos += snprintf(line + pos, sizeof(line) - pos,
+-                                        " cc%d.%c = (_cs.%c %s) ? _v.%c : cc%d.%c;",
+-                                        cond_mod, *L, *L, cmp, *L, cond_mod, *L);
+-                } else {
+-                    pos += snprintf(line + pos, sizeof(line) - pos,
+-                                    " cc%d.%s = _v.%s;", cond_mod, m, m);
++                if (set_cond) {
++                    /* CC receives the destination value (post-select), masked;
++                     * for no-dest set_cond it receives the raw result. */
++                    if (has_dest)
++                        snprintf(buf, sizeof(buf),
++                                 "      cc%u.%s = %s[%u].%s;\n", cc_write, m, reg, dst_idx, m);
++                    else
++                        snprintf(buf, sizeof(buf),
++                                 "      cc%u.%s = _v.%s;\n", cc_write, m, m);
++                    out_puts(&o, buf);
+                 }
++                out_puts(&o, "    }\n");
+             }
+-            snprintf(line + pos, sizeof(line) - pos, " }\n");
+-            out_puts(&o, line);
+ 
+-            if (!(w0 & FP_OUT_NONE) && dst_idx == 0) {
+-                if (dst_half) wrote_h0 = 1; else wrote_r0 = 1;
+-            }
++            if (has_dest && !dst_half && dst_idx == 0) wrote_r0 = 1;
++            if (has_dest && dst_half  && dst_idx == 0) wrote_h0 = 1;
+         }
+ 
+         if (w0 & FP_END) break;
+     }
+ 
+-    /* Close any blocks whose end offset was never reached (defensive: a
+-     * mis-decoded target must not leave the HLSL unbalanced). */
+-    while (n_else-- > 0) out_puts(&o, "    } else {\n");
+-    while (n_end--  > 0) out_puts(&o, "    } }\n");
+-
+-    /* Fragment colour outputs, selected by SET_SHADER_CONTROL: 32-bit
+-     * programs export r0/r2/r3/r4, half programs h0/h4/h6/h8 (wave's water
+-     * height FP writes its result to h0 and uses r0 lanes as scratch --
+-     * heuristics picked r0 and the pond stayed flat forever). Unbound MRT
+-     * writes are discarded. */
+-    /* Colour exports: SET_SHADER_CONTROL bit 0x40 selects the 32-bit bank
+-     * (r0/r2/r3/r4) vs half (h0/h4/h6/h8); fall back to whichever file the
+-     * program actually wrote for c0 (PSL1GHT runs half-export control over
+-     * r0-writing programs). Secondaries use the zero-init sum trick. */
+-    if (exports32 ? wrote_r0 : !wrote_h0)
+-        out_puts(&o, "    PSOut _po; _po.c0 = r[0];\n");
+-    else
+-        out_puts(&o, "    PSOut _po; _po.c0 = h[0];\n");
+-    out_puts(&o, "    _po.c1 = r[2] + h[4]; _po.c2 = r[3] + h[6];\n"
+-                 "    _po.c3 = r[4] + h[8];\n"
+-        /* Guest alpha test (D3D12 has none fixed-function): func codes are
+-         * RSX 0x200+f with f: 0=NEVER 1=LESS 2=EQUAL 3=LEQUAL 4=GREATER
+-         * 5=NOTEQUAL 6=GEQUAL 7=ALWAYS. */
+-        "    if (rsx_alphatest.x != 0.0) {\n"
+-        "        float _a = _po.c0.a, _r = rsx_alphatest.y;\n"
+-        "        int _f = (int)rsx_alphatest.z;\n"
+-        "        bool _p = (_f == 7) || (_f == 1 && _a < _r) || (_f == 2 && _a == _r) ||\n"
+-        "                  (_f == 3 && _a <= _r) || (_f == 4 && _a > _r) ||\n"
+-        "                  (_f == 5 && _a != _r) || (_f == 6 && _a >= _r);\n"
+-        "        if (!_p) discard;\n"
+-        "    }\n"
+-        "    return _po;\n}\n");
++    /* Fragment color output register selection. The NV40 hardware picks the
++     * output from the SHADER_CONTROL word's 32_BITS_EXPORTS bit, not from
++     * whichever temp happened to be written: fp32-export programs output r0,
++     * fp16-export programs (the default) output h0 (RPCS3
++     * FragmentProgramDecompiler::BuildCode). Many real material/lighting
++     * shaders accumulate into fp32 temps (r2/r3/r4) but write their FINAL
++     * color to h0 — the old "wrote_r0 => return r0" heuristic returned a stale
++     * intermediate, producing flat/constant surfaces. */
++    if (ctrl == RSX_FP_CTRL_AUTO) {
++        /* No control word (standalone tests): legacy heuristic. */
++        if (wrote_r0 || !wrote_h0)
++            out_puts(&o, "    return r[0];\n}\n");
++        else
++            out_puts(&o, "    return h[0];\n}\n");
++    } else if (ctrl & FP_CTRL_32BIT_EXPORTS) {
++        out_puts(&o, "    return r[0];\n}\n");
++    } else {
++        out_puts(&o, "    return h[0];\n}\n");
++    }
++    (void)wrote_r0; (void)wrote_h0;
+ 
+     if (!o.ok) return -1;
+     return count;
+ }
++
++int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
++                        u32 tex_cube_mask, char* out, u32 out_size)
++{
++    return rsx_fp_decompile_internal(
++        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
++}
++
++int rsx_fp_decompile_buffered_ex(
++    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
++    char* out, u32 out_size, u32* out_constant_count)
++{
++    return rsx_fp_decompile_internal(
++        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
++        out_constant_count);
++}
++
++static float fp_half_to_float(u16 h)
++{
++    const u32 sign = (u32)(h & 0x8000u) << 16;
++    u32 exponent = (h >> 10) & 0x1Fu;
++    u32 mantissa = h & 0x03FFu;
++    u32 bits;
++    if (exponent == 0) {
++        if (mantissa == 0) {
++            bits = sign;
++        } else {
++            exponent = 127u - 15u + 1u;
++            while ((mantissa & 0x0400u) == 0) {
++                mantissa <<= 1;
++                exponent--;
++            }
++            mantissa &= 0x03FFu;
++            bits = sign | (exponent << 23) | (mantissa << 13);
++        }
++    } else if (exponent == 0x1Fu) {
++        bits = sign | 0x7F800000u | (mantissa << 13);
++    } else {
++        bits = sign | ((exponent + (127u - 15u)) << 23) | (mantissa << 13);
++    }
++    float value;
++    memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
++float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format)
++{
++    /* NV4097 surface color formats: 14=W16Z16Y16X16,
++     * 15=W32Z32Y32X32, 16=X32. */
++    if (surface_color_format == 14u)
++        return fp_half_to_float((u16)(raw & 0xFFFFu));
++    if (surface_color_format == 15u || surface_color_format == 16u) {
++        float value;
++        memcpy(&value, &raw, sizeof(value));
++        return value;
++    }
++    return (float)(raw & 0xFFu) / 255.0f;
++}
++
++int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
++{
++    if (!hlsl || out_size == 0)
++        return -1;
++
++    const u32 cmp = func >= 0x0200u && func <= 0x0207u ? func - 0x0200u : 7u;
++    if (cmp == 7u)
++        return 0;
++
++    char* marker = NULL;
++    for (char* p = strstr(hlsl, "    return "); p;
++         p = strstr(p + 1, "    return "))
++        marker = p;
++    if (!marker)
++        return -1;
++    char* expression = marker + strlen("    return ");
++    char* terminator = strstr(expression, ";\n}\n");
++    if (!terminator || terminator == expression ||
++        (size_t)(terminator - expression) >= 96)
++        return -1;
++    char output[96];
++    memcpy(output, expression, (size_t)(terminator - expression));
++    output[terminator - expression] = '\0';
++
++    static const char* pass_expr[8] = {
++        "false", "_rsx_out.a < _rsx_alpha_ref",
++        "_rsx_out.a == _rsx_alpha_ref", "_rsx_out.a <= _rsx_alpha_ref",
++        "_rsx_out.a > _rsx_alpha_ref", "_rsx_out.a != _rsx_alpha_ref",
++        "_rsx_out.a >= _rsx_alpha_ref", "true"
++    };
++    char suffix[512];
++    const int n = snprintf(suffix, sizeof(suffix),
++        "    float4 _rsx_out = %s;\n"
++        "    const float _rsx_alpha_ref = %.9g;\n"
++        "    if (!(%s)) discard;\n"
++        "    return _rsx_out;\n}\n",
++        output, (double)ref, pass_expr[cmp]);
++    if (n < 0 || (u32)n >= sizeof(suffix))
++        return -1;
++    const size_t prefix = (size_t)(marker - hlsl);
++    if (prefix + (size_t)n + 1 > out_size)
++        return -1;
++    memcpy(marker, suffix, (size_t)n + 1);
++    return 1;
++}
++
++int rsx_fp_apply_alpha_test_buffered(
++    char* hlsl, u32 out_size, u32 func)
++{
++    if (!hlsl || out_size == 0)
++        return -1;
++
++    const u32 cmp =
++        func >= 0x0200u && func <= 0x0207u ? func - 0x0200u : 7u;
++    if (cmp == 7u)
++        return 0;
++
++    char* marker = NULL;
++    for (char* p = strstr(hlsl, "    return "); p;
++         p = strstr(p + 1, "    return "))
++        marker = p;
++    if (!marker)
++        return -1;
++    char* expression = marker + strlen("    return ");
++    char* terminator = strstr(expression, ";\n}\n");
++    if (!terminator || terminator == expression ||
++        (size_t)(terminator - expression) >= 96)
++        return -1;
++    char output[96];
++    memcpy(output, expression, (size_t)(terminator - expression));
++    output[terminator - expression] = '\0';
++
++    static const char* pass_expr[8] = {
++        "false", "_rsx_out.a < _rsx_alpha_ref",
++        "_rsx_out.a == _rsx_alpha_ref", "_rsx_out.a <= _rsx_alpha_ref",
++        "_rsx_out.a > _rsx_alpha_ref", "_rsx_out.a != _rsx_alpha_ref",
++        "_rsx_out.a >= _rsx_alpha_ref", "true"
++    };
++    char suffix[512];
++    const int n = snprintf(
++        suffix, sizeof(suffix),
++        "    float4 _rsx_out = %s;\n"
++        "    const float _rsx_alpha_ref = fp_alpha.x;\n"
++        "    if (!(%s)) discard;\n"
++        "    return _rsx_out;\n}\n",
++        output, pass_expr[cmp]);
++    if (n < 0 || (u32)n >= sizeof(suffix))
++        return -1;
++    const size_t prefix = (size_t)(marker - hlsl);
++    if (prefix + (size_t)n + 1 > out_size)
++        return -1;
++    memcpy(marker, suffix, (size_t)n + 1);
++    return 1;
++}
++
++/* --- kept from this tree when adopting the newer decompiler ---------------
++ * rsx_d3d12_backend.c calls both of these: extract_consts feeds the per-draw
++ * fp_k[] slots, code_hash keys the PSO cache on the ucode rather than the
++ * constants. The live-draw engine does not need them, so they are absent
++ * upstream in caner's fork. */
++
++/* Walk a program the same way the decompiler does and copy out its inline
++ * constants in the SAME order the decompiler assigns fp_k[] indices. The backend
++ * calls this per draw, so re-patched constants take effect without recompiling. */
++int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out)
++{
++    if (!ucode || !out) return 0;
++    u32 off = 0; int n = 0;
++    while (off + 16 <= max_bytes) {
++        u32 w0 = rsx_fp_read_word(ucode + off + 0);
++        u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        off += 16;
++        int is_branch = (w2 & FP_BRANCH) != 0;
++        int has_k = !is_branch &&
++            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
++             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
++             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
++        if (has_k) {
++            if (off + 16 <= max_bytes) {
++                for (int i = 0; i < 4; i++) {
++                    u32 cw = rsx_fp_read_word(ucode + off + i * 4);
++                    if (n < max_out) memcpy(&out[n * 4 + i], &cw, 4);
++                }
++                off += 16;
++            }
++            if (n < max_out) n++;
++        }
++        if (w0 & FP_END) break;
++    }
++    { static int dbg = -1;
++      if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
++      if (dbg) { static int m = 0; if (m++ < 3) {
++        fprintf(stderr, "[FPK] %d consts%c", n, 10);
++        for (int _q = 0; _q < n; _q++)
++            fprintf(stderr, "   k[%2d] = (%g %g %g %g)%c", _q, out[_q*4+0],
++                    out[_q*4+1], out[_q*4+2], out[_q*4+3], 10); } }
++    }
++    return n;
++}
++
++/* FNV-1a over a program's INSTRUCTION words only, skipping the inline constant
++ * slots. With constants hoisted into fp_k[] the compiled shader does not depend
++ * on their values, so including them in the pipeline key made it change every
++ * time the title re-patched a constant -- which is exactly what thrashed the
++ * cache. */
++u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
++{
++    u32 h = 2166136261u;
++    if (!ucode) return h;
++    u32 off = 0;
++    while (off + 16 <= max_bytes) {
++        u32 w0 = rsx_fp_read_word(ucode + off + 0);
++        u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
++        off += 16;
++        int is_branch = (w2 & FP_BRANCH) != 0;
++        int has_k = !is_branch &&
++            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
++             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
++             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
++        if (has_k) off += 16;            /* skip the constant, do not hash it */
++        if (w0 & FP_END) break;
++    }
++    return h;
++}
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index e862272..9f5077f 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -18,6 +18,19 @@
+ extern "C" {
+ #endif
+ 
++#define RSX_FP_BUFFERED_CONSTANTS_API 1
++#define RSX_FP_MAX_INLINE_CONSTANTS 2048u
++
++/* Runtime payload for a structurally decompiled fragment program. Values are
++ * retained as host-order IEEE-754 bit patterns so signed zero, infinities,
++ * NaNs, and NaN payloads survive the guest-word conversion exactly. One slot
++ * is consumed per instruction that references CONST; multiple CONST operands
++ * in that instruction share the slot, matching the RSX encoding. */
++typedef struct rsx_fp_constant_block {
++    u32 count;
++    u32 values[RSX_FP_MAX_INLINE_CONSTANTS][4];
++} rsx_fp_constant_block;
++
+ /* Read one fragment-program word from guest (PS3) memory: big-endian load
+  * followed by a 16-bit half-word swap, yielding a host-order instruction
+  * word. The decoder operates on host-order words. */
+@@ -40,22 +53,88 @@ u32 rsx_fp_read_word(const u8* p);
+  *
+  * Texture sampling and full input plumbing are partial — see the doc's
+  * "Integration TODO". Unhandled opcodes emit a comment and a safe default so
+- * the shader still compiles. */
+-/* exports32: colour outputs come from r0/r2/r3/r4 (SET_SHADER_CONTROL bit
+- * 0x40) instead of h0/h4/h6/h8 (half-precision programs). */
+-/* Inline fragment constants hoisted into the per-draw constant buffer. 64 is
+- * comfortably above what this title's largest program uses; programs beyond it
+- * fall back to literals for the overflow. */
+-#define FP_MAX_CONSTS 64
+-
+-/* Copy a program's inline constants out in fp_k[] index order (see
+- * rsx_fp_decompile). Returns the count. */
+-u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
++ * the shader still compiles.
++ *
++ *   ctrl : the NV4097_SET_SHADER_CONTROL word (reg 0x1D60) for this program.
++ *          Bit 0x40 (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) selects the
++ *          fragment-output register set: clear => fp16 output (color = h0),
++ *          set => fp32 output (color = r0). Pass RSX_FP_CTRL_AUTO when no
++ *          control word is available (standalone tests) to fall back to the
++ *          legacy "whichever of r0/h0 was written" heuristic. */
++#define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
++int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
+ 
+-int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
++/* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
++ * shader. D3D12 has no fixed-function alpha test, so the comparison is
++ * emitted immediately before the shader's final color return. `func` uses
++ * the CELL_GCM comparison values 0x200..0x207 and `ref` is normalized to the
++ * render target's component representation. Returns 1 when a test was
++ * inserted, 0 for ALWAYS, and -1 if the generated shader could not be
++ * patched safely. */
++int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
++
++/* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
++ * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
++ * half float and X32/W32Z32Y32X32 use a 32-bit float. */
++float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
++
++/* Same as rsx_fp_decompile, plus per-texture-unit dimensionality.
++ *
++ *   tex_cube_mask : bit N set => texture unit N is a CUBEMAP. Cube units are
++ *                   declared `TextureCube` and sampled with the full
++ *                   3-component direction (a.xyz); 2D units keep `Texture2D`
++ *                   and a.xy sampling. Pass 0 for the legacy all-2D behavior
++ *                   (rsx_fp_decompile forwards 0, so its output is unchanged
++ *                   byte-for-byte).
++ *
++ * The mask must match what the backend actually binds: a cube unit needs a
++ * TextureCube SRV at register tN, and a 2D unit a Texture2D SRV. See the
++ * fragment lane report (scratch/a010_reports/fragment.md) for replay_main.c
++ * call-site guidance. */
++int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
++                        u32 tex_cube_mask, char* out, u32 out_size);
+ 
+-int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+-                     int exports32);
++/* Buffered-constant variant of rsx_fp_decompile_ex. Inline CONST payloads are
++ * represented as fp_constants[N] in a b1 PSConstants cbuffer rather than
++ * printed as HLSL literals. `out_constant_count` receives the exact slot
++ * count and may be NULL. */
++int rsx_fp_decompile_buffered_ex(
++    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
++    char* out, u32 out_size, u32* out_constant_count);
++
++/* Extract the exact runtime inline-CONST payload. Returns the slot count on
++ * success or -1 for an unterminated/truncated/oversized program. */
++int rsx_fp_collect_constants(
++    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
++
++/* Canonical structural fragment-program hash. Instruction bytes and their
++ * order are hashed; inline CONST payload bytes are skipped. Returns zero for
++ * malformed input. */
++u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed);
++
++/* Hash the exact legacy HLSL literal spellings (%g) for a program while also
++ * retaining structural identity. This is intended for aggregate diagnostics;
++ * PSO identity should use rsx_fp_structural_hash in buffered mode. */
++u64 rsx_fp_literal_source_hash(
++    const u8* ucode, u32 max_bytes, u64 seed);
++
++/* Buffered-alpha counterpart to rsx_fp_apply_alpha_test. It emits the compare
++ * against fp_alpha.x from PSConstants instead of embedding a numeric value. */
++int rsx_fp_apply_alpha_test_buffered(
++    char* hlsl, u32 out_size, u32 func);
++
++/* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
++ * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
++ * -1 when one allocation can never fit. */
++int rsx_fp_constant_ring_plan(
++    u32 used, u32 capacity, u32 data_bytes,
++    u32* out_offset, u32* out_allocation_bytes);
++
++/* Plan one already-aligned fixed-size vertex-constant block.  The caller must
++ * fence and retry from offset zero when this returns 0; silently dropping the
++ * draw would leave a multi-buffered display surface on an older generation. */
++int rsx_vertex_constant_ring_plan(
++    u32 used, u32 capacity, u32 block_bytes, u32* out_offset);
+ 
+ /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
+  * Useful for disassembly/logging. */
+@@ -71,4 +150,8 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
+ #ifdef __cplusplus
+ }
+ #endif
++
++/* Kept from this tree (see the .c) -- used by rsx_d3d12_backend.c. */
++int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
++u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
+ #endif /* PS3RECOMP_RSX_FP_DECOMPILER_H */
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 9683a4f..787bcd8 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -44,6 +44,8 @@ static NullBackendState s_state;
+  * Win32 window procedure
+  * -----------------------------------------------------------------------*/
+ 
++static int s_present_suppressed = 0;
++
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg) {
+@@ -134,6 +136,9 @@ static void null_end_frame(void* ud)
+ 
+ static void null_present(void* ud, u32 buffer_id)
+ {
++    /* The live draw engine presents through its own swap chain on this HWND;
++     * leaving the GDI blit running underneath would fight it for the window. */
++    if (s_present_suppressed) return;
+     (void)ud;
+     (void)buffer_id;
+ 
+@@ -287,6 +292,19 @@ int rsx_null_backend_pump_messages(void)
+     return s_state.window_closed ? -1 : 0;
+ }
+ 
++/* Ported from caner (canersaka) Yakuza-Dead-Souls-EX: the live NV4097->D3D12
++ * engine binds its swap chain to this window and then owns presentation, so it
++ * needs the HWND and a way to silence the GDI present underneath it. */
++void* rsx_null_backend_get_hwnd(void)
++{
++    return (void*)s_state.hwnd;
++}
++
++void rsx_null_backend_suppress_present(int on)
++{
++    s_present_suppressed = on;
++}
++
+ #else /* !_WIN32 */
+ 
+ /* ---------------------------------------------------------------------------
+@@ -508,6 +526,8 @@ void rsx_null_backend_shutdown(void)
+ int rsx_null_backend_pump_messages(void) { return 0; }
+ 
+ void rsx_null_backend_present(void) { nullsw_present(NULL, 0); }
++void* rsx_null_backend_get_hwnd(void) { return 0; }
++void  rsx_null_backend_suppress_present(int on) { (void)on; }
+ 
+ u32 rsx_null_backend_debug_color(void) { return s_soft.clear_argb; }
+ 
+diff --git a/libs/video/rsx_null_backend.h b/libs/video/rsx_null_backend.h
+index 02e34af..4a3e53e 100644
+--- a/libs/video/rsx_null_backend.h
++++ b/libs/video/rsx_null_backend.h
+@@ -57,4 +57,8 @@ u32 rsx_null_backend_readback_center(void);
+ #ifdef __cplusplus
+ }
+ #endif
++
++/* The live draw engine binds to this window and takes over presentation. */
++void* rsx_null_backend_get_hwnd(void);
++void  rsx_null_backend_suppress_present(int on);
+ #endif
+diff --git a/libs/video/rsx_vertex_formats.h b/libs/video/rsx_vertex_formats.h
+index 8e6e53c..b15248d 100644
+--- a/libs/video/rsx_vertex_formats.h
++++ b/libs/video/rsx_vertex_formats.h
+@@ -46,6 +46,20 @@ static inline u32 rsx_vertex_attrib_size(u32 type, u32 num_components)
+     return rsx_vertex_type_size(type) * num_components;
+ }
+ 
++/* Resolve one attribute's element under
++ * NV4097_SET_FREQUENCY_DIVIDER_OPERATION. Frequency 0/1 is ordinary vertex
++ * fetch, a set operation bit is modulo (instanced template), and a clear bit
++ * is division (one per-instance datum shared by `frequency` vertices). */
++static inline u32 rsx_vertex_element_index(u32 vertex_id, u32 base_index,
++                                           u32 frequency, u32 modulo)
++{
++    if (frequency <= 1)
++        return (vertex_id + base_index) & 0x000FFFFFu;
++    if (modulo)
++        return vertex_id % frequency;
++    return vertex_id / frequency;
++}
++
+ /* DXGI format values for D3D12 input layout */
+ #define DXGI_FORMAT_R32_FLOAT           41
+ #define DXGI_FORMAT_R32G32_FLOAT        16
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index a32982a..90ceb65 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -131,7 +131,128 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
+     emit(b, line);
+ }
+ 
++static u32 vec_source_use(u32 op, int* exact)
++{
++    switch (op) {
++    case 0x00: return 0;       /* NOP */
++    case 0x01: return 1u;      /* src0 */
++    case 0x02: return 3u;      /* src0, src1 */
++    case 0x03: return 5u;      /* src0, src2 */
++    case 0x04: return 7u;      /* src0, src1, src2 */
++    case 0x05: case 0x06: case 0x07: case 0x08:
++    case 0x09: case 0x0A: case 0x0B: case 0x0C:
++    case 0x10: case 0x12: case 0x13: case 0x14:
++        return 3u;             /* src0, src1 */
++    case 0x0D: case 0x0E: case 0x0F: case 0x16: case 0x19:
++        return 1u;             /* src0 */
++    case 0x11: case 0x15:
++        return 0;              /* source-independent constants */
++    default:
++        *exact = 0;
++        return 0;
++    }
++}
++
++static u32 sca_source_use(u32 op, int* exact)
++{
++    switch (op) {
++    case 0x00:
++        return 0;
++    case 0x01: case 0x02: case 0x03: case 0x04:
++    case 0x05: case 0x06: case 0x07:
++    case 0x0D: case 0x0E: case 0x0F: case 0x10:
++        return 4u;             /* scalar ALU reads src2 */
++    default:
++        /* Flow control and currently unsupported scalar opcodes make a
++         * narrowed data-flow result unsafe. */
++        *exact = 0;
++        return 0;
++    }
++}
++
++int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
++                          rsx_vp_input_analysis* analysis)
++{
++    if (!ucode || !analysis) return -1;
++    analysis->input_mask = 0;
++    analysis->exact = 1;
++    u32 off = 0;
++    int instrs = 0;
++    int ended = 0;
++    while (off + 16 <= max_bytes) {
++        const u32 d1 = rd_le(ucode + off + 4);
++        const u32 d2 = rd_le(ucode + off + 8);
++        const u32 d3 = rd_le(ucode + off + 12);
++        off += 16;
++        instrs++;
++
++        const u32 vec_op = (d1 >> 22) & 0x1F;
++        const u32 sca_op = (d1 >> 27) & 0x1F;
++        const u32 input_src = (d1 >> 8) & 0xF;
++        const u32 src0 = ((d2 >> 23) & 0x1FF) | ((d1 & 0xFF) << 9);
++        const u32 src1 = (d2 >> 6) & 0x1FFFF;
++        const u32 src2 = ((d3 >> 21) & 0x7FF) | ((d2 & 0x3F) << 11);
++        const u32 sources[3] = {src0, src1, src2};
++        const int vec_writes = ((d3 >> 13) & 0xFu) != 0;
++        const int sca_writes = ((d3 >> 17) & 0xFu) != 0;
++        u32 use = 0;
++        if (vec_writes && vec_op)
++            use |= vec_source_use(vec_op, &analysis->exact);
++        if (sca_writes && sca_op)
++            use |= sca_source_use(sca_op, &analysis->exact);
++        for (u32 source = 0; source < 3; source++)
++            if ((use & (1u << source)) && (sources[source] & 3u) == 2u)
++                analysis->input_mask |= 1u << input_src;
++
++        if (d3 & 1u) {
++            ended = 1;
++            break;
++        }
++    }
++    if (!ended) {
++        analysis->input_mask = 0xFFFFu;
++        analysis->exact = 0;
++        return -1;
++    }
++    if (!analysis->exact)
++        analysis->input_mask = 0xFFFFu;
++    return instrs;
++}
++
++static int rsx_vp_decompile_impl(
++    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
++    u32 input_mask, char* out, u32 out_size);
++
+ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
++{
++    return rsx_vp_decompile_ex(ucode, max_bytes, 0u, out, out_size);
++}
++
++int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
++                        char* out, u32 out_size)
++{
++    return rsx_vp_decompile_impl(
++        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, out, out_size);
++}
++
++int rsx_vp_decompile_compact_ex(
++    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
++    char* out, u32 out_size)
++{
++    rsx_vp_input_analysis analysis;
++    if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 ||
++        !analysis.exact ||
++        (analysis.input_mask & ~(input_mask & 0xFFFFu)) != 0)
++        input_mask = 0xFFFFu;
++    else
++        input_mask = analysis.input_mask;
++    return rsx_vp_decompile_impl(
++        ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
++}
++
++static int rsx_vp_decompile_impl(
++    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
++    u32 input_mask, char* out, u32 out_size)
+ {
+     if (!ucode || !out || out_size < 256) return -1;
+ 
+@@ -212,6 +333,16 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+             case 0x14: snprintf(rhs,sizeof rhs,"(float4)((%s)!=(%s))",A,B); break; /* SNE */
+             case 0x15: snprintf(rhs,sizeof rhs,"float4(1,1,1,1)"); break;      /* STR */
+             case 0x16: snprintf(rhs,sizeof rhs,"sign(%s)",A); break;           /* SSG */
++            case 0x19: {
++                const u32 tex_unit = (d2 >> 8) & 3u;
++                if ((vtex_mask >> tex_unit) & 1u)
++                    snprintf(rhs, sizeof rhs,
++                        "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xy, 0.0)",
++                        tex_unit, tex_unit, A);
++                else
++                    snprintf(rhs, sizeof rhs, "float4(0,0,0,0)");
++                break;
++            }
+             case 0x0D: /* ARL: address register load, rounds down */
+                 if (vmx|vmy|vmz|vmw) {
+                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
+@@ -236,22 +367,11 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+                 snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
+                          rhs, saturate ? " _v = saturate(_v);" : "");
+                 emit(&b, line);
+-                /* The output register o[dst_out] receives the VEC result when
+-                 * vec_result selects the VEC unit OR when the SCA unit is idle
+-                 * (no SCA op) so nothing else can claim the output. The old code
+-                 * wrote o[] only on vec_result==1, so a VEC op targeting an
+-                 * output with vec_result==0 and no paired SCA -- exactly how
+-                 * vkcube's VP writes HPOS (o[0]) and the colours -- was dropped
+-                 * as "CC-only", leaving o[0]=(0,0,0,1) so every vertex collapsed
+-                 * to the origin (black cube). cellmark's VP either sets
+-                 * vec_result or pairs a SCA op, so it is unaffected. */
+-                int _sca_active = (smx|smy|smz|smw) && sca_op != 0x00;
+-                int _wrote_o = (dst_out != 0x1F) && (vec_result || !_sca_active);
+-                if (_wrote_o)
++                if (vec_result && dst_out != 0x1F)
+                     emit_store(&b, "o[%u]", dst_out & 15, m);
+                 if (dst_tmp != 0x3F)
+                     emit_store(&b, "r[%u]", dst_tmp & 31, m);
+-                if (!_wrote_o && dst_tmp == 0x3F)
++                if (!vec_result && dst_tmp == 0x3F)
+                     emit(&b, "        /* TODO: CC-only write not modeled */\n");
+                 emit(&b, "    }\n");
+             }
+@@ -306,15 +426,30 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+ 
+     /* ---- assemble full shader ---- */
+     Out o = { out, out_size, 0, 0 };
++    if (!compact_inputs) {
++        emit(&o,
++            /* All 16 RSX vertex attributes arrive as float4 (the harness
++             * fetches and converts them on the CPU). */
++            "struct VSInput {\n"
++            "    float4 a0:ATTR0;  float4 a1:ATTR1;  float4 a2:ATTR2;  float4 a3:ATTR3;\n"
++            "    float4 a4:ATTR4;  float4 a5:ATTR5;  float4 a6:ATTR6;  float4 a7:ATTR7;\n"
++            "    float4 a8:ATTR8;  float4 a9:ATTR9;  float4 a10:ATTR10; float4 a11:ATTR11;\n"
++            "    float4 a12:ATTR12; float4 a13:ATTR13; float4 a14:ATTR14; float4 a15:ATTR15;\n"
++            "};\n");
++    } else {
++        emit(&o, "struct VSInput {\n");
++        if (!(input_mask & 0xFFFFu))
++            emit(&o, "    uint vertex_id:SV_VertexID;\n");
++        for (u32 attr = 0; attr < 16; attr++) {
++            if (!(input_mask & (1u << attr))) continue;
++            char declaration[64];
++            snprintf(declaration, sizeof(declaration),
++                     "    float4 a%u:ATTR%u;\n", attr, attr);
++            emit(&o, declaration);
++        }
++        emit(&o, "};\n");
++    }
+     emit(&o,
+-        /* All 16 RSX vertex attributes arrive as float4 (the harness fetches
+-         * and converts them on the CPU). */
+-        "struct VSInput {\n"
+-        "    float4 a0:ATTR0;  float4 a1:ATTR1;  float4 a2:ATTR2;  float4 a3:ATTR3;\n"
+-        "    float4 a4:ATTR4;  float4 a5:ATTR5;  float4 a6:ATTR6;  float4 a7:ATTR7;\n"
+-        "    float4 a8:ATTR8;  float4 a9:ATTR9;  float4 a10:ATTR10; float4 a11:ATTR11;\n"
+-        "    float4 a12:ATTR12; float4 a13:ATTR13; float4 a14:ATTR14; float4 a15:ATTR15;\n"
+-        "};\n"
+         "struct VSOutput {\n"
+         "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+         "    float4 fog:FOG;\n"
+@@ -328,13 +463,39 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+         "    float4 vp_c[512];\n"
+         "    float4 vp_posscale;\n"
+         "    float4 vp_posoffset;\n"
+-        "};\n"
+-        "VSOutput main(VSInput input) {\n"
+-        "    float4 v[16];\n"
+-        "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
+-        "    v[4]=input.a4;  v[5]=input.a5;  v[6]=input.a6;  v[7]=input.a7;\n"
+-        "    v[8]=input.a8;  v[9]=input.a9;  v[10]=input.a10; v[11]=input.a11;\n"
+-        "    v[12]=input.a12; v[13]=input.a13; v[14]=input.a14; v[15]=input.a15;\n"
++        "};\n");
++
++    for (u32 vtu = 0; vtu < 4; vtu++) {
++        if (!((vtex_mask >> vtu) & 1u)) continue;
++        char decl[128];
++        snprintf(decl, sizeof(decl),
++            "Texture2D rsx_vtex%u : register(t%u);\n"
++            "SamplerState rsx_vsamp%u : register(s%u);\n",
++            vtu, 16u + vtu, vtu, vtu);
++        emit(&o, decl);
++    }
++
++    emit(&o, "VSOutput main(VSInput input) {\n");
++    if (!compact_inputs) {
++        emit(&o,
++            "    float4 v[16];\n"
++            "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
++            "    v[4]=input.a4;  v[5]=input.a5;  v[6]=input.a6;  v[7]=input.a7;\n"
++            "    v[8]=input.a8;  v[9]=input.a9;  v[10]=input.a10; v[11]=input.a11;\n"
++            "    v[12]=input.a12; v[13]=input.a13; v[14]=input.a14; v[15]=input.a15;\n");
++    } else {
++        emit(&o,
++            "    float4 v[16];\n"
++            "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n");
++        for (u32 attr = 0; attr < 16; attr++) {
++            if (!(input_mask & (1u << attr))) continue;
++            char assignment[64];
++            snprintf(assignment, sizeof(assignment),
++                     "    v[%u]=input.a%u;\n", attr, attr);
++            emit(&o, assignment);
++        }
++    }
++    emit(&o,
+         "    float4 r[32]; float4 o[16];\n"
+         "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
+         "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
+diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
+index 0221f4f..daffacd 100644
+--- a/libs/video/rsx_vp_decompiler.h
++++ b/libs/video/rsx_vp_decompiler.h
+@@ -25,6 +25,18 @@ extern "C" {
+  * including the one with the D3.end bit, bounded by max_bytes. 0 if none. */
+ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
+ 
++typedef struct rsx_vp_input_analysis {
++    u32 input_mask;
++    int exact;
++} rsx_vp_input_analysis;
++
++/* Report the guest input registers statically read by the program.  `exact`
++ * is zero and input_mask is 0xFFFF when an unsupported opcode/control-flow
++ * construct makes the result unsafe to narrow.  Returns the instruction
++ * count, or -1 for invalid/non-terminated input. */
++int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
++                          rsx_vp_input_analysis* analysis);
++
+ /* Decompile an NV40 vertex program into an HLSL vertex shader.
+  *   ucode    : VP bytecode (little-endian words, as in RPCS3's shader cache).
+  *   max_bytes: safety bound.
+@@ -36,9 +48,24 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes);
+  * vp_posoffset (the RSX viewport transform mapped to D3D clip space; the
+  * caller computes them per draw), SV_Position + COLOR0/1 + FOG + TEXCOORD0..7
+  * varyings routed per the NV40 output register map (o0/o1/o2/o5/o7..o14).
+- * Not modeled: condition-code tests, flow control (BRA/CAL/...), TXL. */
++ * Not modeled: condition-code tests and flow control (BRA/CAL/...). TXL is
++ * stubbed to zero unless rsx_vp_decompile_ex receives a bound-unit mask. */
+ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
+ 
++/* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
++ * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
++ * Unmasked units retain the defined-zero fallback. */
++int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
++                        char* out, u32 out_size);
++
++/* Compact-input variant.  The generated VSInput declares only the original
++ * ATTRn semantics selected by input_mask.  The mask is checked against a
++ * fresh static analysis; any uncertainty or missing referenced bit falls
++ * back to all 16 inputs. */
++int rsx_vp_decompile_compact_ex(
++    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
++    char* out, u32 out_size);
++
+ /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
+ const char* rsx_vp_vec_name(u32 op);
+ const char* rsx_vp_sca_name(u32 op);
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index 886fbc7..9205301 100644
 --- a/runtime/ppu/ppu_fs.cpp

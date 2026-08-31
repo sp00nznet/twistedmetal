@@ -1483,6 +1483,80 @@ TM_LOADDONE=140              release the load-complete byte the cinema re-clears
 TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
 ```
 
+### Porting the live NV4097→D3D12 engine
+
+The generic `rsx_d3d12_backend.c` is, in its author's own words, a placeholder
+shader path. Rubber Ducky renders through it because it asks very little of it.
+Getting a Scaleform UI on screen means bringing across the engine that does
+render — caner's (canersaka) live path from
+[Yakuza-Dead-Souls-EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX),
+MIT, with this project as copyright holder and game-independent fixes
+explicitly prepared for upstream.
+
+Ported into `libs/video/`:
+
+```
+rsx_dispatch.c/.h        NV4097 method dispatcher + register model (clean-room,
+                         documented against envytools rnndb nv30-40_3d, Mesa
+                         nv30 and psdevwiki)
+rsx_live_draw.c/.h       the live engine: PSO cache, vertex/index decode,
+                         primitive restart, RT-as-texture, texture decode and
+                         remap, per-draw constants, full raster state, fences
+rsx_vertex_compact.c/.h  vertex stream compaction
+rsx_restart_cuts.h
+```
+
+Its shader translators are newer than this tree's, so `rsx_fp_decompiler`,
+`rsx_vp_decompiler` and `rsx_vertex_formats.h` were taken with them. Two
+functions this tree adds and his does not — `rsx_fp_extract_consts` and
+`rsx_fp_code_hash`, both used by the old backend — are appended to the new
+decompiler rather than lost, and `rsx_fp_decompile`'s signature change (third
+parameter is now `SET_SHADER_CONTROL`, not an exports-32 flag) is absorbed at
+the one call site.
+
+Three adaptations were needed to make it title-agnostic:
+
+- **`rsx_live_draw_config.c`** supplies the Yakuza runner's state the engine
+  reads — a config snapshot and three A010 debug flags — all zero, so every
+  Yakuza-specific path is off.
+- **Opt-in.** Upstream defaults the engine ON because that runner has no other
+  renderer. Here it must be asked for: `RSX_LIVE_DRAW=1` (his `YZ_RSX_DRAW`
+  still works).
+- **Presentation.** Upstream self-presents when it sees flip method `0xE944`,
+  which his README notes was established empirically from Yakuza. This title
+  flips through a different path, so presentation is driven from the same ~60Hz
+  tick that used to drive the D3D12 backend.
+
+`rsx_null_backend` gained `get_hwnd` and `suppress_present` (ported from his
+fork) so the engine can bind a swap chain to the window the null backend opens
+and silence the GDI blit underneath it.
+
+#### Where it stands
+
+The engine is up, fed and presenting:
+
+```
+[rsx] live-draw engine up (D3D12); GDI present suppressed
+[live] frames=2696 last_draws=0
+[RSX] CLEAR_SURFACE mask=0xF0 color=0x00000000
+[live-draw] frame 3 ... clears[guest=1 ...] groups[seen=0 exec=0 ...]
+```
+
+Frames advance, the method stream reaches it, and it processes the guest's
+clears. **No draw groups form** (`groups[seen=0]`), so nothing is drawn yet. Its
+own telemetry localises that precisely: over 150 seconds the feed carries
+~16,375 `VERTEX_BEGIN_END` (0x1808) but only **4** `DRAW_ARRAYS` (0x1814) and no
+index batches, so the begin/end pairs are arriving without the batch method that
+would turn them into geometry. That is the next thing to chase, and the engine's
+`[live-draw]` counters — packets, groups, drop reasons, clears, textures — are
+the right instrument for it.
+
+Two other things it reports that will need wiring: it falls back with *"flip 0
+has no registered/rendered scanout"* because `rsx_live_draw_set_display_buffer`
+is never called from this tree's `cellGcmSetDisplayBuffer`, and its target reads
+`clip=0,0+720x480` — the video-out mode rather than the 1280x704 surfaces the
+title actually renders into.
+
 ### What caner's Yakuza fork says about the renderer
 
 [canersaka/Yakuza-Dead-Souls-EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)
