@@ -1483,6 +1483,43 @@ TM_LOADDONE=140              release the load-complete byte the cinema re-clears
 TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
 ```
 
+### Is anything actually visible?
+
+No. Nothing has been shown on screen, and a run still presents a black window.
+The decoded intro frame elsewhere in this file came out of the decoder before it
+reached the RSX — it proves H.264 decoding, and nothing about display.
+
+Two corrections to earlier claims in this file.
+
+**Some readbacks measured the wrong surface.** At 40 seconds the draws target
+render target `0x01BE0000`; the dumps taken at that point were of `0x00AB0000`,
+which receives only *clears* then. "The render target reads back black" was
+therefore partly a statement about a surface nothing was drawing to.
+`0x00AB0000` is the right target later, at the menu — the two are not
+interchangeable and were treated as if they were.
+
+**There is now intermittent non-black output, and it has not been proven to be
+a draw.** With `GCM_SUBCH1_3D=1`, readbacks of `0x01BE0000` around 55-58 seconds
+twice came back with exactly 25.00% of the surface pure white — and 25% of
+1280x704 is precisely the 640x352 draw viewport. The same readback without the
+fix is uniformly black. But it is a transient: repeated captures at 50, 52, 55
+and 58 seconds mostly return black, and the one control that would settle it —
+the same moment with `FP_OFF=1` to remove the draws — did not reproduce the
+white in its own baseline, so it decided nothing. A clear is scissored to the
+viewport too, so viewport-shaped white is not by itself proof of a draw.
+Forcing the clear colour green (`CLEAR_RGB=0,0.25,0`) left the white white, but
+also left the surrounding clear black rather than green, so that override was
+not reaching this surface and the test is not conclusive either.
+
+What can be said: before the subchannel fix every draw ran a one-instruction
+program whose constant was sixteen zero bytes, so black was the arithmetically
+correct output. After it the title's real shaders reach the renderer, and
+non-black pixels appear in exactly the right rectangle at least sometimes.
+Whether they are draws, and why they do not persist, needs the GPU hang fixed
+first — the device is removed between 40 and 68 seconds, which is both why the
+menu can never be sampled and why every attempt here is a race against a
+closing window.
+
 ### Why everything renders black: one fragment program
 
 The menu draws 100,816 textured quads with a live glyph atlas into a render
