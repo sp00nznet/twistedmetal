@@ -173,6 +173,7 @@ extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" int  cellGcm_take_flip_pending_synced(void);
 
 /* Live NV4097->D3D12 engine (libs/video/rsx_live_draw.c, from caner /
  * canersaka's Yakuza: Dead Souls port). Selected with RSX_LIVE_DRAW=1. It
@@ -195,6 +196,7 @@ extern "C" void     rsx_live_draw_flush(void);
 extern "C" void     rsx_live_draw_present(uint32_t buffer_id);
 extern "C" int      rsx_live_draw_debug_dump_surface(uint32_t location, uint32_t offset,
                                                     const char* path);
+extern "C" void     rsx_live_draw_a010_probe_begin(void);
 
 /* Resolve (location, offset) to host memory for the engine. location 0 is RSX
  * local VRAM, 1 is main/IO memory; the engine promises its callers the whole
@@ -239,6 +241,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                                              tm_live_guest_ptr, nullptr);
             if (r == 0) {
                 rsx_null_backend_suppress_present(1);
+                /* YZ_RSX_A010_PROBE=1 turns on the engine's own periodic surface
+                 * readback. It samples from inside the frame, after the draws and
+                 * before the next clear, which is the timing every hand-rolled
+                 * dump from the ticker kept getting wrong. */
+                if (getenv("YZ_RSX_A010_PROBE")) rsx_live_draw_a010_probe_begin();
                 fprintf(stderr, "[rsx] live-draw engine up (D3D12); GDI present suppressed\n");
             } else {
                 fprintf(stderr, "[rsx] live-draw init FAILED (%d) -- GDI present only\n", r);
@@ -297,31 +304,57 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                  * there is nothing to drive from here when it owns the window. */
                 if (!live) rsx_d3d12_backend_present();
                 else {
-                    /* Upstream the engine self-presents when it sees the guest's
-                     * flip method (0xE944, established from Yakuza). This title
-                     * flips through a different path, so drive presentation on
-                     * the same ~60Hz tick that used to drive the D3D12 backend. */
-                    rsx_live_draw_present(0);
+                    /* Present on the GUEST's flip, not on our tick. Upstream
+                     * self-presents on flip method 0xE944 (established from
+                     * Yakuza); this title flips elsewhere, and presenting every
+                     * 60Hz tick showed whatever the surface happened to hold --
+                     * usually a freshly cleared one, which is why every dump came
+                     * back as a flat clear colour while 73k groups were drawing.
+                     * take_flip_pending_synced() is true only once the drain has
+                     * consumed everything up to put, i.e. the FIFO holds exactly
+                     * one completed frame. */
+                    const int flipped = cellGcm_take_flip_pending_synced();
+                    /* Dump BEFORE presenting. At this point the FIFO has been
+                     * drained to put, so the frame's draws are complete and the
+                     * next frame has not cleared anything yet -- every earlier
+                     * sample was taken after the present and read a surface the
+                     * guest had already begun reusing. */
+                    if (flipped) {
+                      static int armed = -1; static uint32_t secs = 0;
+                      static int done = 0; static ULONGLONG t0 = 0;
+                      if (armed < 0) { const char* e = getenv("TM_LIVE_DUMP");
+                          armed = e ? 1 : 0;
+                          secs = e ? (uint32_t)strtoul(e, nullptr, 0) : 0; }
+                      /* Count flips rather than seconds: the guest stalls at an
+                       * unpredictable point and a wall-clock deadline kept
+                       * landing after flips had already stopped. TM_LIVE_DUMP is
+                       * now "dump on the Nth presented frame that carried
+                       * geometry". */
+                      /* TM_LIVE_DUMP=<n>: dump the first presented frame that
+                       * carried at least n draws. Wall-clock deadlines kept
+                       * landing after the guest had stopped flipping, and a flip
+                       * count caught frames with a single draw in them. */
+                      (void)t0;
+                      if (armed && !done && rsx_live_draw_get_last_draws() >= (secs ? secs : 1u)) {
+                          done = 1;
+                          static const uint32_t offs[] = {
+                              0x00AB0000u, 0x00AB1400u, 0x01BE0000u, 0x01F50000u,
+                              0x01F51400u, 0x01870000u, 0x01190000u, 0x00010000u };
+                          fprintf(stderr, "[live] pre-present dump (last_draws=%u)\n",
+                                  rsx_live_draw_get_last_draws());
+                          for (unsigned k = 0; k < sizeof offs / sizeof offs[0]; k++) {
+                              char path[64];
+                              snprintf(path, sizeof path, "surf_%08X.ppm", offs[k]);
+                              rsx_live_draw_debug_dump_surface(0, offs[k], path);
+                          }
+                          fflush(stderr);
+                      } }
+                    if (flipped) rsx_live_draw_present(0);
                     /* TM_LIVE_DUMP=<secs>,<hex offset>: ask the engine to write
                      * one of its tracked surfaces out, so "is it drawing" is
                      * answerable from its own resources rather than a readback
                      * of the generic backend that is not even running. */
-                    { static int armed = -1; static uint32_t off = 0, secs = 0;
-                      static int done = 0;
-                      if (armed < 0) { const char* e = getenv("TM_LIVE_DUMP");
-                          armed = e ? 1 : 0;
-                          if (e) { secs = (uint32_t)strtoul(e, nullptr, 0);
-                                   const char* c = strchr(e, 44);
-                                   off = c ? (uint32_t)strtoul(c + 1, nullptr, 16) : 0x10000u; } }
-                      if (armed && !done) {
-                          static ULONGLONG t0 = 0;
-                          if (!t0) t0 = GetTickCount64();
-                          if (GetTickCount64() - t0 >= (ULONGLONG)secs * 1000) {
-                              done = 1;
-                              const int r = rsx_live_draw_debug_dump_surface(0, off, "live_surface.bmp");
-                              fprintf(stderr, "[live] dump surface loc0:0x%08X -> %d\n", off, r);
-                              fflush(stderr);
-                          } } }
+
                     /* Is the engine actually receiving the stream? Frames only
                      * advance when it sees a flip; draws only when geometry
                      * reaches it. Both zero means the feed is not connected. */

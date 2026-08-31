@@ -1608,6 +1608,50 @@ That is the next thing to chase, and it is a good place to be: the question has
 moved from "why is everything black" to "why do most begin/end pairs carry no
 batch", which the engine's own counters can answer.
 
+#### Visible geometry
+
+```
+[live] pre-present dump (last_draws=535)
+surf_00AB0000.ppm   1280x704  distinct=2  non-dark=49.93%
+                              (255,255,255) x112490   (0,0,0) x112790
+```
+
+A large white polygon covering the lower half of the surface with a clean
+slanted edge. Not a clear — a clear is uniform, and every earlier dump was
+`distinct=1`. Geometry from the title's own draw stream is rasterising with a
+working vertex transform.
+
+Two things were wrong, and both were about *when*, not *what*.
+
+**Presenting on the wrong clock.** Presentation was being driven from the 60Hz
+ticker, independent of the guest. `cellGcm_take_flip_pending_synced()` is true
+only once the drain has consumed everything up to `put` — i.e. the FIFO holds
+exactly one completed frame — so presenting on that instead took
+`last_draws` from **0 to 910**. Before this, every presented frame was one the
+guest had not finished.
+
+**Sampling on the wrong clock too.** Every surface dump was taken after the
+present, by which point the guest had begun the next frame and cleared. That is
+why surfaces kept reading back as flat clear colours — `0x00AB0000` as
+`(253,98,98)`, `0x01BE0000` as `(16,164,0)` — which looked like "the clears work
+and nothing draws" when it was really "you are looking between frames". Dumping
+*before* the present, on a frame carrying real geometry, shows the geometry.
+
+Getting the trigger right took several attempts worth recording, because each
+failure looked like a black surface rather than a missed sample: a wall-clock
+deadline lands after the guest has stopped flipping; a flip counter catches
+frames holding a single draw. What works is "dump the first presented frame that
+carried at least N draws" — `TM_LIVE_DUMP=250`.
+
+The per-draw CSV (`YZ_RSX_DRAW_CSV=draws.csv`) says the pipeline state is sound:
+**16,937 draws, every one `outcome=execute`**, 16,498 of them into `0x00AB0000`,
+colour mask `0x01010101`, viewport 1280x704, vertex counts of 66/30/48/21/57 —
+no drops for fetch, degenerate primitives, PSO or ring exhaustion.
+
+What is still wrong is shading: the geometry is flat white rather than textured
+UI art. That is the next thing — the geometry, the transform, the surfaces and
+the frame timing are now all doing what they should.
+
 ### What caner's Yakuza fork says about the renderer
 
 [canersaka/Yakuza-Dead-Souls-EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)

@@ -88,3 +88,7 @@ scratch/
 
 live_surface.bmp
 live_surface.png
+
+surf_*.ppm
+geometry.png
+draws.csv
