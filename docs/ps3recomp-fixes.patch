@@ -1,5 +1,5 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 23e7f94..69f1b50 100644
+index 23e7f94..f7b79f4 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -566,9 +566,28 @@ static atomic_int s_gcm_pending = 0;
@@ -133,7 +133,7 @@ index 23e7f94..69f1b50 100644
                s_fifo_calloff = s_fifo_getoff + 4;
                s_fifo_getoff  = tgt; }
              continue;
-@@ -1200,11 +1284,71 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1200,11 +1284,85 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                    k << 2, hist[k], tot[k], 10);
                    }
                } }
@@ -200,13 +200,27 @@ index 23e7f94..69f1b50 100644
 +                          printf("[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X%c",
 +                                 subch, h, 10); fflush(stdout);
 +                      } } }
-+                static int s1_3d = -1;
-+                if (s1_3d < 0) { const char* e = getenv("GCM_SUBCH1_3D"); s1_3d = e ? atoi(e) : 0; }
-+                if (subch == 0 || (s1_3d && subch == 1)) {
++                /* The subchannel is a binding slot, not an engine selector: a
++                 * title may bind NV4097 to something other than subchannel 0.
++                 * Twisted Metal uses subchannel 1, and caner (canersaka) hit
++                 * the same thing in Yakuza Dead Souls, where SPU-built command
++                 * lists bind NV4097 elsewhere -- his rsx_live_draw.c masks the
++                 * subchannel out of the method for exactly this reason.
++                 *
++                 * gcm_2d_method only ever handles subchannels 2..7 (NV3062,
++                 * NV308A/NV309E, NV3089), so anything arriving on 1 was being
++                 * dropped on the floor -- for this title that included
++                 * SET_SHADER_PROGRAM, leaving one stale fragment program bound
++                 * for every draw in the game. Treat the subchannels the 2D path
++                 * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
++                 */
++                static int s1_2d = -1;
++                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
++                if (subch == 0 || (subch == 1 && !s1_2d)) {
                      rsx_process_method(&s_state, m, vm_read32(dea));
                      /* NV406E_SET_REFERENCE: queue the fence value for PACED
                       * publication (gcm_ref_publish below) instead of letting a
-@@ -1221,6 +1365,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1221,6 +1379,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
          s_fifo_getoff += 4;                    /* unknown word: skip */
      }
  

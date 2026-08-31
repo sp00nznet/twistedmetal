@@ -1483,6 +1483,63 @@ TM_LOADDONE=140              release the load-complete byte the cinema re-clears
 TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
 ```
 
+### What caner's Yakuza fork says about the renderer
+
+[canersaka/Yakuza-Dead-Souls-EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)
+is a fork of ps3recomp carrying a playable Yakuza: Dead Souls port. It is MIT
+licensed and its copyright line is this project's own, and its README states
+that game-independent fixes are prepared for submission upstream — so reading
+and adopting from it is clean, with credit.
+
+Two things from it matter here.
+
+**The subchannel bug is confirmed, and it is not title-specific.**
+`rsx_live_draw.c` masks the subchannel out of every method before dispatch:
+
+```c
+const u32 canonical = method & 0x1FFCu;   /* sub = (method >> 13) & 7 */
+```
+
+with the comment that *"if an SPU-built command list binds NV4097 on a different
+subchannel, feeding the raw 0x2xxx-shifted method into the canonical dispatcher
+silently stores the state in the wrong register bank."* That is exactly the
+defect found here independently: the subchannel is a **binding slot, not an
+engine selector**. Our `gcm_2d_method` only ever claims subchannels 2..7, so
+everything Twisted Metal issued on subchannel 1 — `SET_SHADER_PROGRAM` included
+— was dropped, leaving one stale fragment program bound for every draw in the
+game.
+
+That is now the default rather than an opt-in flag: subchannels the 2D path does
+not claim are treated as 3D. `GCM_SUBCH1_2D=1` restores the old split. Distinct
+fragment programs seen in a boot go from **1 to 14**.
+
+**The bigger point: this backend is not the one that renders.** His README is
+explicit —
+
+> *"The newer live engine is separate from the older generic
+> `rsx_d3d12_backend.c`, which still contains a placeholder shader path."*
+
+He wrote a separate live NV4097-to-D3D12 engine to get Yakuza rendering:
+
+```
+rsx_live_draw.c       8351 lines
+rsx_dispatch.c         516     NV4097 method dispatcher (clean-room, documented
+rsx_vertex_compact.c   351     against envytools rnndb / Mesa nv30 / psdevwiki)
+```
+
+with per-shader PSO caching, guest vertex/index decode, primitive restart and
+strip/fan expansion, render-target-as-texture sampling, texture decode and
+remap, per-draw vertex constants, full blend/depth/stencil/cull/viewport/scissor
+state, and GPU reference fences. None of those files exist in this tree.
+
+That reframes the graphics work here. Rubber Ducky renders through
+`rsx_d3d12_backend.c` because it asks very little of it — and the hardcoded
+subchannel map in `cellGcmSys.c` is, by its own comment, the duck's layout. A UI
+as involved as this title's is past what that backend does. The realistic route
+to a picture is to bring the live engine across rather than keep repairing the
+generic one; the shader translator underneath it is shared and already works,
+which is why the fragment constants recovered here look sane.
+
 ### The subchannel map was tuned for Rubber Ducky
 
 `libs/video/cellGcmSys.c` says so directly, in the NV309E state it keeps:
