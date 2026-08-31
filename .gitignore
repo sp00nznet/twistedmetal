@@ -82,3 +82,6 @@ src/gen/spu_workloads.c
 # decoded video frames dumped by TM_VDEC_DUMP (game content)
 vdec_frame.bmp
 vdec_frame.png
+
+# runtime scratch: live-draw present telemetry and shader cache
+scratch/
