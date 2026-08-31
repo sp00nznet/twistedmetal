@@ -982,7 +982,7 @@ index 3a3e5db..a262594 100644
                          " has_display=%d seen_content=%d -> render_frame=%s\n",
                  s_d3d.draw_count, onscreen, offscreen, clears, has_display,
 diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
-index 253eaca..4118fa2 100644
+index 253eaca..3c98bed 100644
 --- a/libs/video/rsx_fp_decompiler.c
 +++ b/libs/video/rsx_fp_decompiler.c
 @@ -9,25 +9,10 @@
@@ -1052,7 +1052,7 @@ index 253eaca..4118fa2 100644
              if (off + 16 <= max_bytes) off += 16;
          }
          if (w0 & FP_END) return off;
-@@ -129,6 +128,151 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
+@@ -129,6 +128,168 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
      return 0;
  }
  
@@ -1065,6 +1065,22 @@ index 253eaca..4118fa2 100644
 +            FP_REG_TYPE_CONST ||
 +        ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) ==
 +            FP_REG_TYPE_CONST;
++}
++
++unsigned long long g_rsx_fp_nonfinite_constants = 0;
++
++/* An inline fragment constant is never legitimately non-finite.  A NaN one
++ * poisons every pixel the program touches, which on an FP16 HDR target shows
++ * up as a saturated white fill rather than as an obviously broken draw.
++ * Substitute zero and count it so the underlying bad read stays visible. */
++u32 rsx_fp_sanitize_constant_word(u32 w)
++{
++    float f;
++    memcpy(&f, &w, sizeof f);
++    if (f == f && f <= 3.0e38f && f >= -3.0e38f)
++        return w;
++    g_rsx_fp_nonfinite_constants++;
++    return 0;
 +}
 +
 +int rsx_fp_collect_constants(
@@ -1087,7 +1103,8 @@ index 253eaca..4118fa2 100644
 +                return -1;
 +            for (u32 component = 0; component < 4; ++component)
 +                out->values[out->count][component] =
-+                    rsx_fp_read_word(ucode + off + component * 4);
++                    rsx_fp_sanitize_constant_word(
++                        rsx_fp_read_word(ucode + off + component * 4));
 +            out->count++;
 +            off += 16;
 +        }
@@ -1204,7 +1221,7 @@ index 253eaca..4118fa2 100644
  /* Bounded string appender. */
  typedef struct { char* p; u32 cap; u32 len; int ok; } Out;
  
-@@ -185,42 +329,22 @@ static const char* input_expr(u32 input_src)
+@@ -185,42 +346,22 @@ static const char* input_expr(u32 input_src)
  }
  
  /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
@@ -1255,7 +1272,7 @@ index 253eaca..4118fa2 100644
              snprintf(base, sizeof(base), "float4(0,0,0,0)");
      }
  
-@@ -246,81 +370,34 @@ static void dest_mask(u32 op0, char* m)
+@@ -246,81 +387,34 @@ static void dest_mask(u32 op0, char* m)
      m[n] = '\0';
  }
  
@@ -1358,7 +1375,7 @@ index 253eaca..4118fa2 100644
      Out o = { out, out_size, 0, 1 };
  
      /* Preamble: PSInput matches the backend's placeholder layout; temp/half
-@@ -331,58 +408,56 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+@@ -331,58 +425,56 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
          "    float4 fog : FOG;\n"
          "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
          "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
@@ -1452,7 +1469,7 @@ index 253eaca..4118fa2 100644
          off += 16;
          count++;
  
-@@ -391,63 +466,45 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+@@ -391,66 +483,49 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
          u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
          int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
  
@@ -1545,8 +1562,13 @@ index 253eaca..4118fa2 100644
 +            s2.type == FP_REG_TYPE_CONST) {
              if (off + 16 <= max_bytes) {
                  for (int i = 0; i < 4; i++) {
-                     u32 cw = rsx_fp_read_word(ucode + off + i * 4);
-@@ -458,38 +515,21 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+-                    u32 cw = rsx_fp_read_word(ucode + off + i * 4);
++                    u32 cw = rsx_fp_sanitize_constant_word(
++                        rsx_fp_read_word(ucode + off + i * 4));
+                     memcpy(&k[i], &cw, 4);
+                 }
+                 off += 16;
+@@ -458,38 +533,21 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
              has_k = 1;
          }
  
@@ -1597,7 +1619,7 @@ index 253eaca..4118fa2 100644
              if (w0 & FP_END) break;
              continue;
          }
-@@ -510,48 +550,35 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+@@ -510,48 +568,35 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
          case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
          case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
          case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
@@ -1669,7 +1691,7 @@ index 253eaca..4118fa2 100644
          case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
          case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
          case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
-@@ -564,149 +591,389 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
+@@ -564,149 +609,394 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size,
          case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
          case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
          case OP_TEX:
@@ -1935,13 +1957,17 @@ index 253eaca..4118fa2 100644
 +    if (ctrl == RSX_FP_CTRL_AUTO) {
 +        /* No control word (standalone tests): legacy heuristic. */
 +        if (wrote_r0 || !wrote_h0)
-+            out_puts(&o, "    return r[0];\n}\n");
++            out_puts(&o, "    float4 _o = r[0];\n"
++                         "    return (_o == _o) ? _o : (float4)0;\n}\n");
 +        else
-+            out_puts(&o, "    return h[0];\n}\n");
++            out_puts(&o, "    float4 _o = h[0];\n"
++                         "    return (_o == _o) ? _o : (float4)0;\n}\n");
 +    } else if (ctrl & FP_CTRL_32BIT_EXPORTS) {
-+        out_puts(&o, "    return r[0];\n}\n");
++        out_puts(&o, "    float4 _o = r[0];\n"
++                     "    return (_o == _o) ? _o : (float4)0;\n}\n");
 +    } else {
-+        out_puts(&o, "    return h[0];\n}\n");
++        out_puts(&o, "    float4 _o = h[0];\n"
++                     "    return (_o == _o) ? _o : (float4)0;\n}\n");
 +    }
 +    (void)wrote_r0; (void)wrote_h0;
  
@@ -2129,7 +2155,8 @@ index 253eaca..4118fa2 100644
 +        if (has_k) {
 +            if (off + 16 <= max_bytes) {
 +                for (int i = 0; i < 4; i++) {
-+                    u32 cw = rsx_fp_read_word(ucode + off + i * 4);
++                    u32 cw = rsx_fp_sanitize_constant_word(
++                        rsx_fp_read_word(ucode + off + i * 4));
 +                    if (n < max_out) memcpy(&out[n * 4 + i], &cw, 4);
 +                }
 +                off += 16;
@@ -2177,10 +2204,10 @@ index 253eaca..4118fa2 100644
 +    return h;
 +}
 diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
-index e862272..9f5077f 100644
+index e862272..42a3eec 100644
 --- a/libs/video/rsx_fp_decompiler.h
 +++ b/libs/video/rsx_fp_decompiler.h
-@@ -18,6 +18,19 @@
+@@ -18,10 +18,25 @@
  extern "C" {
  #endif
  
@@ -2200,7 +2227,13 @@ index e862272..9f5077f 100644
  /* Read one fragment-program word from guest (PS3) memory: big-endian load
   * followed by a 16-bit half-word swap, yielding a host-order instruction
   * word. The decoder operates on host-order words. */
-@@ -40,22 +53,88 @@ u32 rsx_fp_read_word(const u8* p);
+ u32 rsx_fp_read_word(const u8* p);
++u32 rsx_fp_sanitize_constant_word(u32 w);
++extern unsigned long long g_rsx_fp_nonfinite_constants;
+ 
+ /* Decompile an NV40 fragment program into an HLSL pixel shader.
+  *
+@@ -40,22 +55,88 @@ u32 rsx_fp_read_word(const u8* p);
   *
   * Texture sampling and full input plumbing are partial — see the doc's
   * "Integration TODO". Unhandled opcodes emit a comment and a safe default so
@@ -2303,7 +2336,7 @@ index e862272..9f5077f 100644
  
  /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
   * Useful for disassembly/logging. */
-@@ -71,4 +150,8 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
+@@ -71,4 +152,8 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
  #ifdef __cplusplus
  }
  #endif
