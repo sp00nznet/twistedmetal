@@ -1483,6 +1483,59 @@ TM_LOADDONE=140              release the load-complete byte the cinema re-clears
 TM_SKIP_BANKUNLOAD=1         skip the BRB unload that deadlocks the cinema load
 ```
 
+### The subchannel map was tuned for Rubber Ducky
+
+`libs/video/cellGcmSys.c` says so directly, in the NV309E state it keeps:
+
+> *"Rubber Ducky binds it to the same subchannel this file previously …"*
+
+The FIFO drain sends subchannel 0 to the 3D engine and **everything else** to
+`gcm_2d_method`, whose branches are `2/3` (NV3062), `4/5` (NV308A/NV309E) and
+`6/7` (NV3089). That mapping is one title's layout, and its own comment warns
+the binding is libgcm-version-specific and that `SET_OBJECT` binds are not
+tracked. Twisted Metal drives NV4097 on subchannel **1**, so every 3D method it
+issued there — including `SET_SHADER_PROGRAM` — was handed to the 2D handler and
+dropped. That is why one constant-black program was the only shader the renderer
+ever saw.
+
+With `GCM_SUBCH1_3D=1` the title's real shaders arrive, and so do their
+constants:
+
+```
+[FPK] tex0=0x01870000 fp=0x00FDDC82 k0=(0.996094 0.00389099 1.51992e-05 0)
+[FPK] tex0=0x00F6E680 fp=0x00FDBE82 k0=(0 0 0 1)
+[FPK] tex0=0x00AB0000 fp=0x00FD5D02 k0=(0.0625 0 0 0)  k1=(255 0 0 0)
+[FPK] tex0=0x01870000 fp=0x00FDB882 k0=(2 0 0 0)       k1=(0.5 0 0 0)
+[FPK] tex0=0x01F50000 fp=0x00FDD682 k0=(-3 -0 0 0)     k1=(0 -0 3 0)
+```
+
+Plausible scale/bias constants, and draws now bind a variety of textures
+including render targets sampled as textures — a real UI compositing pipeline
+rather than one stale program.
+
+The principled fix is to read the subchannel-to-engine map from the FIFO instead
+of assuming it. A first attempt at that (`GCM_OBJDBG=1`, logging method 0 as
+`SET_OBJECT`) does not work: the handles it prints are `0x44340000`,
+`0x00040310`, `0x00000001` — not object handles, so method 0 is not decoding as
+`SET_OBJECT` and the FIFO header walk needs work before that route is usable.
+
+### What the profiler says about the hang
+
+`PERF=1` across the moment the UI appears:
+
+```
+[PERF] 59.81 fps | tex 0 calls   | render_frame 0.29s (88%) | guest 0.04s (12%)
+[PERF]  1.27 fps | tex 775 calls | render_frame 6.49s (41%) | pso 764 calls, 1.12s
+                 | guest 9.32s (59%)
+```
+
+The frame cost explodes by two orders of magnitude when the UI starts, with 775
+texture uploads and 764 pipeline-state creations in one interval. But uploads
+are **not** the cost — `tex` is 0.01s for those 775 calls — and capping them
+(`TEX_BUDGET`, added and left off by default) does not stop the TDR. PSO
+creation is 1.12s of CPU. The GPU-side cost is inside `render_frame`, still
+unattributed.
+
 ### Is anything actually visible?
 
 No. Nothing has been shown on screen, and a run still presents a black window.
