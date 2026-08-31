@@ -190,6 +190,7 @@ extern "C" int   rsx_null_backend_pump_messages(void);
 extern "C" void* rsx_null_backend_get_hwnd(void);
 extern "C" void  rsx_null_backend_suppress_present(int on);
 extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
+extern "C" uint32_t cellGcmResolveIO(uint32_t offset);
 extern "C" uint32_t rsx_live_draw_get_frames(void);
 extern "C" uint32_t rsx_live_draw_get_last_draws(void);
 extern "C" void     rsx_live_draw_flush(void);
@@ -206,9 +207,39 @@ static const uint8_t* tm_live_guest_ptr(void* user, uint32_t location,
 {
     (void)user;
     if (!vm_base) return nullptr;
-    const uint32_t ea = cellGcmResolveLocated(location == 0, offset);
-    if (!ea || ea == 0xFFFFFFFFu) return nullptr;
-    if ((uint64_t)ea + min_bytes > 0x100000000ull) return nullptr;
+    /* The engine's `location` comes straight from the RSX DMA context selector,
+     * so it is authoritative -- use it rather than a heuristic.
+     * cellGcmResolveOffset() prefers VRAM for any page the guest ever derived
+     * from a local EA, which is right for a title that keeps its data there and
+     * wrong here: it was mapping this title's MAIN-memory textures into local
+     * memory, where they read as garbage, every decode failed, and the engine
+     * fell back to its 1x1 white texture -- which is exactly the flat white the
+     * geometry came out in. Ask the IO table for main memory. */
+    uint32_t ea;
+    if (location == 0) {
+        ea = cellGcmResolveLocated(1, offset);          /* RSX local VRAM */
+    } else {
+        ea = cellGcmResolveIO(offset);                  /* main, via the IO table */
+        if (!ea) ea = cellGcmResolveLocated(0, offset); /* unmapped: old behaviour */
+    }
+    const bool ok = ea && ea != 0xFFFFFFFFu &&
+                    (uint64_t)ea + min_bytes <= 0x100000000ull;
+    /* TM_LIVE_PTR_DBG=1: the engine falls back to a 1x1 white texture whenever a
+     * resolve fails, so a failing callback and a missing texture look identical
+     * from the picture. Count both sides. */
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("TM_LIVE_PTR_DBG") ? 1 : 0;
+      if (dbg) {
+          static long long okc[2] = {0,0}, failc[2] = {0,0}, n = 0;
+          const int li = (location == 0) ? 0 : 1;
+          if (ok) okc[li]++; else failc[li]++;
+          if ((++n % 100000) == 0)
+              fprintf(stderr, "[ptr] local ok=%lld fail=%lld | main ok=%lld fail=%lld"
+                              " (last loc=%u off=0x%08X n=%u ea=0x%08X)\n",
+                      okc[0], failc[0], okc[1], failc[1],
+                      location, offset, min_bytes, ea), fflush(stderr);
+      } }
+    if (!ok) return nullptr;
     return (const uint8_t*)vm_base + ea;
 }
 
@@ -335,16 +366,23 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                        * landing after the guest had stopped flipping, and a flip
                        * count caught frames with a single draw in them. */
                       (void)t0;
-                      if (armed && !done && rsx_live_draw_get_last_draws() >= (secs ? secs : 1u)) {
-                          done = 1;
+                      /* Sample several qualifying frames, not one: which frame a
+                       * single dump lands on is arbitrary, and a frame whose
+                       * geometry happens to be offscreen looks the same as a
+                       * broken renderer. */
+                      static int shot = 0;
+                      static uint32_t skip = 0;
+                      if (armed && !done && rsx_live_draw_get_last_draws() >= (secs ? secs : 1u)
+                          && (skip++ % 60) == 0) {
+                          if (++shot >= 5) done = 1;
                           static const uint32_t offs[] = {
                               0x00AB0000u, 0x00AB1400u, 0x01BE0000u, 0x01F50000u,
                               0x01F51400u, 0x01870000u, 0x01190000u, 0x00010000u };
-                          fprintf(stderr, "[live] pre-present dump (last_draws=%u)\n",
+                          fprintf(stderr, "[live] dump #%d (last_draws=%u)\n", shot,
                                   rsx_live_draw_get_last_draws());
                           for (unsigned k = 0; k < sizeof offs / sizeof offs[0]; k++) {
                               char path[64];
-                              snprintf(path, sizeof path, "surf_%08X.ppm", offs[k]);
+                              snprintf(path, sizeof path, "surf_%d_%08X.ppm", shot, offs[k]);
                               rsx_live_draw_debug_dump_surface(0, offs[k], path);
                           }
                           fflush(stderr);

@@ -1652,6 +1652,51 @@ What is still wrong is shading: the geometry is flat white rather than textured
 UI art. That is the next thing — the geometry, the transform, the surfaces and
 the frame timing are now all doing what they should.
 
+#### Shading: one fix, and where it still falls short
+
+**Texture memory was resolving to the wrong place.** The engine asks its host to
+translate `(location, offset)`, and `location` comes straight from the RSX DMA
+context selector, so it is authoritative. The callback was answering with
+`cellGcmResolveOffset()`, which *prefers VRAM for any page the guest ever derived
+from a local EA* — a heuristic that is right for a title keeping its data there
+and wrong for this one. Main-memory textures were landing in local memory:
+
+```
+before   loc=1 off=0x0F784780  ->  ea=0xCF784780      (local VRAM)
+after    loc=1 off=0x08BA4800  ->  ea=0x19BA4800      (main, via the IO table)
+```
+
+The callback now honours `location`: local goes to `localAddress + offset`, main
+goes through `cellGcmResolveIO()` — the IO-table-first resolver written for
+exactly this case — and only falls back when the page is unmapped. The
+1024x1024 B8 font atlas at `0x0AB55580` now binds and refreshes every frame:
+
+```
+[tex-refresh] n=1 frame=912 unit-src=0:0x0AB55580 fmt=0xA1 1024x1024
+```
+
+**What is still flat.** Geometry rasterises but comes out untextured white on the
+frames sampled so far. The engine falls back to a 1x1 white texture whenever a
+texture is unavailable, which is exactly that colour, and its cache reports a
+handful of decode failures on formats it does not implement:
+
+```
+[texture-cache] decode failed src=0:0x01BE0000 fmt=0xFA 1280x704 pitch=10240
+[texture-cache] decode failed src=0:0x022D0000 fmt=0xF2 1472x1472 pitch=3072
+[texture-cache] decode failed src=1:0x00FDF280 fmt=0xBF 1024x1
+```
+
+`0xFA` masks to `0x9A` — `W16Z16Y16X16` half-float — and `0x01BE0000` is one of
+the title's own render targets being sampled as a texture. So the UI composites
+through half-float render targets, and that is the format the decoder does not
+cover. `0xF2` and `0xBF` are likewise outside the supported set
+(`B8, A1R5G5B5, A4R4G4B4, R5G6B5, A8R8G8B8, DXT1/23/45, G8B8, DEPTH24_D8`).
+
+Sampling is also frame-dependent: one dump at 535 draws showed the polygon,
+another at 1350 showed nothing, so which frame a single readback lands on
+matters as much as what the renderer does. `TM_LIVE_DUMP=<n>` now samples up to
+five qualifying frames rather than one.
+
 ### What caner's Yakuza fork says about the renderer
 
 [canersaka/Yakuza-Dead-Souls-EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)
