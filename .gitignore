@@ -92,3 +92,11 @@ live_surface.png
 surf_*.ppm
 geometry.png
 draws.csv
+
+# Local capture runs, alternate build trees, lift backups, SPU job dumps (game-derived)
+cap_*/
+build-*/
+spu_miss/
+src/recomp.bak-*/
+src/spu_gen.bak-*/
+src/gen/*.bak-*

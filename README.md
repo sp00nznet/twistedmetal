@@ -47,17 +47,26 @@ that read back as flat clear colours were being taken between frames.
 | SPU lifting | **done** — all 11 lifted and registered; dispatch hits |
 | PPU lifting | **done** — 35,635 functions emitted, 4.47 M lines of C++ |
 | Build & link | **done** — 106 MB x86-64 exe, clang-cl 21 + Ninja, 6 warnings |
-| Boot | **runs the front end** — 186 files opened, audio middleware up, Scaleform UI loaded |
+| Boot | **reaches the match** — front end, menus, vehicle select, suburbs match with six opponents |
 | Asset decompression | **works on the host** — 192 MB, ~1.8 ms per 64 KB block |
-| Front end | **starts** — Scaleform UI loads, `UiLegal_1::onEnter` reached |
-| Graphics (RSX → D3D12) | **rasterises** — the title's own geometry draws through the live NV4097 engine, presented on the guest's flip |
+| Front end | **playable path** — legal, attract, menus and loading driven by a scripted pad |
+| Graphics (RSX → D3D12) | **in-match HUD renders** — menus at full brightness; the 3D world and post-FX do not draw yet |
+| SPURS jobs | **run** — all 15 JobQueue job binaries lifted, and the JOBCRT start-up fixed so they reach `main` |
 | Audio / input | **audio initialises** — BoomRangBuss 1.0.33, banks load; input not started |
 
 ## Where it stops
 
-Attract mode and the intro video are the live frontier — the title's `st_intro.avi`
-decodes through an H.264 Media Foundation transform, and the menu's textures are
-confirmed good. What is on screen is still short of a playable front end.
+The match runs, and its HUD draws, but the world does not. The chain behind
+that, from the culling jobs that never ran through the Edge geometry ring to
+the post-FX tasks that never start, is in
+**[docs/in-match.md](docs/in-match.md)**. The live blocker is an unregistered
+cellSpurs import (NID 0x7FDF4FEF) in the post-FX library init. Because of it
+the post-FX tasks are never created, and the RSX waits forever on the frame
+label they release.
+
+This build links the runtime branch
+[`ydkj-master-bringup`](https://github.com/sp00nznet/ps3recomp/tree/ydkj-master-bringup)
+of ps3recomp, which carries every runtime fix the port needed.
 
 ## The working log
 
@@ -68,6 +77,7 @@ summary. They live in [`docs/`](docs/):
 - **[Boot bring-up](docs/bringup.md)** — the FIOS deadlock, SPURS, the lifter boundary bug that was the real blocker, and two filesystem bugs that went back upstream.
 - **[Getting the first pixels](docs/first-pixels.md)** — Edge Zlib on the SPU, an RSX parked and never released, and the discovery that the draws had been rendering the whole time.
 - **[The live engine, and the movie path](docs/live-engine-and-movies.md)** — porting caner's engine into this tree, the one fragment program that made everything render black, and the road to attract mode.
+- **[Into the match](docs/in-match.md)** — the HUD in a running match, the SPU jobs that failed before `main`, the Edge geometry ring, and the post-FX frame label.
 - **[Reference notes](docs/reference.md)** — the title's own config, video modes, recovering names without a symbol table, the demo disc.
 
 ## Reproducing the analysis
@@ -145,6 +155,7 @@ twistedmetal/
 │   ├── bringup.md           # boot: FIOS, SPURS, the lifter boundary bug
 │   ├── first-pixels.md      # Edge Zlib, the parked RSX, the first geometry
 │   ├── live-engine-and-movies.md
+│   ├── in-match.md          # the match, SPURS jobs, Edge ring, post-FX label
 │   ├── reference.md         # config, video modes, names without symbols
 │   └── ps3recomp-fixes.patch      # runtime fixes this build needs
 ├── data/keys               # your scetool key file (gitignored)

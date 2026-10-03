@@ -189,10 +189,14 @@ def check_elf(elf, entry, log=print):
     ok = elf[:4] == b'\x7fELF'
     phoff, phnum = struct.unpack('>Q', elf[0x20:0x28])[0], struct.unpack('>H', elf[0x38:0x3A])[0]
     file_off = None
+    vaddr_end = 0
     for i in range(phnum):
         p_type, _, p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack(
             '>IIQQQQQQ', elf[phoff + i * 0x38:phoff + (i + 1) * 0x38])
-        if p_type == 1 and p_vaddr <= entry < p_vaddr + p_filesz:
+        if p_type != 1:
+            continue
+        vaddr_end = max(vaddr_end, p_vaddr + p_filesz)
+        if p_vaddr <= entry < p_vaddr + p_filesz:
             file_off = p_offset + (entry - p_vaddr)
     if file_off is None:
         log('  FAIL: entry point is not inside any PT_LOAD segment')
@@ -203,7 +207,9 @@ def check_elf(elf, entry, log=print):
     # noise here.
     func, toc = struct.unpack('>II', elf[file_off:file_off + 8])
     log(f'  entry {entry:#x} -> OPD func={func:#x} toc={toc:#x}')
-    return ok and 0 < func < 0x1000000 and 0 < toc < 0x1000000
+    # Bound by the image's own load extent, not a fixed size: a 40 MB EBOOT
+    # (Sonic Unleashed) has a TOC well past any constant we could pick.
+    return ok and 0 < func < vaddr_end and 0 < toc < vaddr_end
 
 
 def selftest():

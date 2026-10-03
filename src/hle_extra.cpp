@@ -101,6 +101,11 @@ static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx);
 static void probe_cellSpursSendSignal(ppu_context* ctx);
 static void probe_cellGcmGetFlipStatus(ppu_context* ctx);
 static void probe_EventFlagWait(ppu_context* ctx);
+static void tm_jq_push_job(ppu_context* ctx);
+extern "C" ppu_context* g_tm_postfx_ctx;   /* TEMP: SpuPostFX thread (generated code) */
+#pragma comment(linker, "/alternatename:g_tm_postfx_ctx=?g_tm_postfx_ctx@@3PEAUppu_context@@EA")
+static void tm_jq_sync(ppu_context* ctx);
+static void tm_probe_spurs_unk(ppu_context* ctx);
 
 extern "C" void tm_vdec_register(void);   /* src/vdec_hle.cpp */
 
@@ -131,6 +136,10 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0xE0A6DBE4u, "_cellSpursSendSignal", probe_cellSpursSendSignal);
     ps3_hle_register_ctx(0x72A577CEu, "cellGcmGetFlipStatus", probe_cellGcmGetFlipStatus);
     ps3_hle_register_ctx(0x373523D4u, "cellSpursEventFlagWait", probe_EventFlagWait);
+    ps3_hle_register_ctx(0x90E392CFu, "cellSpursJq push job", tm_jq_push_job);
+    ps3_hle_register_ctx(0x9396BE1Du, "cellSpursJq sync", tm_jq_sync);
+    ps3_hle_register_ctx(0x7FDF4FEFu, "cellSpurs unk 7FDF4FEF", tm_probe_spurs_unk);
+    ps3_hle_register_ctx(0x9FCB567Bu, "cellSpurs unk 9FCB567B", tm_probe_spurs_unk);
 }
 
 /* ---------------------------------------------------------------------------
@@ -213,6 +222,9 @@ static void cellSpursTasksetAttribute2Initialize(ppu_context* ctx)
 }
 
 /* cellSpursCreateTaskset2(spurs, taskset, attr) */
+extern "C" void spu_taskset2_register(uint32_t ea);   /* runtime spu_workload.c */
+extern "C" int64_t sys_event_flag_create(ppu_context* ctx);   /* runtime sys_event.c */
+extern "C" void spu_taskset_start_pending(uint32_t taskset_ea);   /* runtime spu_workload.c */
 static void cellSpursCreateTaskset2(ppu_context* ctx)
 {
     const uint32_t spurs = (uint32_t)ctx->gpr[3], taskset = (uint32_t)ctx->gpr[4];
@@ -224,10 +236,46 @@ static void cellSpursCreateTaskset2(ppu_context* ctx)
     fprintf(stderr, "[cellSpurs] CreateTaskset2(spurs=0x%08X, taskset=0x%08X, attr=0x%08X) "
                     "args=0x%llX maxContention=%u -> v1 CreateTaskset\n",
             spurs, taskset, attr, (unsigned long long)args, maxcont);
+    /* CellSpursTaskset2 is 0x2900 bytes and the SDK zeroes all of it; the v1
+     * call below only initializes the first 0x1900. The rest is per-task state
+     * the SPU-side taskset2 code scans (128 x 16 bytes at +0x1980), and left as
+     * whatever the heap held before -- texture data, here -- a Havok SPU task
+     * looped over it forever and the physics step waited on that task. */
+    if (taskset)
+        for (uint32_t o = 0; o < 0x2900; o += 4) vm_write32(taskset + o, 0);
+    if (taskset) spu_taskset2_register(taskset);
     const int32_t rc = cellSpursCreateTaskset(
         (void*)(uintptr_t)spurs, (void*)(uintptr_t)taskset, args,
         attr ? (const void*)(uintptr_t)(attr + TSA2_PRIORITY) : nullptr, maxcont);
+    /* The taskset header after task_info[128] (0x80 + 128 * 0x30): size at +0x1890. The SPU-side
+     * taskset2 calls refuse a taskset whose size is below sizeof(Taskset2) --
+     * Havok's join-all loop retried forever on that error. It used to pass by
+     * luck, on whatever heap bytes sat there. */
+    if (taskset && rc == 0) vm_write32(taskset + 0x1890, 0x2900);
+    /* ...and its two lv2 event flags at +0x1898/+0x189C. The SPU-side
+     * cellSpursCreateTask2 -- Havok's master task recreates its workers from
+     * the SPU every step -- returns INVAL when both ids are 0, and the master
+     * retried that forever. The scratch id slot is the taskset's unused tail. */
+    if (taskset && rc == 0) {
+        for (uint32_t k = 0; k < 2; k++) {
+            ppu_context t = *ctx;
+            t.gpr[3] = taskset + 0x28F0; t.gpr[4] = 0; t.gpr[5] = 0;
+            if (sys_event_flag_create(&t) == 0)
+                vm_write32(taskset + 0x1898 + 4 * k, vm_read32(taskset + 0x28F0));
+        }
+        vm_write32(taskset + 0x28F0, 0);
+        fprintf(stderr, "[cellSpurs] Taskset2 0x%08X event flags %u/%u\n", taskset,
+                vm_read32(taskset + 0x1898), vm_read32(taskset + 0x189C));
+    }
+    fprintf(stderr, "[cellSpurs] CreateTaskset2 -> rc=0x%08X lr=0x%08X\n", (uint32_t)rc, (uint32_t)ctx->lr);  /* TEMP */
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
+}
+/* TEMP: two cellSpurs imports the post-FX init calls that nothing registers. */
+static void tm_probe_spurs_unk(ppu_context* ctx)
+{
+    fprintf(stderr, "[cellSpurs] unk import r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X\n",
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
+    ctx->gpr[3] = 0;
 }
 
 /* cellSpursAttributeEnableSystemWorkload(attr, priority[8], maxSpu, isPreemptible[8]).
@@ -966,6 +1014,87 @@ void func_009B2574(ppu_context* ctx)
     }
     tm_trace("cw::009B2574", func_009B2574_lifted, ctx);
 }
+/* BRB's list append (func_009BBFB8, r3 = node, r4 = &head): clears
+ * node->next (+0x30), walks to the tail through func_009B3F68 and links the node
+ * there. Appending a node that is ALREADY in the list makes it point at itself,
+ * and the next append walks the cycle forever. TM_SKIP_BANKUNLOAD leaves the
+ * shell bank registered, so reloading shell re-appended it and the match load
+ * hung registering "hsemi" with the main thread spinning here. Skip a node
+ * that is already present; everything else goes through untouched. */
+void func_009BBFB8_lifted(ppu_context* ctx);
+extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
+void func_009BBFB8(ppu_context* ctx)
+{
+    const uint32_t node = (uint32_t)ctx->gpr[3], headp = (uint32_t)ctx->gpr[4];
+    const uint64_t lr = ctx->lr;
+    uint32_t n = headp ? vm_read32(headp) : 0;
+    for (int steps = 0; n && steps < 100000; steps++) {
+        if (n == node) {
+            static int k = 0;
+            if (k++ < 8) { fprintf(stderr, "[brb-list] 0x%08X already listed -- not re-appended\n", node); fflush(stderr); }
+            ctx->lr = lr;
+            return;
+        }
+        if (!vm_read32(n + 0x30)) break;
+        ctx->gpr[3] = n;
+        func_009B3F68(ctx);
+        while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf((void*)ctx); }
+        n = (uint32_t)ctx->gpr[3];
+    }
+    ctx->gpr[3] = node; ctx->gpr[4] = headp; ctx->lr = lr;
+    func_009BBFB8_lifted(ctx);
+}
+/* TEMP diag: how far the BRB driver gets each tick. */
+static volatile long g_brb_cb, g_brb_proc, g_brb_poll, g_brb_poll_done;
+void func_009CF718_lifted(ppu_context* ctx);
+/* TM_BRB_SILENT=1: the BRB driver's per-block callback returns without mixing.
+ * Its mixing waits on WWS SPU jobs that never report completion, and it takes
+ * BRB's global lock first, so the driver thread blocked mid-callback HOLDING
+ * that lock -- every later BRB call (bank unload, bank allocation) then waited
+ * on it forever. Silent audio, but the rest of BRB's bookkeeping proceeds.
+ * ponytail: stand-in until the WWS job completion path is fixed. */
+/* Under TM_BRB_SILENT no voice is ever serviced, so a bank never becomes
+ * free to unload by the driver's hand and CommonBank::Unload sleep-polls here
+ * forever. Nothing reads those voices; report the bank free. */
+void func_009BBE60_lifted(ppu_context* ctx);
+void func_009BBE60(ppu_context* ctx)
+{
+    static int silent = -1;
+    if (silent < 0) silent = getenv("TM_BRB_SILENT") ? 1 : 0;
+    if (silent) { ctx->gpr[3] = 1; return; }
+    func_009BBE60_lifted(ctx);
+}
+/* TM_BRB_PARK=1: under TM_BRB_SILENT the driver has nothing to do, and with mixing skipped its
+ * loop spins reading fields of objects mixing would have set up (145 M null
+ * reads in ten minutes). Park the thread instead. */
+void func_009D7B08_lifted(ppu_context* ctx);
+void func_009D7B08(ppu_context* ctx)
+{
+    static int silent = -1;
+    if (silent < 0) silent = getenv("TM_BRB_PARK") ? 1 : 0;
+    if (silent) { for (;;) std::this_thread::sleep_for(std::chrono::seconds(1)); }
+    func_009D7B08_lifted(ctx);
+}
+void func_009CF718(ppu_context* ctx)
+{
+    static int silent = -1;
+    if (silent < 0) silent = getenv("TM_BRB_SILENT") ? 1 : 0;
+    g_brb_cb++;
+    if (silent) { ctx->gpr[3] = 0; return; }
+    func_009CF718_lifted(ctx);
+}
+void func_009D9590_lifted(ppu_context* ctx);
+void func_009D9590(ppu_context* ctx) { g_brb_proc++; func_009D9590_lifted(ctx); }
+void func_009D4200_lifted(ppu_context* ctx);
+void func_009D4200(ppu_context* ctx) { g_brb_poll++; func_009D4200_lifted(ctx); g_brb_poll_done++; }
+extern "C" void tm_brb_counters_tick(void)
+{
+    static int tk = 0;
+    if (!getenv("TM_BRBDRV") || (tk++ % 60)) return;
+    fprintf(stderr, "[brbcnt] cb=%ld proc=%ld poll=%ld poll_done=%ld\n",
+            g_brb_cb, g_brb_proc, g_brb_poll, g_brb_poll_done);
+    fflush(stderr);
+}
 void func_009B2784_lifted(ppu_context* ctx);
 void func_009B2784(ppu_context* ctx) { tm_trace("cw::009B2784", func_009B2784_lifted, ctx); }
 void func_00606F78_lifted(ppu_context* ctx);
@@ -1131,8 +1260,15 @@ void func_00360E84(ppu_context* ctx) { tm_trace("AL::e84", func_00360E84_lifted,
 void func_00360EBC(ppu_context* ctx) { tm_trace("AL::ebc", func_00360EBC_lifted, ctx); }
 void func_00360F68(ppu_context* ctx) { tm_trace("AL::f68", func_00360F68_lifted, ctx); }
 void func_00360F88(ppu_context* ctx) { tm_trace("AL::f88", func_00360F88_lifted, ctx); }
+ppu_context* g_tm_main_ctx;   /* TEMP: main thread, for TM_MAINSTACK */
 void func_0064BA08(ppu_context* ctx)
-{ if (tm_trace_verbose()) tm_trace("updateLoadBar::frame", func_0064BA08_lifted, ctx); else func_0064BA08_lifted(ctx); }
+{ g_tm_main_ctx = ctx;
+  { static long n = 0; const uint32_t o = (uint32_t)ctx->gpr[3];  /* TEMP: render gates */
+    if ((n++ % 50) == 0) fprintf(stderr, "[frame] #%ld obj=0x%08X +250=%u +251=%u +252=%u +88=%u\n", n, o,
+        vm_read8(o + 0x250), vm_read8(o + 0x251), vm_read8(o + 0x252), vm_read8(o + 0x88)); }
+  { static int f3 = -1; if (f3 < 0) f3 = getenv("TM_FORCE3D") ? 1 : 0;   /* TEMP probe */
+    if (f3) { vm_write8((uint32_t)ctx->gpr[3] + 0x252, 1); if (f3 && getenv("TM_FORCE3D")[0] == '2') vm_write8((uint32_t)ctx->gpr[3] + 0x88, 1); } }
+  if (tm_trace_verbose()) tm_trace("updateLoadBar::frame", func_0064BA08_lifted, ctx); else func_0064BA08_lifted(ctx); }
 
 /* The two writers of the load-complete byte at 0x0190FC89. The boot sequence
  * and the loading-screen thread both spin until one of them runs, so knowing
@@ -1407,8 +1543,95 @@ extern "C" int32_t cellSpursEventFlagSet(void* eventFlag, uint16_t bits);
  * 0x0AB55580; if those bytes are zero the geometry is fine and the artwork
  * simply never arrived, which is a different bug from the renderer dropping
  * the draws. */
+/* TM_BRB_ACK=1: brb_StartSession (func_009D16B8) creates the primary output
+ * object obj = [[[TOC-0x60F8]-0x7FFC]], then polls up to 10 s for the driver
+ * thread to acknowledge it: [[obj+0x14]+0x24] catching up to [[obj+0x10]+0x10].
+ * The driver (brbDriver, woken by its sys_timer on queue 2) never does, so
+ * StartSession reports FATAL, s_pPrimaryOutput stays NULL, and every later BRB
+ * call -- including registering a loaded sound bank -- loops in its error path.
+ * That is what froze the match load after "Loaded global".
+ * ponytail: stands in for the driver's ack; find why the driver never gives it. */
+static void tm_brb_ack_tick(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_BRB_ACK") ? 1 : 0;
+    if (!on || !vm_base) return;
+    const uint32_t r30 = vm_read32(0x00F21930u - 0x60F8u);
+    if (!r30) return;
+    const uint32_t r27 = vm_read32(r30 - 0x7FFCu);
+    const uint32_t obj = r27 ? vm_read32(r27) : 0;
+    if (!obj) return;
+    const uint32_t req = vm_read32(obj + 0x10), ack = vm_read32(obj + 0x14);
+    if (!req || !ack) return;
+    const uint32_t want = vm_read32(req + 0x10);
+    if (vm_read32(ack + 0x24) == want) return;
+    vm_write32(ack + 0x24, want);
+    static int n = 0;
+    if (n++ < 4) { fprintf(stderr, "[brb-ack] obj=0x%08X ack+0x24 <- 0x%08X\n", obj, want); fflush(stderr); }
+}
+
+/* TEMP TM_HEAPWALK=1: every 10 s, walk the title's 15 MB dlmalloc heap at
+ * 0x40000000 and print the biggest in-use (size, first payload word) groups.
+ * The first payload word is a vtable for most objects, which names the owner. */
+#include <map>
+static void tm_heapwalk_tick(void)
+{
+    static int on = -1; if (on < 0) on = getenv("TM_HEAPWALK") ? 1 : 0;
+    static int tk = 0;
+    if (!on || !vm_base || (tk++ % 600) != 599) return;
+    const uint32_t base = 0x40000000u, end = base + 0xF00000u;
+    for (uint32_t start = base; start < base + 0x400; start += 8) {
+        std::map<uint32_t, std::pair<uint32_t, uint32_t>> g;   /* size -> (count, bytes) */
+        std::map<uint32_t, uint32_t> last;                      /* size -> last chunk */
+        uint32_t a = start, n = 0, used = 0;
+        while (a + 8 <= end) {
+            const uint32_t sz = vm_read32(a + 4) & ~7u;
+            if (sz < 16 || a + sz > end) break;
+            const uint32_t nx = a + sz;
+            const int inuse = nx + 8 <= end ? (vm_read32(nx + 4) & 1) : 0;
+            if (inuse) { g[sz].first++; g[sz].second += sz; used += sz; last[sz] = a; }
+            a = nx; n++;
+        }
+        if (n < 20) continue;
+        fprintf(stderr, "[heapwalk] start=0x%08X chunks=%u used=%u stop=0x%08X\n", start, n, used, a);
+        std::multimap<uint32_t, uint32_t> top;
+        for (auto& e : g) top.emplace(e.second.second, e.first);
+        int i = 0;
+        for (auto it = top.rbegin(); it != top.rend() && i < 8; ++it, ++i) {
+            const uint32_t c = last[it->second];
+            fprintf(stderr, "[heapwalk]   size=%7u count=%4u bytes=%8u last@%08X:",
+                    it->second, g[it->second].first, it->first, c + 8);
+            for (uint32_t o = 8; o < 8 + 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(c + o));
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+        return;
+    }
+    fprintf(stderr, "[heapwalk] no consistent chunk chain found; head:");
+    for (uint32_t i = 0; i < 0x200; i += 4) {
+        if (!(i & 31)) fprintf(stderr, "\n[heapwalk] %08X:", base + i);
+        fprintf(stderr, " %08X", vm_read32(base + i));
+    }
+    fprintf(stderr, "\n");
+}
+extern "C" void tm_pool_tick(void);
 extern "C" void tm_memdump_tick(void)
 {
+    tm_heapwalk_tick();
+    tm_pool_tick();
+    tm_brb_ack_tick();
+    tm_brb_counters_tick();
+    /* TEMP: BRB driver state, once a second */
+    { static int on = -1; if (on < 0) on = getenv("TM_BRBDRV") ? 1 : 0;
+      static int tk = 0;
+      if (on && vm_base && (tk++ % 60) == 0) {
+          const uint32_t d = 0x01AA8700u;
+          const uint32_t p70 = vm_read32(d + 0x70);
+          fprintf(stderr, "[brbdrv] +58=%08X +68=%08X +6C=%08X +70=%08X *70=%08X%08X +78=%08X +80=%08X +04=%08X +0C=%08X\n",
+                  vm_read32(d + 0x58), vm_read32(d + 0x68), vm_read32(d + 0x6C), p70,
+                  p70 ? vm_read32(p70) : 0, p70 ? vm_read32(p70 + 4) : 0,
+                  vm_read32(d + 0x78), vm_read32(d + 0x80), vm_read32(d + 0x04), vm_read32(d + 0x0C));
+          fflush(stderr); } }
     static int on = -1;
     static uint32_t addr = 0, count = 32;
     if (on < 0) {
@@ -1458,6 +1681,11 @@ extern "C" void tm_fifowatch_tick(void)
         for (int i = 0; i < 6; i++) fprintf(stderr, " %08X", vm_read32(ea + i * 4));
     }
     last_get = get;
+    /* TEMP: how much of the last 16 KB the title wrote before put is zero. */
+    { uint32_t zeros = 0; const uint32_t pe = put + 0x11000000u;
+      for (uint32_t i = 1; i <= 4096; i++) if (!vm_read32(pe - 4 * i)) zeros++;
+      fprintf(stderr, "  zeros-before-put=%u/4096 tail:", zeros);
+      for (int i = 8; i >= 1; i--) fprintf(stderr, " %08X", vm_read32(pe - 4 * i)); }
     /* The title syncs on RSX labels (cellGcmGetLabelAddress). ps3recomp puts
      * them at a fixed guest base, 16 bytes apart, so the ones the FIFO's
      * SEMAPHORE_RELEASE writes are readable here. If these never move, the
@@ -1639,6 +1867,14 @@ void func_0099790C(ppu_context* ctx)
                   fprintf(stderr, "[edge] %lld blocks: %.1f ms/block round trip, "
                                   "%.2f ms/block inflating (%.0f%%)\n",
                           m, gap_ms / m, work_ms / m, 100.0 * work_ms / (gap_ms ? gap_ms : 1)); }
+            /* TEMP TM_GUARD=lo:hi -- report an inflate whose output overlaps a guarded range. */
+            { static uint32_t glo = 1, ghi = 0;
+              if (glo == 1) { const char* e = getenv("TM_GUARD"); glo = 0;
+                  if (e) { glo = (uint32_t)strtoul(e, nullptr, 16); const char* c = strchr(e, ':'); ghi = c ? (uint32_t)strtoul(c + 1, nullptr, 16) : 0; } }
+              const uint32_t d0 = inplace ? inplace : dst;
+              if (ghi && n > 0 && d0 < ghi && d0 + (uint32_t)n > glo)
+                  fprintf(stderr, "[guard] edge inflate req=0x%08X writes 0x%08X..0x%08X (%d bytes, inplace=%d dstlen=%u)\n",
+                          req, d0, d0 + (uint32_t)n, n, inplace ? 1 : 0, dstlen); }
             if (n >= 0) {
                 if (inplace) memcpy(vm_base + inplace, tmp, (size_t)n);
                 else         memcpy(vm_base + dst,     tmp, (size_t)n);
@@ -1704,4 +1940,283 @@ void func_0099790C(ppu_context* ctx)
     }
     (void)self;
     func_0099790C_lifted(ctx);
+}
+
+/* TEMP TM_ALLOCTRACE=<size>: log the guest call chain of memalign requests of
+ * exactly that size (the heap fills with 66200-byte blocks). */
+void func_004DBEC4_lifted(ppu_context* ctx);
+void func_004DBEC4(ppu_context* ctx)
+{
+    static long want = -1;
+    if (want < 0) { const char* e = getenv("TM_ALLOCTRACE"); want = e ? atol(e) : 0; }
+    if (want && ((long)(uint32_t)ctx->gpr[3] == want || (long)(uint32_t)ctx->gpr[4] == want)) {
+        static long n = 0;
+        if (n++ < 40) {
+            fprintf(stderr, "[alloc] %ld lr=%08X", want, (uint32_t)ctx->lr);
+            uint32_t sp = (uint32_t)ctx->gpr[1];
+            for (int i = 0; i < 40 && sp; i++) {
+                sp = vm_read32(sp + 4);           /* back chain (low word of 64-bit slot) */
+                if (!sp) break;
+                fprintf(stderr, " <%08X", vm_read32(sp + 0x14));   /* saved LR at +0x10 */
+            }
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
+    func_004DBEC4_lifted(ctx);
+}
+
+/* TM_HEAP_MB=<n>: the title's one general heap is a dlmalloc mspace over a
+ * fixed 15 MB sys_memory block (func_004DBB70), and memalign traps when it is
+ * full. Entering the match fills it with Havok free-list blocks (66 KB each)
+ * and every later allocation -- archive TOCs, texture pager -- fails.
+ * Same sequence as the lifted body, with the size as a knob.
+ * ponytail: workaround until it is known why this port needs more than 15 MB. */
+void func_004DBB70_lifted(ppu_context* ctx);
+void func_00979450(ppu_context* ctx);
+void func_004DC490(ppu_context* ctx);
+void func_004DBB70(ppu_context* ctx)
+{
+    const char* e = getenv("TM_HEAP_MB");
+    const uint32_t mb = e ? (uint32_t)atoi(e) : 15;
+    if (mb <= 15) { func_004DBB70_lifted(ctx); return; }
+    const uint32_t size = mb << 20, g = 0x017B0000u;
+    const uint64_t lr = ctx->lr;
+    ctx->gpr[3] = g + 0xB40; ctx->gpr[11] = 0x160; lv2_syscall(ctx);   /* get_user_memory_size */
+    ctx->gpr[3] = size; ctx->gpr[4] = 0x400; ctx->gpr[5] = g + 0xB38;
+    ctx->gpr[11] = 0x15C; lv2_syscall(ctx);                              /* sys_memory_allocate */
+    fprintf(stderr, "[heap] TM_HEAP_MB=%u: allocate -> rc=0x%X base=0x%08X\n",
+            mb, (uint32_t)ctx->gpr[3], vm_read32(g + 0xB38));
+    if ((uint32_t)ctx->gpr[3]) { ctx->lr = lr; func_004DBB70_lifted(ctx); return; }
+    ctx->gpr[3] = vm_read32(g + 0xB38); ctx->gpr[4] = size;
+    ctx->lr = 0x004DBBCC; func_00979450(ctx); while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf((void*)ctx); }  /* create_mspace_with_base */
+    vm_write32(g + 0xB3C, (uint32_t)ctx->gpr[3]);
+    ctx->lr = 0x004DBBD8; func_004DC490(ctx); while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf((void*)ctx); }
+    ctx->lr = lr;
+}
+
+/* TEMP diag: the match's first frame waits in func_00678CE8 for
+ * [0x019307A4+0x2C] to reach 0 and never sees it. No PPU store in the image
+ * writes a non-zero value there, so log whether the pool init (0x00676ED8)
+ * ran, what the pool looks like at the wait, and when the word changes. */
+void func_00676ED8_lifted(ppu_context* ctx);
+void func_00676ED8(ppu_context* ctx)
+{
+    fprintf(stderr, "[pool] init(%u) lr=0x%08X\n", (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+    fflush(stderr);
+    func_00676ED8_lifted(ctx);
+}
+static void tm_pool_dump(const char* why)
+{
+    fprintf(stderr, "[pool] %s:", why);
+    for (uint32_t o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(0x019307A4u + o));
+    fprintf(stderr, "\n"); fflush(stderr);
+}
+void func_00678CE8_lifted(ppu_context* ctx);
+void func_00678CE8(ppu_context* ctx)
+{
+    static int n = 0;
+    if (vm_read32(0x019307D0u) && n++ < 4) {
+        char b[48]; snprintf(b, sizeof b, "wait lr=0x%08X", (uint32_t)ctx->lr); tm_pool_dump(b);
+    }
+    /* TM_POOL_NOWAIT=1: give up after ~200 ms instead of sleep-polling forever.
+     * ponytail: stand-in until whatever leaves the word at 1 is found. */
+    static int nowait = -1;
+    if (nowait < 0) nowait = getenv("TM_POOL_NOWAIT") ? 1 : 0;
+    if (nowait) {
+        /* TM_POOL_NOWAIT=<n>: give the producer n polls of 100 us (default 0). */
+        static int polls = -1; if (polls < 0) polls = atoi(getenv("TM_POOL_NOWAIT"));
+        for (int i = 0; i < polls && vm_read32(0x019307D0u); i++)
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        return;
+    }
+    func_00678CE8_lifted(ctx);
+}
+extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
+extern ppu_context* g_tm_main_ctx;
+extern "C" void tm_pool_tick(void)
+{
+    /* SPURS would schedule a task an SPU created as soon as it is ready; our
+     * scheduler only looks on task exit. Poll the Taskset2s every ~20 ms. */
+    { static auto nx = std::chrono::steady_clock::now();
+      if (std::chrono::steady_clock::now() >= nx) { nx += std::chrono::milliseconds(20);
+          for (int i = 0; i < g_ntasksets; i++) spu_taskset_start_pending(g_tasksets[i]); } }
+    /* TEMP TM_MAINSTACK=1: main thread's guest stack every ~30 s. */
+    { static int on = -1; if (on < 0) on = getenv("TM_MAINSTACK") ? 1 : 0;
+      static auto next = std::chrono::steady_clock::now();
+      if (on && g_tm_main_ctx && std::chrono::steady_clock::now() >= next) {
+          next += std::chrono::seconds(atoi(getenv("TM_MAINSTACK")) > 1 ? atoi(getenv("TM_MAINSTACK")) : 10); { extern volatile long g_tm_players_upd, g_tm_frame_upd; fprintf(stderr, "[upd] players=%ld frame=%ld\n", g_tm_players_upd, g_tm_frame_upd); } fprintf(stderr, "[query-count] %u\n", vm_read32(0x0190E7D8u)); { uint32_t sp = (uint32_t)g_tm_main_ctx->gpr[1]; fprintf(stderr, "[mainchain] lr=0x%08X", (uint32_t)g_tm_main_ctx->lr); for (int i = 0; i < 40 && sp > 0x01000000u && sp < 0x40000000u; i++) { const uint32_t nsp = vm_read32(sp + 4); if (nsp <= sp) break; fprintf(stderr, " %08X", vm_read32(nsp + 0x14)); sp = nsp; } fprintf(stderr, "\n"); } ppu_dump_guest_stack(g_tm_main_ctx, "main"); { if (g_tm_postfx_ctx) { uint32_t sp = (uint32_t)g_tm_postfx_ctx->gpr[1]; fprintf(stderr, "[postfxchain] lr=0x%08X", (uint32_t)g_tm_postfx_ctx->lr); for (int i = 0; i < 40 && sp > 0x01000000u && sp < 0x40000000u; i++) { const uint32_t nsp = vm_read32(sp + 4); if (nsp <= sp) break; fprintf(stderr, " %08X", vm_read32(nsp + 0x14)); sp = nsp; } fprintf(stderr, "\n"); } } const ppu_context* m = g_tm_main_ctx; fprintf(stderr, "[main-fpr] f14=%g f18=%g f25=%g f13=%g f30=%g f31=%g\n", m->fpr[14], m->fpr[18], m->fpr[25], m->fpr[13], m->fpr[30], m->fpr[31]); } }
+    static uint32_t last = 0; static int n = 0;
+    if (!vm_base) return;
+    /* TEMP TM_TS2DUMP=<taskset ea>: every ~20 s, the 128 task_exit_code states
+     * (byte14:byte15) and the taskset enabled/running bitsets. */
+    { static uint32_t ts = 1; if (ts == 1) { const char* e = getenv("TM_TS2DUMP"); ts = e ? (uint32_t)strtoul(e, nullptr, 16) : 0; }
+      static auto nx = std::chrono::steady_clock::now();
+      if (ts && g_ntasksets) ts = g_tasksets[g_ntasksets - 1];   /* the newest Taskset2 */
+      if (ts && std::chrono::steady_clock::now() >= nx) { nx += std::chrono::seconds(20);
+          char b[128 * 3 + 1]; int p = 0;
+          for (uint32_t t = 0; t < 64; t++) { const uint32_t e = ts + 0x1980 + 16 * t;
+              p += snprintf(b + p, sizeof b - p, "%X%X ", vm_read8(e + 14) & 15, vm_read8(e + 15)); }
+          fprintf(stderr, "[ts2] run=%08X rdy=%08X pnd=%08X ena=%08X sig=%08X wait=%08X | ti1: %08X %08X %08X %08X %08X %08X exit:%.48s\n",
+                  vm_read32(ts + 0x00), vm_read32(ts + 0x10), vm_read32(ts + 0x20), vm_read32(ts + 0x30), vm_read32(ts + 0x40), vm_read32(ts + 0x50),
+                  vm_read32(ts + 0x80 + 0x30), vm_read32(ts + 0x84 + 0x30), vm_read32(ts + 0x90 + 0x30), vm_read32(ts + 0x94 + 0x30), vm_read32(ts + 0x98 + 0x30), vm_read32(ts + 0x9C + 0x30), b); } }
+    /* TEMP TM_GUARD: log when the first words of the guarded range change. */
+    { static uint32_t g = 1; if (g == 1) { const char* e = getenv("TM_GUARD"); g = e ? (uint32_t)strtoul(e, nullptr, 16) : 0; }
+      static uint32_t prev[8]; static int k = 0;
+      if (g && k < 60) { uint32_t cur[8]; for (int i = 0; i < 8; i++) cur[i] = vm_read32(g + 0x1A80 + 4 * i);
+          if (memcmp(cur, prev, sizeof cur)) { k++; memcpy(prev, cur, sizeof cur);
+              fprintf(stderr, "[guard-mem] 0x%08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", g + 0x1A80,
+                      cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7]); } } }
+    /* TEMP TM_PEEK=<ea>: log the 32 bytes at ea whenever they change. */
+    { static uint32_t g = 1; if (g == 1) { const char* e = getenv("TM_PEEK"); g = e ? (uint32_t)strtoul(e, nullptr, 16) : 0; }
+      static uint32_t prev[8]; static int k = 0;
+      if (g && k < 300) { uint32_t cur[8]; for (int i = 0; i < 8; i++) cur[i] = vm_read32(g + 4 * i);
+          if (memcmp(cur, prev, sizeof cur)) { k++; memcpy(prev, cur, sizeof cur);
+              fprintf(stderr, "[peek] 0x%08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", g,
+                      cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7]); } } }
+    const uint32_t v = vm_read32(0x019307D0u);
+    if (v != last && n++ < 40) { char b[48]; snprintf(b, sizeof b, "change %08X->%08X", last, v); tm_pool_dump(b); }
+    last = v;
+}
+
+/* Called from the guarded time-of-impact loop heads (tools/post_lift.py,
+ * TOI_GUARD) when t + dt vs tEnd compares unordered: name the NaN operand. */
+void tm_toi_nan(ppu_context* ctx)
+{
+    static int n = 0;
+    if (n++ < 8) {
+        fprintf(stderr, "[toi-nan] t=%g dt=%g tEnd=%g lr=0x%08X\n",
+                ctx->fpr[25], ctx->fpr[18], ctx->fpr[14], (uint32_t)ctx->lr);
+        fflush(stderr);
+    }
+}
+
+/* TEMP diag: game frame progress, printed with TM_MAINSTACK. */
+volatile long g_tm_players_upd, g_tm_frame_upd;
+void func_000DB394_lifted(ppu_context* ctx);
+void func_000DB394(ppu_context* ctx) { g_tm_players_upd++; func_000DB394_lifted(ctx); }
+void func_0010C898_lifted(ppu_context* ctx);
+void func_0010C898(ppu_context* ctx) { g_tm_frame_upd++; func_0010C898_lifted(ctx); }
+
+/* TEMP diag: AI line-of-sight raycast; r5..r8 carry start/end as float pairs. */
+void func_00514EF8_lifted(ppu_context* ctx);
+void func_00514EF8(ppu_context* ctx)
+{
+    static long n = 0, bad = 0;
+    auto f = [](uint64_t v, int hi) { uint32_t b = hi ? (uint32_t)(v >> 32) : (uint32_t)v; float x; memcpy(&x, &b, 4); return x; };
+    const float sx = f(ctx->gpr[5], 1), sy = f(ctx->gpr[5], 0), sz = f(ctx->gpr[6], 1);
+    const float ex = f(ctx->gpr[7], 1), ey = f(ctx->gpr[7], 0), ez = f(ctx->gpr[8], 1);
+    const bool nan = sx != sx || sy != sy || sz != sz || ex != ex || ey != ey || ez != ez;
+    if (nan) bad++;
+    if ((++n % 20000) == 1 || (nan && bad < 6))
+        fprintf(stderr, "[los] #%ld bad=%ld (%g,%g,%g)->(%g,%g,%g)\n", n, bad, sx, sy, sz, ex, ey, ez);
+    func_00514EF8_lifted(ctx);
+}
+
+/* TEMP diag: world query. Log a window of calls once it has run away, to see
+ * whether the same queries repeat (a cycle) or new ones keep coming. */
+void func_0062EB40_lifted(ppu_context* ctx);
+void func_0062EB40(ppu_context* ctx)
+{
+    static long n = 0;
+    const long k = ++n;
+    if (k >= 2000000 && k < 2000060)
+        fprintf(stderr, "[query] #%ld lr=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X r7=0x%08X r8=0x%08X [r3]=%08X %08X\n",
+                k, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+                (uint32_t)ctx->gpr[6], (uint32_t)ctx->gpr[7], (uint32_t)ctx->gpr[8],
+                ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3]) : 0, ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3] + 4) : 0);
+    func_0062EB40_lifted(ctx);
+}
+
+/* TEMP diag: segment raycast loop in func_00630150 -- t (v28) += step (v27)
+ * until t >= tmax (v26). Report the lanes once the loop has clearly run away. */
+void tm_seg_probe(ppu_context* ctx)
+{
+    static long n = 0;
+    if (++n != 1000000 && n != 1000001) return;
+    float t[4], st[4], mx[4];
+    for (int i = 0; i < 4; i++) {
+        uint32_t a, b, c;
+        memcpy(&a, (uint8_t*)&ctx->vr[28] + 4 * i, 4); a = __builtin_bswap32(a); memcpy(&t[i], &a, 4);
+        memcpy(&b, (uint8_t*)&ctx->vr[27] + 4 * i, 4); b = __builtin_bswap32(b); memcpy(&st[i], &b, 4);
+        memcpy(&c, (uint8_t*)&ctx->vr[26] + 4 * i, 4); c = __builtin_bswap32(c); memcpy(&mx[i], &c, 4);
+    }
+    fprintf(stderr, "[seg] iter=%ld t=(%g %g %g %g) step=(%g %g %g %g) tmax=(%g %g %g %g) cr=0x%08X\n",
+            n, t[0], t[1], t[2], t[3], st[0], st[1], st[2], st[3], mx[0], mx[1], mx[2], mx[3], (uint32_t)ctx->cr);
+}
+
+/* ---------------------------------------------------------------------------
+ * SPURS JobQueue (cellSpursJq). Every import of the library was a fake, so the
+ * jobs the title pushes -- its visibility culling among them -- never ran: the
+ * cull job's completion counter (0x019307D0) never cleared and every object's
+ * visibility byte stayed 0, so the match drew no world at all.
+ *
+ * From the call site at 0x006789A8: push(jq, job, 0x40, tag, 1, 0, 1) hands a
+ * 64-byte CellSpursJob64; sync(jq, 1 << tag, 1) runs before a tag is reused.
+ * Jobs run on a pool of host workers standing in for the SPUs (binary staged
+ * at LS 0, cellSpursJobMain2 context); sync waits until every job pushed on
+ * the masked tags of that queue has finished. Running them on the pushing PPU
+ * thread instead serialised ~1.6 s image jobs into the game's own frame.
+ * ponytail: one global FIFO for all queues, 4 workers; no priorities or
+ * readiness counts, add them if a title depends on them.
+ * ------------------------------------------------------------------------- */
+#include <condition_variable>
+#include <deque>
+#include <process.h>
+extern "C" int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+                                         uint32_t job_ea, uint32_t job_desc_size);
+struct TmJqItem { uint32_t jq, job, size, tag, bin, bin_size; };
+static std::mutex s_jq_mx;
+static std::condition_variable s_jq_cv, s_jq_done;
+static std::deque<TmJqItem> s_jq_q;
+static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
+extern "C" void spurs_job_set_spu_num(uint32_t n);
+static unsigned __stdcall tm_jq_worker(void* arg)
+{
+    spurs_job_set_spu_num((uint32_t)(uintptr_t)arg);   /* one SPU id per worker */
+    for (;;) {
+        TmJqItem it;
+        { std::unique_lock<std::mutex> lk(s_jq_mx);
+          s_jq_cv.wait(lk, [] { return !s_jq_q.empty(); });
+          it = s_jq_q.front(); s_jq_q.pop_front(); }
+        int ran = spu_workload_dispatch_job(vm_base + it.bin, it.bin_size, it.job, it.size);
+        if (it.bin == 0x00E3BD80u) { static int k = 0; if (k++ < 6) {  /* TEMP: the cull job */
+            fprintf(stderr, "[jq-cull] job=0x%08X ran=%d counter=0x%08X\n", it.job, ran, vm_read32(0x019307D0u)); } }
+        { std::lock_guard<std::mutex> lk(s_jq_mx);
+          --s_jq_pending[((uint64_t)it.jq << 32) | it.tag]; }
+        s_jq_done.notify_all();
+    }
+}
+static void tm_jq_push_job(ppu_context* ctx)
+{
+    static std::once_flag once;
+    std::call_once(once, [] {    /* a job's spu_context + lifted call depth need a big stack */
+        const char* e = getenv("TM_JQ_WORKERS"); int nw = e ? atoi(e) : 4;
+        if (nw > 6) nw = 6;   /* six SPUs: labels 0x80-0x85, one per SPU */
+        for (int i = 0; i < nw; i++) _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
+    });
+    TmJqItem it;
+    it.jq = (uint32_t)ctx->gpr[3]; it.job = (uint32_t)ctx->gpr[4];
+    it.size = (uint32_t)ctx->gpr[5] ? (uint32_t)ctx->gpr[5] : 0x40;
+    it.tag = (uint32_t)ctx->gpr[6] & 15;
+    it.bin = (uint32_t)(vm_read64(it.job + 0) & ~1ull);
+    it.bin_size = (uint32_t)vm_read16(it.job + 8) << 4;
+    if (it.bin && it.bin_size) {
+        { std::lock_guard<std::mutex> lk(s_jq_mx);
+          ++s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
+          s_jq_q.push_back(it); }
+        s_jq_cv.notify_one();
+    }
+    ctx->gpr[3] = 0;
+}
+static void tm_jq_sync(ppu_context* ctx)
+{
+    const uint64_t jq = (uint32_t)ctx->gpr[3];
+    const uint32_t mask = (uint32_t)ctx->gpr[4];
+    std::unique_lock<std::mutex> lk(s_jq_mx);
+    s_jq_done.wait(lk, [&] {
+        for (uint32_t t = 0; t < 16; t++)
+            if ((mask >> t & 1) && s_jq_pending[(jq << 32) | t] > 0) return false;
+        return true;
+    });
+    ctx->gpr[3] = 0;
 }
