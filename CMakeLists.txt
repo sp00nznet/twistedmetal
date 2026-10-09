@@ -36,6 +36,10 @@ endif()
 
 option(TM_BUILD_GAME  "Build the game executable (needs the lift in TM_RECOMP_DIR)" ON)
 option(TM_BUILD_SMOKE "Build twistedmetal_smoke: this harness on ps3recomp's smoke title" OFF)
+# src/gen/spu_jobs.c registers the 15 JobQueue job binaries, which are dumped
+# at run time and lifted separately from the 11 SPU images in the ELF. OFF
+# links the images without them.
+option(TM_LINK_SPU_JOBS "Link src/gen/spu_jobs.c (needs the lifted JobQueue jobs)" ON)
 set(TM_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp" CACHE PATH
     "lifted ppu_recomp.h and its chunks")
 # Extra compile options for the lifted chunks only (e.g. -O1 to keep GCC's
@@ -104,9 +108,9 @@ if(TM_BUILD_GAME)
     file(GLOB_RECURSE SPU_SOURCES "src/spu_gen/*.c")
     # spu_jobs.c registers the SPU jobs lifted under src/spu_gen and cannot link
     # without them. A first boot does not need them.
-    if(NOT SPU_SOURCES)
+    if(NOT SPU_SOURCES OR NOT TM_LINK_SPU_JOBS)
         list(FILTER GEN_SOURCES EXCLUDE REGEX "/spu_jobs\\.c$")
-        message(STATUS "twistedmetal: no lifted SPU code in src/spu_gen; spu_jobs.c left out")
+        message(STATUS "twistedmetal: spu_jobs.c left out (no lifted SPU code, or TM_LINK_SPU_JOBS=OFF)")
     endif()
 
     add_executable(twistedmetal
