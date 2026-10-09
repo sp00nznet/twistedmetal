@@ -153,9 +153,12 @@ extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
  * calling cellGcmTickVBlank()/TickFlip(), which invoke the registered handlers.
  * Without this the game inits, registers its handlers, and then waits forever
  * for a vblank that never comes. */
-typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSysutil.c */
-extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+/* ps3_guest_caller_fn and g_ps3_guest_caller (libs/system/cellSysutil.c) come
+ * from the runtime's header, where a guest callback takes 8 arguments. Declared
+ * here by hand with 4, they left arguments 5 to 8 indeterminate. */
+#include "ps3emu/guest_call.h"
+extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
 /* Mark a vblank+flip tick pending WITHOUT running guest code -- the handlers are
@@ -163,8 +166,9 @@ extern "C" void cellGcmTickFlip(void);
  * with guest execution so the ticker thread never races it. */
 extern "C" void cellGcm_request_tick(void);
 
-static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
-{ ppu_guest_call(opd, a0, a1, a2, a3); }
+static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{ ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7); }
 
 #ifdef _WIN32
 /* RSX present backend (libs/video/rsx_d3d12_backend.c). Driven on the vblank
