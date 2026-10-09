@@ -627,6 +627,8 @@ static void* tm_frame_clock(void*)
     return nullptr;
 }
 
+extern "C" void tm_gstacks_start(void);   /* src/tm_gstacks.cpp: TM_GSTACKS=<secs> */
+
 struct TmGuestRun { uint32_t entry; int rc; };
 
 static void* tm_guest_main(void* p)
@@ -750,6 +752,7 @@ int main(int argc, char** argv)
             fprintf(stderr, "[boot] frame clock thread could not be created\n");
         pthread_attr_destroy(&attr);
     }
+    tm_gstacks_start();
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);

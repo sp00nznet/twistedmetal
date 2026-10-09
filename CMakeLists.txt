@@ -92,6 +92,8 @@ function(tm_configure_target tgt recomp_dir)
             "${PS3RECOMP_DIR}/include"
             ${LIB_INC_DIRS}
         )
+        target_sources(${tgt} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/tm_gstacks.cpp")  # TM_GSTACKS guest stack sampler
         find_package(Threads REQUIRED)
         target_link_libraries(${tgt} PRIVATE ps3recomp_runtime Threads::Threads ${CMAKE_DL_LIBS})
         target_compile_options(${tgt} PRIVATE -fno-strict-aliasing)
