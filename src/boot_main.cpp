@@ -572,11 +572,37 @@ static DWORD WINAPI hang_watchdog(LPVOID)
  * sys_ppu_thread_create starts (PPU_HOST_STACK_BYTES). */
 #define TM_MAIN_STACK_BYTES (256u * 1024u * 1024u)
 
-/* Null backend: no window, headless software rendering. Booting on Linux only
- * needs a game loop that advances; Vulkan comes next. */
+/* The RSX backend: Vulkan when the runtime is built with PS3RECOMP_RSX_VULKAN
+ * (its window, guest programs and frame dumps are set by the backend's own
+ * PS3RECOMP_VK_* variables), otherwise the null backend -- no window, headless
+ * software rendering. TM_RSX=null picks the null backend in a Vulkan build. */
 extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_null_backend_present(void);
 extern "C" int  rsx_null_backend_pump_messages(void);
+#if defined(PS3RECOMP_RSX_VULKAN)
+extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_vulkan_backend_present(void);
+extern "C" int  rsx_vulkan_backend_pump_messages(void);
+#endif
+
+struct TmBackend {
+    const char* name;
+    int  (*init)(uint32_t, uint32_t, const char*);
+    void (*present)(void);
+    int  (*pump)(void);
+};
+
+static TmBackend tm_pick_backend(void)
+{
+#if defined(PS3RECOMP_RSX_VULKAN)
+    const char* e = getenv("TM_RSX");
+    if (!e || strcmp(e, "null") != 0)
+        return { "Vulkan", rsx_vulkan_backend_init, rsx_vulkan_backend_present,
+                 rsx_vulkan_backend_pump_messages };
+#endif
+    return { "null", rsx_null_backend_init, rsx_null_backend_present,
+             rsx_null_backend_pump_messages };
+}
 
 static uint64_t tm_now_ms(void)
 {
@@ -594,8 +620,9 @@ static void* tm_frame_clock(void*)
     uint32_t rsx_w = 1280, rsx_h = 704;
     if (const char* e = getenv("TM_RSX_W")) rsx_w = (uint32_t)strtoul(e, 0, 0);
     if (const char* e = getenv("TM_RSX_H")) rsx_h = (uint32_t)strtoul(e, 0, 0);
-    int rsx_ok = (rsx_null_backend_init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
-    fprintf(stderr, "[rsx] null backend init %s\n", rsx_ok ? "OK" : "FAILED");
+    const TmBackend be = tm_pick_backend();
+    int rsx_ok = (be.init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
+    fprintf(stderr, "[rsx] %s backend init %s\n", be.name, rsx_ok ? "OK" : "FAILED");
 
     uint64_t next_tick = tm_now_ms();
     for (;;) {
@@ -617,9 +644,9 @@ static void* tm_frame_clock(void*)
         }
         if (fired >= 240) next_tick = now;
         if (rsx_ok) {
-            if (rsx_null_backend_pump_messages() != 0) { rsx_ok = 0; continue; }
+            if (be.pump() != 0) { rsx_ok = 0; continue; }
             if (cellGcm_take_flip_pending_synced()) {
-                rsx_null_backend_present();
+                be.present();
                 tm_count_presented_frame();
             }
         }
