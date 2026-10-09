@@ -2161,7 +2161,13 @@ void tm_seg_probe(ppu_context* ctx)
  * ------------------------------------------------------------------------- */
 #include <condition_variable>
 #include <deque>
+#ifdef _WIN32
 #include <process.h>
+#define TM_JQ_WORKER_FN static unsigned __stdcall
+#else
+#include <pthread.h>
+#define TM_JQ_WORKER_FN static void*
+#endif
 extern "C" int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                                          uint32_t job_ea, uint32_t job_desc_size);
 struct TmJqItem { uint32_t jq, job, size, tag, bin, bin_size; };
@@ -2170,7 +2176,7 @@ static std::condition_variable s_jq_cv, s_jq_done;
 static std::deque<TmJqItem> s_jq_q;
 static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
 extern "C" void spurs_job_set_spu_num(uint32_t n);
-static unsigned __stdcall tm_jq_worker(void* arg)
+TM_JQ_WORKER_FN tm_jq_worker(void* arg)
 {
     spurs_job_set_spu_num((uint32_t)(uintptr_t)arg);   /* one SPU id per worker */
     for (;;) {
@@ -2192,7 +2198,19 @@ static void tm_jq_push_job(ppu_context* ctx)
     std::call_once(once, [] {    /* a job's spu_context + lifted call depth need a big stack */
         const char* e = getenv("TM_JQ_WORKERS"); int nw = e ? atoi(e) : 4;
         if (nw > 6) nw = 6;   /* six SPUs: labels 0x80-0x85, one per SPU */
-        for (int i = 0; i < nw; i++) _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
+        for (int i = 0; i < nw; i++) {
+#ifdef _WIN32
+            _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
+#else
+            pthread_t t;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 16u << 20);
+            if (pthread_create(&t, &attr, tm_jq_worker, (void*)(uintptr_t)i) == 0)
+                pthread_detach(t);
+            pthread_attr_destroy(&attr);
+#endif
+        }
     });
     TmJqItem it;
     it.jq = (uint32_t)ctx->gpr[3]; it.job = (uint32_t)ctx->gpr[4];
