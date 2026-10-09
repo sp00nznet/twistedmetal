@@ -1800,11 +1800,19 @@ static void probe_EventFlagWait(ppu_context* ctx)
         (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
 }
 
-/* BCUS98106 by-address hooks: host Edge decompressor, heap, pool. Meaningless
- * on another binary, where these addresses are other functions. */
+/* The Edge decompressor's completion wait, per title: BCUS98106 0x0099790C;
+ * BCES01010 0x0099864C, the only caller of cellSpursEventFlagWait in that
+ * binary, at the same +0xD40 shift as the logger next to it. */
 #if TM_US_ADDRESS_HOOKS
+#define TM_EDGE_WAIT        func_0099790C
+#define TM_EDGE_WAIT_LIFTED func_0099790C_lifted
+#elif defined(TM_TITLE_BCES01010)
+#define TM_EDGE_WAIT        func_0099864C
+#define TM_EDGE_WAIT_LIFTED func_0099864C_lifted
+#endif
+#ifdef TM_EDGE_WAIT
 /* ---------------------------------------------------------------------------
- * The Edge decompressor's completion wait, guest 0x0099790C.
+ * The Edge decompressor's completion wait, guest 0x0099790C (BCUS98106).
  *
  * Decoded from the lifted code: wait(this, request, ...) computes its event-flag
  * bit as `1 << ((request - (this + 0x2C04)) / sizeof(request))`, then loops
@@ -1835,9 +1843,9 @@ extern "C" int tm_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, ui
 extern "C" void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
 extern "C" int tm_inflate_selftest(void);
 
-void func_0099790C_lifted(ppu_context* ctx);
+void TM_EDGE_WAIT_LIFTED(ppu_context* ctx);
 
-void func_0099790C(ppu_context* ctx)
+void TM_EDGE_WAIT(ppu_context* ctx)
 {
     const uint32_t self = (uint32_t)ctx->gpr[3];
     const uint32_t req  = (uint32_t)ctx->gpr[4];
@@ -1979,7 +1987,7 @@ void func_0099790C(ppu_context* ctx)
                 /* Fall through to the lifted body rather than returning: with the
                  * busy flag already clear it skips the event-flag wait but still
                  * runs the post-processing after it, which the caller depends on. */
-                func_0099790C_lifted(ctx);
+                TM_EDGE_WAIT_LIFTED(ctx);
                 return;
             }
             static int warned = 0;
@@ -1990,9 +1998,13 @@ void func_0099790C(ppu_context* ctx)
         }
     }
     (void)self;
-    func_0099790C_lifted(ctx);
+    TM_EDGE_WAIT_LIFTED(ctx);
 }
+#endif /* TM_EDGE_WAIT */
 
+/* BCUS98106 by-address hooks: heap, pool. Meaningless on another binary,
+ * where these addresses are other functions. */
+#if TM_US_ADDRESS_HOOKS
 /* TEMP TM_ALLOCTRACE=<size>: log the guest call chain of memalign requests of
  * exactly that size (the heap fills with 66200-byte blocks). */
 void func_004DBEC4_lifted(ppu_context* ctx);

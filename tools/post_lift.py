@@ -182,8 +182,9 @@ FALLTHROUGH = {
 # Per-title tables. Every address above is a BCUS98106 one.
 # BCES01010 (Europe, v01.01): the title's three loggers, found through the
 # format strings they are passed, with the same bodies as their US
-# counterparts. No tracer or by-address fix is ported yet; the vector-op
-# lowerings below are generic and apply to every title.
+# counterparts, and the Edge decompressor's wait, the binary's only caller of
+# cellSpursEventFlagWait. No tracer or other by-address fix is ported yet; the
+# vector-op lowerings below are generic and apply to every title.
 TITLES = {
     'BCUS98106': dict(overrides=OVERRIDES, trace=TRACE, fallthrough=FALLTHROUGH,
                       address_patches=True),
@@ -191,6 +192,7 @@ TITLES = {
                           '0034AE6C': "the title's log(level, fmt, ...) (BCUS98106 0x0034ACAC)",
                           '00981860': "the title's second log (BCUS98106 0x00980B20)",
                           '004747BC': "the Ui state machine's log (BCUS98106 0x004740EC)",
+                          '0099864C': "the Edge decompressor's completion wait (BCUS98106 0x0099790C)",
                       },
                       trace={}, fallthrough={}, address_patches=False),
 }
