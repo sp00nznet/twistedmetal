@@ -127,6 +127,61 @@ an OPD descriptor pointing back into the image, which noise never does.
 - [ps3recomp](https://github.com/sp00nznet/ps3recomp) checked out at `../ps3recomp`
 - 7-Zip (reads the UDF image)
 
+## Building on Linux
+
+The harness also builds and boots on Linux (checked on a Steam Deck,
+SteamOS, GCC 15.2). Off Windows, CMake builds the runtime from
+`PS3RECOMP_DIR` itself, so it needs SDL2 (plus Vulkan headers and glslang
+for `-DPS3RECOMP_RSX_VULKAN=ON`), and a ps3recomp tree that has both
+`ydkj-master-bringup` and master's POSIX fixes.
+
+Without any game data, `twistedmetal_smoke` boots this harness on
+ps3recomp's synthetic smoke title:
+
+```bash
+cmake -S . -B build-smoke -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DTM_BUILD_GAME=OFF -DTM_BUILD_SMOKE=ON
+cmake --build build-smoke --target twistedmetal_smoke
+./build-smoke/twistedmetal_smoke build-smoke/smoke/smoke.elf   # [smoke] PASS
+```
+
+The European disc, `BCES01010`, is a different binary from `BCUS98106`:
+its TOC, code end and hooked functions sit at other addresses, which
+`TM_TITLE` and `post_lift.py --title` select.
+
+```bash
+P=../ps3recomp/tools
+python $P/find_functions.py input/EBOOT.ELF --output meta/functions.json
+python tools/seed_gaps.py --code-hi 0xC7BD3C
+python $P/ppu_loader.py input/EBOOT.ELF -o meta/
+python $P/ppu_lifter.py input/EBOOT.ELF \
+       --functions meta/functions.seeded.json --hle-stubs meta/EBOOT.imports.json \
+       --toc 0xF21968 --code-end 0xC7BD3C --chunk-lines 150000 --output src/recomp -j 3
+python tools/post_lift.py --title BCES01010
+python $P/extract_spu_images.py input/EBOOT.ELF --output meta/spu
+python $P/build_spu_workloads.py --images meta/spu --lifted src/spu_gen \
+       --out src/gen/spu_workloads.c --register-fn tm_spu_register_all \
+       --constructor --title twistedmetal
+cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DTM_TITLE=BCES01010 \
+      -DTM_LINK_SPU_JOBS=OFF -DTM_RECOMP_COMPILE_OPTIONS=-O1
+cmake --build build-linux -j2
+PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EBOOT.ELF
+```
+
+- GCC needs about 2 GB per 240k-line chunk at `-O1`. `--chunk-lines`
+  (ps3recomp's `ppu_lifter.py`) keeps each chunk small enough for a 16 GB
+  machine; without it, chunks are 600k lines.
+- The VFS root must be writable: `/dev_hdd0` maps into it, and the title
+  installs its game data there on first boot. A read-only disc tree can be
+  symlinked in as `PS3_GAME`.
+- `TM_GAMELOG=1` prints the game's own log, as on Windows.
+
+On Linux the title boots on the null backend to its legal screens
+(`UiLegal_1` through `UiLegal_havok`), with the UI archive inflated on the
+host -- but not on every run yet: after the archive loader starts it often
+stalls. Nothing is rendered: the live NV4097 engine is D3D12-only, and the
+Vulkan backend is not wired in.
+
 ## Project structure
 
 ```
@@ -146,6 +201,7 @@ twistedmetal/
 │   ├── boot_main.cpp       # ps3recomp boot harness, rebranded for this title
 │   ├── hle_extra.cpp       # imports this title reaches that the runtime lacks
 │   ├── tm_inflate.cpp      # self-contained RFC 1951 inflater for the SPU decompressor
+│   ├── smoke_stubs.cpp     # empty game hooks for twistedmetal_smoke
 │   ├── compat/             # <dirent.h>/<unistd.h> Win32 shims
 │   ├── gen/                # generated HLE NID table (committed)
 │   ├── spu_gen/            # lifted SPU images, 19 MB (gitignored; regenerate)
