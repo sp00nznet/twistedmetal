@@ -175,12 +175,17 @@ PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EB
   installs its game data there on first boot. A read-only disc tree can be
   symlinked in as `PS3_GAME`.
 - `TM_GAMELOG=1` prints the game's own log, as on Windows.
+- With `-DPS3RECOMP_RSX_VULKAN=ON` the harness presents through the Vulkan
+  backend (`PS3RECOMP_VK_GUEST_PROGRAMS=1` runs the title's own programs,
+  `PS3RECOMP_VK_WINDOW=1` opens a window); `TM_RSX=null` keeps the null one.
+- `TM_GSTACKS=<seconds>` prints every guest thread's call chain that often.
 
-On Linux the title boots on the null backend to its legal screens
-(`UiLegal_1` through `UiLegal_havok`), with the UI archive inflated on the
-host -- but not on every run yet: after the archive loader starts it often
-stalls. Nothing is rendered: the live NV4097 engine is D3D12-only, and the
-Vulkan backend is not wired in.
+On Linux the title boots to its legal screens (`UiLegal_1` through
+`UiLegal_havok`), with the UI archive inflated on the host, in 11 of 14
+runs; the others stop after the archive loader starts. On Vulkan its
+loading indicator renders through its own programs, but the legal screens
+stay black: they are composited with scaled NV3089 blits, which only the
+D3D12 live engine resolves on the GPU.
 
 ## Project structure
 
