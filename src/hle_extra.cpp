@@ -25,6 +25,13 @@
 #include <thread>
 #include <chrono>
 
+/* 1: the lift comes from BCUS98106 and this file's by-address hooks apply.
+ * CMakeLists.txt sets it from TM_TITLE; without it, the original behaviour is
+ * kept. */
+#ifndef TM_US_ADDRESS_HOOKS
+#define TM_US_ADDRESS_HOOKS 1
+#endif
+
 extern "C" {
 void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 uint32_t vm_read32(uint64_t a);
@@ -389,6 +396,7 @@ static void tm_game_log(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+#if TM_US_ADDRESS_HOOKS
 /* Replaces the lifted body, which tools/post_lift.py renames to _lifted. The
  * lifter emits direct C++ calls, so a rename is the only way to intercept one;
  * ppu_register_function redirects indirect dispatch only. */
@@ -425,6 +433,37 @@ void func_004740EC(ppu_context* ctx)
     if (on) tm_game_log(ctx);
     func_004740EC_lifted(ctx);
 }
+#elif defined(TM_TITLE_BCES01010)
+/* The same three loggers in BCES01010, found through the format strings they
+ * are passed; tools/post_lift.py --title BCES01010 renames their bodies. */
+void func_0034AE6C(ppu_context* ctx)   /* BCUS98106 0x0034ACAC */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    ctx->gpr[3] = 0;
+}
+
+void func_00981860_lifted(ppu_context* ctx);
+
+void func_00981860(ppu_context* ctx)   /* BCUS98106 0x00980B20 */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_00981860_lifted(ctx);
+}
+
+void func_004747BC_lifted(ppu_context* ctx);
+
+void func_004747BC(ppu_context* ctx)   /* BCUS98106 0x004740EC */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_004747BC_lifted(ctx);
+}
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* ---------------------------------------------------------------------------
  * Title metadata from PARAM.SFO.
@@ -520,6 +559,9 @@ static void cellVideoOutGetDeviceInfo(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+/* Everything up to the #endif targets BCUS98106 functions by address
+ * (tools/post_lift.py renames them to _lifted). */
+#if TM_US_ADDRESS_HOOKS
 /* ---------------------------------------------------------------------------
  * Guest call tracing (TM_TRACE=1).
  *
@@ -1285,6 +1327,12 @@ void func_0036204C(ppu_context* ctx) { tm_trace("AL::204c", func_0036204C_lifted
 void func_00670C10(ppu_context* ctx) { tm_trace("f_00670C10", func_00670C10_lifted, ctx); }
 void func_00671560(ppu_context* ctx) { tm_trace("f_00671560", func_00671560_lifted, ctx); }
 void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lifted, ctx); }
+#else
+/* Other titles: what the rest of this file expects from the block above. */
+ppu_context* g_tm_main_ctx = nullptr;   /* TEMP: main thread, for TM_MAINSTACK */
+extern "C" ppu_context* g_tm_postfx_ctx = nullptr;   /* set by post_lift.py code on BCUS98106 */
+extern "C" void tm_brb_counters_tick(void) {}
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* ---------------------------------------------------------------------------
  * cellNetCtlGetState (0x8B3EBA69) — report a state instead of an error.
@@ -1752,6 +1800,9 @@ static void probe_EventFlagWait(ppu_context* ctx)
         (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
 }
 
+/* BCUS98106 by-address hooks: host Edge decompressor, heap, pool. Meaningless
+ * on another binary, where these addresses are other functions. */
+#if TM_US_ADDRESS_HOOKS
 /* ---------------------------------------------------------------------------
  * The Edge decompressor's completion wait, guest 0x0099790C.
  *
@@ -2005,12 +2056,14 @@ void func_00676ED8(ppu_context* ctx)
     fflush(stderr);
     func_00676ED8_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 static void tm_pool_dump(const char* why)
 {
     fprintf(stderr, "[pool] %s:", why);
     for (uint32_t o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(0x019307A4u + o));
     fprintf(stderr, "\n"); fflush(stderr);
 }
+#if TM_US_ADDRESS_HOOKS
 void func_00678CE8_lifted(ppu_context* ctx);
 void func_00678CE8(ppu_context* ctx)
 {
@@ -2031,6 +2084,7 @@ void func_00678CE8(ppu_context* ctx)
     }
     func_00678CE8_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
 extern ppu_context* g_tm_main_ctx;
 extern "C" void tm_pool_tick(void)
@@ -2092,6 +2146,7 @@ void tm_toi_nan(ppu_context* ctx)
 
 /* TEMP diag: game frame progress, printed with TM_MAINSTACK. */
 volatile long g_tm_players_upd, g_tm_frame_upd;
+#if TM_US_ADDRESS_HOOKS
 void func_000DB394_lifted(ppu_context* ctx);
 void func_000DB394(ppu_context* ctx) { g_tm_players_upd++; func_000DB394_lifted(ctx); }
 void func_0010C898_lifted(ppu_context* ctx);
@@ -2126,6 +2181,7 @@ void func_0062EB40(ppu_context* ctx)
                 ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3]) : 0, ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3] + 4) : 0);
     func_0062EB40_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* TEMP diag: segment raycast loop in func_00630150 -- t (v28) += step (v27)
  * until t >= tmax (v26). Report the lanes once the loop has clearly run away. */

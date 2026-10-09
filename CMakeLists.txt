@@ -41,6 +41,9 @@ set(TM_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp" CACHE PATH
 # Extra compile options for the lifted chunks only (e.g. -O1 to keep GCC's
 # memory down on 40 MB translation units). Empty: the build type's own.
 set(TM_RECOMP_COMPILE_OPTIONS "" CACHE STRING "extra options for the lifted chunks")
+# Title the lift comes from. The by-address hooks in src/hle_extra.cpp and
+# tools/post_lift.py are only valid for BCUS98106.
+set(TM_TITLE "BCUS98106" CACHE STRING "title id of the lifted EBOOT")
 
 # PPU boot scaffold, compiled per game against the lifter's ppu_recomp.h.
 set(TM_SCAFFOLD_SOURCES
@@ -118,6 +121,12 @@ if(TM_BUILD_GAME)
         ${RECOMP_SOURCES}
     )
     tm_configure_target(twistedmetal "${TM_RECOMP_DIR}")
+    target_compile_definitions(twistedmetal PRIVATE TM_TITLE_${TM_TITLE}=1)
+    if(TM_TITLE STREQUAL "BCUS98106")
+        target_compile_definitions(twistedmetal PRIVATE TM_US_ADDRESS_HOOKS=1)
+    else()
+        target_compile_definitions(twistedmetal PRIVATE TM_US_ADDRESS_HOOKS=0)
+    endif()
     if(NOT MSVC)
         # Generated code: warnings bury what matters, and a PPC fmadd must not be
         # fused or split differently from what the lifter wrote.

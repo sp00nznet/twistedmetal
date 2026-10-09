@@ -14,7 +14,9 @@ body lets hle_extra.cpp implement it against the host stderr, gated on
 TM_GAMELOG so a normal run stays quiet.
 
 Run after every re-lift:  python tools/post_lift.py
+A lift of another binary passes its title id:  --title BCES01010
 """
+import argparse
 import glob
 import re
 import sys
@@ -177,6 +179,24 @@ FALLTHROUGH = {
     '0076CB00': '0076CBB4',
 }
 
+# Per-title tables. Every address above is a BCUS98106 one.
+# BCES01010 (Europe, v01.01): the title's three loggers, found through the
+# format strings they are passed, with the same bodies as their US
+# counterparts. No tracer or by-address fix is ported yet; the vector-op
+# lowerings below are generic and apply to every title.
+TITLES = {
+    'BCUS98106': dict(overrides=OVERRIDES, trace=TRACE, fallthrough=FALLTHROUGH,
+                      address_patches=True),
+    'BCES01010': dict(overrides={
+                          '0034AE6C': "the title's log(level, fmt, ...) (BCUS98106 0x0034ACAC)",
+                          '00981860': "the title's second log (BCUS98106 0x00980B20)",
+                          '004747BC': "the Ui state machine's log (BCUS98106 0x004740EC)",
+                      },
+                      trace={}, fallthrough={}, address_patches=False),
+}
+# False for a title the TOI/segment probes below have not been ported to.
+ADDRESS_PATCHES = True
+
 # vsumsws sites this lift emitted as "/* TODO */" no-ops -- the lifter only
 # learned the instruction afterwards (ps3recomp 93f1377). 1100 of them sit in
 # Havok, mostly "count the lanes that passed": vcmpgefp, vand, vsumsws. With
@@ -265,11 +285,11 @@ def patch(path, changed):
 
     out, n = VSUMSWS.subn(vsumsws, out)
     out, k = VMXOPS.subn(vmxop, out)
-    if SEG_EDGE in out and 'tm_seg_probe' not in out and 'func_00630150_' not in out and 'void func_00630150(' in out:
+    if ADDRESS_PATCHES and SEG_EDGE in out and 'tm_seg_probe' not in out and 'func_00630150_' not in out and 'void func_00630150(' in out:
         eol = chr(13) + chr(10) if chr(13) + chr(10) in out else chr(10)
         out = out.replace(SEG_EDGE, SEG_PROBE + eol + SEG_EDGE)
         changed.append(f'{path}: probed segment raycast loop')
-    if TOI_HEAD in out and 'tm_toi_nan' not in out:
+    if ADDRESS_PATCHES and TOI_HEAD in out and 'tm_toi_nan' not in out:
         eol = chr(13) + chr(10) if chr(13) + chr(10) in out else chr(10)
         exit_br = '        if (((ctx->cr >> 0) & 2)) goto loc_00B96088;'
         # TOI_HEAD, the fcmpu, the cror, then the exit branch: guard only there.
@@ -287,6 +307,16 @@ def patch(path, changed):
 
 
 def main():
+    global OVERRIDES, TRACE, FALLTHROUGH, ADDRESS_PATCHES
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--title', default='BCUS98106', choices=sorted(TITLES),
+                    help='title id of the lifted EBOOT (default: BCUS98106)')
+    args = ap.parse_args()
+    t = TITLES[args.title]
+    OVERRIDES, TRACE, FALLTHROUGH = t['overrides'], t['trace'], t['fallthrough']
+    ADDRESS_PATCHES = t['address_patches']
+
     files = sorted(glob.glob(f'{RECOMP}/*.cpp'))
     if not files:
         print(f'no lifted sources under {RECOMP}/ -- run ppu_lifter first', file=sys.stderr)
