@@ -105,7 +105,6 @@ static void cellVideoOutGetDeviceInfo(ppu_context* ctx);
 static void cellNetCtlGetState(ppu_context* ctx);
 static void cellSpursTaskAttribute2Initialize(ppu_context* ctx);
 static void cellSpursCreateTask2(ppu_context* ctx);
-static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx);
 static void probe_cellSpursSendSignal(ppu_context* ctx);
 static void probe_cellGcmGetFlipStatus(ppu_context* ctx);
 static void probe_EventFlagWait(ppu_context* ctx);
@@ -113,9 +112,11 @@ static void tm_jq_push_job(ppu_context* ctx);
 extern "C" ppu_context* g_tm_postfx_ctx;   /* TEMP: SpuPostFX thread (generated code) */
 #pragma comment(linker, "/alternatename:g_tm_postfx_ctx=?g_tm_postfx_ctx@@3PEAUppu_context@@EA")
 static void tm_jq_sync(ppu_context* ctx);
-static void tm_probe_spurs_unk(ppu_context* ctx);
 
 extern "C" void tm_vdec_register(void);   /* src/vdec_hle.cpp */
+extern "C" void ps3_hle_register(unsigned int nid, const char* name, void* handler);
+extern "C" int32_t cellSpursBarrierInitialize(uint64_t taskset, uint64_t barrier, uint32_t total);
+extern "C" int32_t cellSpursGetTasksetInfo(uint64_t taskset, uint64_t info);
 
 extern "C" void tm_hle_register_extra(void)
 {
@@ -139,15 +140,17 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x8ADADF65u, "_cellSpursTaskAttribute2Initialize",
                          cellSpursTaskAttribute2Initialize);
     ps3_hle_register_ctx(0xE14CA62Du, "cellSpursCreateTask2", cellSpursCreateTask2);
-    ps3_hle_register_ctx(0x9034E538u, "cellSpursTaskGetContextSaveAreaSize",
-                         cellSpursTaskGetContextSaveAreaSize);
     ps3_hle_register_ctx(0xE0A6DBE4u, "_cellSpursSendSignal", probe_cellSpursSendSignal);
     ps3_hle_register_ctx(0x72A577CEu, "cellGcmGetFlipStatus", probe_cellGcmGetFlipStatus);
     ps3_hle_register_ctx(0x373523D4u, "cellSpursEventFlagWait", probe_EventFlagWait);
     ps3_hle_register_ctx(0x90E392CFu, "cellSpursJq push job", tm_jq_push_job);
     ps3_hle_register_ctx(0x9396BE1Du, "cellSpursJq sync", tm_jq_sync);
-    ps3_hle_register_ctx(0x7FDF4FEFu, "cellSpurs unk 7FDF4FEF", tm_probe_spurs_unk);
-    ps3_hle_register_ctx(0x9FCB567Bu, "cellSpurs unk 9FCB567B", tm_probe_spurs_unk);
+    /* The post-FX library init creates its taskset, a barrier for its six
+     * tasks and the tasks themselves, then reads the taskset's workload id
+     * back. Neither call is in the generated table. */
+    ps3_hle_register(0x7FDF4FEFu, "cellSpursBarrierInitialize",
+                     (void*)cellSpursBarrierInitialize);
+    ps3_hle_register(0x9FCB567Bu, "cellSpursGetTasksetInfo", (void*)cellSpursGetTasksetInfo);
 }
 
 /* ---------------------------------------------------------------------------
@@ -278,14 +281,6 @@ static void cellSpursCreateTaskset2(ppu_context* ctx)
     fprintf(stderr, "[cellSpurs] CreateTaskset2 -> rc=0x%08X lr=0x%08X\n", (uint32_t)rc, (uint32_t)ctx->lr);  /* TEMP */
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
-/* TEMP: two cellSpurs imports the post-FX init calls that nothing registers. */
-static void tm_probe_spurs_unk(ppu_context* ctx)
-{
-    fprintf(stderr, "[cellSpurs] unk import r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X\n",
-            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
-    ctx->gpr[3] = 0;
-}
-
 /* cellSpursAttributeEnableSystemWorkload(attr, priority[8], maxSpu, isPreemptible[8]).
  * Reserves an SPU for the system workload. The runtime schedules workloads on
  * the host, so there is nothing to reserve — acknowledging is the whole job. */
@@ -1494,14 +1489,6 @@ static void cellSpursCreateTask2(ppu_context* ctx)
                                            (void*)(uintptr_t)eaContext,
                                            sizeContext, lsPattern, argument);
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
-}
-
-/* Size of the per-task context save area. The runtime keeps no save area, but
- * the title allocates from this, so a zero would give every task a null
- * context. One SPU local store is the SDK's maximum and always sufficient. */
-static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx)
-{
-    ctx->gpr[3] = 0x40000;
 }
 
 /* Probe: _cellSpursSendSignal (0xE0A6DBE4). The SPU task parks in WAIT_SIGNAL
