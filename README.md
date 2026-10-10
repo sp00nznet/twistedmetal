@@ -181,11 +181,15 @@ PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EB
 - `TM_GSTACKS=<seconds>` prints every guest thread's call chain that often.
 
 On Linux the title boots to its legal screens (`UiLegal_1` through
-`UiLegal_havok`), with the UI archive inflated on the host, in 11 of 14
-runs; the others stop after the archive loader starts. On Vulkan its
-loading indicator renders through its own programs, but the legal screens
-stay black: they are composited with scaled NV3089 blits, which only the
-D3D12 live engine resolves on the GPU.
+`UiLegal_havok`), with the UI archive inflated on the host, in 25 of 34
+runs. The others stop after the archive loader starts: most abort in the
+guest allocator right after the game logs `File read error: 0x80010706`,
+and a few stall. On Vulkan (RADV, Steam Deck) the loading indicator, the
+boot logo and the legal screens render through the title's own programs.
+That needs ps3recomp's `fix/b8-component-remap`, `fix/engine-unnorm-coords`,
+`feat/vk-rgba16f-targets`, `fix/engine-display-buffers-flips` and
+`feat/engine-nv3089-coherence`, all in its `linux/integration` branch. The
+legal screens present at two to three frames per second for now.
 
 ## Project structure
 
