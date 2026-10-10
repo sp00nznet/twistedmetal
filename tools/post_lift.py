@@ -193,6 +193,7 @@ TITLES = {
                           '00981860': "the title's second log (BCUS98106 0x00980B20)",
                           '004747BC': "the Ui state machine's log (BCUS98106 0x004740EC)",
                           '0099864C': "the Edge decompressor's completion wait (BCUS98106 0x0099790C)",
+                          '00976FD4': "the title's dlmalloc free(mspace, mem), checked under TM_FREECHECK",
                       },
                       trace={}, fallthrough={}, address_patches=False),
 }

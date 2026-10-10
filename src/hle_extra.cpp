@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <chrono>
@@ -462,6 +463,73 @@ void func_004747BC(ppu_context* ctx)   /* BCUS98106 0x004740EC */
     if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
     if (on) tm_game_log(ctx);
     func_004747BC_lifted(ctx);
+}
+
+/* TM_FREECHECK=1: the title's dlmalloc free(mspace, mem). The lifted body
+ * aborts on a chunk below the heap, a chunk not marked in use, a size that
+ * does not move forward, or a next chunk that says this one is free -- a
+ * double free or an overwritten header. Linux runs end in that abort, from
+ * several FIOS paths, so check the same conditions first and, when one would
+ * fail, print the chunk, its neighbourhood, the caller chain and every recent
+ * free of the same address. The body then runs and aborts as before. */
+void func_00976FD4_lifted(ppu_context* ctx);
+extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
+
+namespace {
+struct TmFreeRec { uint32_t mem, lr, caller, tid; };
+TmFreeRec s_free_ring[262144];
+std::atomic<uint32_t> s_free_seq{0};
+}
+
+static uint32_t tm_frame_caller(const ppu_context* ctx)
+{
+    const uint32_t sp = (uint32_t)ctx->gpr[1];
+    const uint32_t back = sp ? vm_read32(sp + 4) : 0;    /* 64-bit back chain, low word */
+    return back > sp ? vm_read32(back + 0x14) : 0;       /* that frame's saved LR, low word */
+}
+
+void func_00976FD4(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_FREECHECK") ? 1 : 0;
+    const uint32_t m = (uint32_t)ctx->gpr[3], mem = (uint32_t)ctx->gpr[4];
+    if (!on || !mem) { func_00976FD4_lifted(ctx); return; }
+
+    const uint32_t p = mem - 8, least = vm_read32(m + 0x10);
+    const uint32_t head = p >= least ? vm_read32(p + 4) : 0;
+    const uint32_t size = head & ~7u, next = p + size;
+    const uint32_t nhead = next > p ? vm_read32(next + 4) : 0;
+    const char* why = p < least       ? "chunk below the heap"
+                    : !(head & 2u)    ? "chunk not in use (double free?)"
+                    : !(next > p)     ? "size does not move forward"
+                    : !(nhead & 1u)   ? "next chunk says this one is free"
+                    : nullptr;
+    const uint32_t lr = (uint32_t)ctx->lr, caller = tm_frame_caller(ctx);
+    if (why) {
+        static std::atomic<int> said{0};
+        if (said++ < 3) {
+            fprintf(stderr, "[freecheck] %s: mspace=0x%08X mem=0x%08X prev_size=0x%08X head=0x%08X"
+                            " next=0x%08X next_head=0x%08X lr=0x%08X caller=0x%08X tid=%llu\n",
+                    why, m, mem, p >= least ? vm_read32(p) : 0, head, next, nhead, lr, caller,
+                    (unsigned long long)ctx->thread_id);
+            for (uint32_t a = (p - 0x40) & ~15u; a < p + 0x60; a += 16)
+                fprintf(stderr, "[freecheck]   %08X: %08X %08X %08X %08X\n", a,
+                        vm_read32(a), vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12));
+            const uint32_t end = s_free_seq.load();
+            const uint32_t n = end < 262144u ? end : 262144u;
+            for (uint32_t i = 0; i < n; i++) {
+                const TmFreeRec& r = s_free_ring[(end - 1 - i) & 262143u];
+                if (r.mem == mem)
+                    fprintf(stderr, "[freecheck]   freed %u frees ago: lr=0x%08X caller=0x%08X tid=%u\n",
+                            i + 1, r.lr, r.caller, r.tid);
+            }
+            ppu_dump_guest_stack(ctx, "freecheck");
+            fflush(stderr);
+        }
+    }
+    const uint32_t seq = s_free_seq.fetch_add(1);
+    s_free_ring[seq & 262143u] = TmFreeRec{ mem, lr, caller, (uint32_t)ctx->thread_id };
+    func_00976FD4_lifted(ctx);
 }
 #endif /* TM_US_ADDRESS_HOOKS */
 
