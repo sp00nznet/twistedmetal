@@ -180,16 +180,19 @@ PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EB
   `PS3RECOMP_VK_WINDOW=1` opens a window); `TM_RSX=null` keeps the null one.
 - `TM_GSTACKS=<seconds>` prints every guest thread's call chain that often.
 
-On Linux the title boots to its legal screens (`UiLegal_1` through
-`UiLegal_havok`), with the UI archive inflated on the host, in 25 of 34
-runs. The others stop after the archive loader starts: most abort in the
-guest allocator right after the game logs `File read error: 0x80010706`,
-and a few stall. On Vulkan (RADV, Steam Deck) the loading indicator, the
-boot logo and the legal screens render through the title's own programs.
-That needs ps3recomp's `fix/b8-component-remap`, `fix/engine-unnorm-coords`,
-`feat/vk-rgba16f-targets`, `fix/engine-display-buffers-flips` and
-`feat/engine-nv3089-coherence`, all in its `linux/integration` branch. The
-legal screens present at two to three frames per second for now.
+On Linux the title boots through all of its legal screens (`UiLegal_1`
+through `UiLegal_havok`, about 45 s), with the UI archive inflated on the
+host, in 10 of 10 runs. It then stays on its "EXIT GAME NETWORK" dialog
+(`UiNetShutdown`), which on Windows leads to `MainMenu`. Until ps3recomp's
+`fix/lwmutex-posix`, every `sys_lwmutex` was a no-op on POSIX, and about
+one run in three aborted in the guest allocator (`TM_FREECHECK=1` shows
+such a double free). On Vulkan (RADV, Steam Deck) the loading indicator,
+the boot logo, the legal screens and that dialog render through the
+title's own programs. That needs ps3recomp's `fix/b8-component-remap`,
+`fix/engine-unnorm-coords`, `feat/vk-rgba16f-targets`,
+`fix/engine-display-buffers-flips` and `feat/engine-nv3089-coherence`. All
+of them are in its `linux/integration` branch. The legal screens present at
+two to three frames per second for now.
 
 ## Project structure
 
