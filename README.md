@@ -204,29 +204,31 @@ host, in 10 of 10 runs. It then shows its "EXIT GAME NETWORK" dialog
 stayed there (200 s in one run). With them lifted, the dialog closed after
 75 to 87 s in 3 of 3 runs (it does not always close: one run stayed on it
 for 170 s), and the title goes on to `MainMenu`. On Vulkan the main menu's
-items and button hints render ("ONE PLAYER", "MULTI-PLAYER", "QUICK
-ONLINE ACTION", "OPTIONS", "PREV/NEXT", "SELECT"); that needs ps3recomp's
+items and button hints render ("ONE PLAYER", "MULTI-PLAYER", "QUICK ONLINE
+ACTION", "OPTIONS", "PREV/NEXT", "SELECT"); that needs ps3recomp's
 `fix/gcm-resolve-main-io`, without which the menu's fragment programs were
 read out of VRAM. The deferred 3D scene behind the menu (shadow atlas,
-four-target G-buffer, HDR lighting, bloom) still draws nothing: its vertex
-arrays read as zeros unless the RSX waits on its frame label 0x42 as the
-hardware does (`GCM_SEMA_ACQUIRE=1`). With that set and the post-FX tasks
-missing, the G-buffer filled (a car interior) but the final composite was
-skipped. `SpuPostFX` writes that label once its post-FX tasks finish;
-those tasks are now created (see `hle_extra.cpp`), take their first
-signal and wait at a SPURS barrier whose layout ps3recomp does not have
-right yet, so with `GCM_SEMA_ACQUIRE=1` the frame now stalls on the label.
-The default run is unaffected. Until ps3recomp's
-`fix/lwmutex-posix`, every `sys_lwmutex` was a no-op on POSIX, and about
-one run in three aborted in the guest allocator (`TM_FREECHECK=1` shows
-such a double free). On Vulkan (RADV, Steam Deck) the loading indicator,
-the boot logo, the legal screens and that dialog render through the
-title's own programs. That needs ps3recomp's `fix/b8-component-remap`,
-`fix/engine-unnorm-coords`, `feat/vk-rgba16f-targets`,
-`fix/engine-display-buffers-flips`, `feat/engine-nv3089-coherence` and,
-for the 4608x704 target the 3D scene uses, `feat/vk-max-image-dim`. All of
-them are in its `linux/integration` branch. The legal screens present at
-two to three frames per second for now.
+four-target G-buffer, HDR lighting, bloom) now draws its geometry too, with
+wrong colours so far. That took three more ps3recomp fixes: its SPU decoder
+lacked `orbi`/`xorhi`/`xorbi` (`fix/spu-disasm-orbi`; re-lift the jobs and
+images after it -- job 0x29F5F1C692D71C34 runs four `orbi` every menu
+frame), and the post-FX tasks need `cellSpursBarrierInitialize` and
+`cellSpursGetTasksetInfo` (`feat/spurs-barrier-tasksetinfo`) plus a taskset
+the runtime no longer corrupts (`fix/spurs-taskset-native-fields`). With
+them `SpuPostFX` runs its tasks again and again (one post-FX frame about
+every 20 s so far); the RSX still runs ahead of its frame label
+(`GCM_SEMA_ACQUIRE=1` makes it wait, and then the title stalls after its
+legal screens). Until ps3recomp's `fix/lwmutex-posix`, every `sys_lwmutex`
+was a no-op on POSIX, and about one run in three aborted in the guest
+allocator (`TM_FREECHECK=1` shows such a double free). On Vulkan (RADV,
+Steam Deck) the loading indicator, the boot logo, the legal screens and
+that dialog render through the title's own programs. That needs ps3recomp's
+`fix/b8-component-remap`, `fix/engine-unnorm-coords`,
+`feat/vk-rgba16f-targets`, `fix/engine-display-buffers-flips`,
+`feat/engine-nv3089-coherence` and, for the 4608x704 target the 3D scene
+uses, `feat/vk-max-image-dim`. All of them are in its `linux/integration`
+branch. The legal screens present at two to three frames per second for
+now.
 
 ## Project structure
 
