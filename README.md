@@ -163,9 +163,26 @@ python $P/build_spu_workloads.py --images meta/spu --lifted src/spu_gen \
        --out src/gen/spu_workloads.c --register-fn tm_spu_register_all \
        --constructor --title twistedmetal
 cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DTM_TITLE=BCES01010 \
-      -DTM_LINK_SPU_JOBS=OFF -DTM_RECOMP_COMPILE_OPTIONS=-O1
+      -DTM_RECOMP_COMPILE_OPTIONS=-O1
 cmake --build build-linux -j2
 PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EBOOT.ELF
+```
+
+The JobQueue jobs and the audio mixer's SPURS policy module are not in the
+EBOOT: the title loads them from its data. Dump them at run time, lift them,
+and configure again; for a title other than BCUS98106, CMake registers every
+`src/spu_gen/job_<fingerprint>` and `pm_<fingerprint>` it finds.
+
+```bash
+SPU_DUMP_MISS=$PWD/meta/jobs PS3_VFS_ROOT=... ./build-linux/twistedmetal input/EBOOT.ELF
+# A job runs at LS 0. The policy module ("[cellSpurs] wid=0 PM dumped") runs at
+# LS 0xA00: use base=0xA00 and the pm_ prefix and directory for that one.
+fp=<fingerprint>; base=0x0; kind=job
+python $P/wrap_spu_elf.py meta/jobs/spujob_${fp}_*.bin --entry $base --base $base \
+       --out meta/spu/${kind}_$fp.elf
+python $P/spu_lifter.py meta/spu/${kind}_$fp.elf --auto-functions meta/spu/${kind}_$fp.elf \
+       --symbol-prefix ${kind}_${fp}_ -o src/spu_gen/${kind}_$fp
+cmake build-linux && cmake --build build-linux -j2
 ```
 
 - GCC needs about 2 GB per 240k-line chunk at `-O1`. `--chunk-lines`
@@ -182,16 +199,23 @@ PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EB
 
 On Linux the title boots through all of its legal screens (`UiLegal_1`
 through `UiLegal_havok`, about 45 s), with the UI archive inflated on the
-host, in 10 of 10 runs. It then stays on its "EXIT GAME NETWORK" dialog
-(`UiNetShutdown`), which on Windows leads to `MainMenu`. Until ps3recomp's
+host, in 10 of 10 runs. It then shows its "EXIT GAME NETWORK" dialog
+(`UiNetShutdown`). Without the dumped jobs and the mixer's policy module it
+stayed there (200 s in one run). With them lifted, the dialog closed after
+75 to 87 s in 3 of 3 runs, and the title goes on to a deferred 3D scene
+(about 900 draws a frame, shadow map, four-target G-buffer, car textures),
+presumably the main menu's garage. On Vulkan that scene is still mostly
+black: a light shaft and a coloured frame show, the rest does not, and cube
+maps are not supported there yet. Until ps3recomp's
 `fix/lwmutex-posix`, every `sys_lwmutex` was a no-op on POSIX, and about
 one run in three aborted in the guest allocator (`TM_FREECHECK=1` shows
 such a double free). On Vulkan (RADV, Steam Deck) the loading indicator,
 the boot logo, the legal screens and that dialog render through the
 title's own programs. That needs ps3recomp's `fix/b8-component-remap`,
 `fix/engine-unnorm-coords`, `feat/vk-rgba16f-targets`,
-`fix/engine-display-buffers-flips` and `feat/engine-nv3089-coherence`. All
-of them are in its `linux/integration` branch. The legal screens present at
+`fix/engine-display-buffers-flips`, `feat/engine-nv3089-coherence` and,
+for the 4608x704 target the 3D scene uses, `feat/vk-max-image-dim`. All of
+them are in its `linux/integration` branch. The legal screens present at
 two to three frames per second for now.
 
 ## Project structure
