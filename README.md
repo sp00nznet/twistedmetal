@@ -202,11 +202,21 @@ through `UiLegal_havok`, about 45 s), with the UI archive inflated on the
 host, in 10 of 10 runs. It then shows its "EXIT GAME NETWORK" dialog
 (`UiNetShutdown`). Without the dumped jobs and the mixer's policy module it
 stayed there (200 s in one run). With them lifted, the dialog closed after
-75 to 87 s in 3 of 3 runs, and the title goes on to a deferred 3D scene
-(about 900 draws a frame, shadow map, four-target G-buffer, car textures),
-presumably the main menu's garage. On Vulkan that scene is still mostly
-black: a light shaft and a coloured frame show, the rest does not, and cube
-maps are not supported there yet. Until ps3recomp's
+75 to 87 s in 3 of 3 runs (it does not always close: one run stayed on it
+for 170 s), and the title goes on to `MainMenu`. On Vulkan the main menu's
+items and button hints render ("ONE PLAYER", "MULTI-PLAYER", "QUICK
+ONLINE ACTION", "OPTIONS", "PREV/NEXT", "SELECT"); that needs ps3recomp's
+`fix/gcm-resolve-main-io`, without which the menu's fragment programs were
+read out of VRAM. The deferred 3D scene behind the menu (shadow atlas,
+four-target G-buffer, HDR lighting, bloom) still draws nothing: its vertex
+arrays read as zeros unless the RSX waits on its frame label 0x42 as the
+hardware does (`GCM_SEMA_ACQUIRE=1`). With that set and the post-FX tasks
+missing, the G-buffer filled (a car interior) but the final composite was
+skipped. `SpuPostFX` writes that label once its post-FX tasks finish;
+those tasks are now created (see `hle_extra.cpp`), take their first
+signal and wait at a SPURS barrier whose layout ps3recomp does not have
+right yet, so with `GCM_SEMA_ACQUIRE=1` the frame now stalls on the label.
+The default run is unaffected. Until ps3recomp's
 `fix/lwmutex-posix`, every `sys_lwmutex` was a no-op on POSIX, and about
 one run in three aborted in the guest allocator (`TM_FREECHECK=1` shows
 such a double free). On Vulkan (RADV, Steam Deck) the loading indicator,
