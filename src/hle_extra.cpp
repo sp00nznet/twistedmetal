@@ -21,9 +21,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <chrono>
+
+/* 1: the lift comes from BCUS98106 and this file's by-address hooks apply.
+ * CMakeLists.txt sets it from TM_TITLE; without it, the original behaviour is
+ * kept. */
+#ifndef TM_US_ADDRESS_HOOKS
+#define TM_US_ADDRESS_HOOKS 1
+#endif
 
 extern "C" {
 void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -97,7 +105,6 @@ static void cellVideoOutGetDeviceInfo(ppu_context* ctx);
 static void cellNetCtlGetState(ppu_context* ctx);
 static void cellSpursTaskAttribute2Initialize(ppu_context* ctx);
 static void cellSpursCreateTask2(ppu_context* ctx);
-static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx);
 static void probe_cellSpursSendSignal(ppu_context* ctx);
 static void probe_cellGcmGetFlipStatus(ppu_context* ctx);
 static void probe_EventFlagWait(ppu_context* ctx);
@@ -105,9 +112,11 @@ static void tm_jq_push_job(ppu_context* ctx);
 extern "C" ppu_context* g_tm_postfx_ctx;   /* TEMP: SpuPostFX thread (generated code) */
 #pragma comment(linker, "/alternatename:g_tm_postfx_ctx=?g_tm_postfx_ctx@@3PEAUppu_context@@EA")
 static void tm_jq_sync(ppu_context* ctx);
-static void tm_probe_spurs_unk(ppu_context* ctx);
 
 extern "C" void tm_vdec_register(void);   /* src/vdec_hle.cpp */
+extern "C" void ps3_hle_register(unsigned int nid, const char* name, void* handler);
+extern "C" int32_t cellSpursBarrierInitialize(uint64_t taskset, uint64_t barrier, uint32_t total);
+extern "C" int32_t cellSpursGetTasksetInfo(uint64_t taskset, uint64_t info);
 
 extern "C" void tm_hle_register_extra(void)
 {
@@ -131,15 +140,17 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x8ADADF65u, "_cellSpursTaskAttribute2Initialize",
                          cellSpursTaskAttribute2Initialize);
     ps3_hle_register_ctx(0xE14CA62Du, "cellSpursCreateTask2", cellSpursCreateTask2);
-    ps3_hle_register_ctx(0x9034E538u, "cellSpursTaskGetContextSaveAreaSize",
-                         cellSpursTaskGetContextSaveAreaSize);
     ps3_hle_register_ctx(0xE0A6DBE4u, "_cellSpursSendSignal", probe_cellSpursSendSignal);
     ps3_hle_register_ctx(0x72A577CEu, "cellGcmGetFlipStatus", probe_cellGcmGetFlipStatus);
     ps3_hle_register_ctx(0x373523D4u, "cellSpursEventFlagWait", probe_EventFlagWait);
     ps3_hle_register_ctx(0x90E392CFu, "cellSpursJq push job", tm_jq_push_job);
     ps3_hle_register_ctx(0x9396BE1Du, "cellSpursJq sync", tm_jq_sync);
-    ps3_hle_register_ctx(0x7FDF4FEFu, "cellSpurs unk 7FDF4FEF", tm_probe_spurs_unk);
-    ps3_hle_register_ctx(0x9FCB567Bu, "cellSpurs unk 9FCB567B", tm_probe_spurs_unk);
+    /* The post-FX library init creates its taskset, a barrier for its six
+     * tasks and the tasks themselves, then reads the taskset's workload id
+     * back. Neither call is in the generated table. */
+    ps3_hle_register(0x7FDF4FEFu, "cellSpursBarrierInitialize",
+                     (void*)cellSpursBarrierInitialize);
+    ps3_hle_register(0x9FCB567Bu, "cellSpursGetTasksetInfo", (void*)cellSpursGetTasksetInfo);
 }
 
 /* ---------------------------------------------------------------------------
@@ -270,14 +281,6 @@ static void cellSpursCreateTaskset2(ppu_context* ctx)
     fprintf(stderr, "[cellSpurs] CreateTaskset2 -> rc=0x%08X lr=0x%08X\n", (uint32_t)rc, (uint32_t)ctx->lr);  /* TEMP */
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
-/* TEMP: two cellSpurs imports the post-FX init calls that nothing registers. */
-static void tm_probe_spurs_unk(ppu_context* ctx)
-{
-    fprintf(stderr, "[cellSpurs] unk import r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X\n",
-            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
-    ctx->gpr[3] = 0;
-}
-
 /* cellSpursAttributeEnableSystemWorkload(attr, priority[8], maxSpu, isPreemptible[8]).
  * Reserves an SPU for the system workload. The runtime schedules workloads on
  * the host, so there is nothing to reserve — acknowledging is the whole job. */
@@ -389,6 +392,7 @@ static void tm_game_log(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+#if TM_US_ADDRESS_HOOKS
 /* Replaces the lifted body, which tools/post_lift.py renames to _lifted. The
  * lifter emits direct C++ calls, so a rename is the only way to intercept one;
  * ppu_register_function redirects indirect dispatch only. */
@@ -425,6 +429,104 @@ void func_004740EC(ppu_context* ctx)
     if (on) tm_game_log(ctx);
     func_004740EC_lifted(ctx);
 }
+#elif defined(TM_TITLE_BCES01010)
+/* The same three loggers in BCES01010, found through the format strings they
+ * are passed; tools/post_lift.py --title BCES01010 renames their bodies. */
+void func_0034AE6C(ppu_context* ctx)   /* BCUS98106 0x0034ACAC */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    ctx->gpr[3] = 0;
+}
+
+void func_00981860_lifted(ppu_context* ctx);
+
+void func_00981860(ppu_context* ctx)   /* BCUS98106 0x00980B20 */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_00981860_lifted(ctx);
+}
+
+void func_004747BC_lifted(ppu_context* ctx);
+
+void func_004747BC(ppu_context* ctx)   /* BCUS98106 0x004740EC */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_004747BC_lifted(ctx);
+}
+
+/* TM_FREECHECK=1: the title's dlmalloc free(mspace, mem). The lifted body
+ * aborts on a chunk below the heap, a chunk not marked in use, a size that
+ * does not move forward, or a next chunk that says this one is free -- a
+ * double free or an overwritten header. Linux runs end in that abort, from
+ * several FIOS paths, so check the same conditions first and, when one would
+ * fail, print the chunk, its neighbourhood, the caller chain and every recent
+ * free of the same address. The body then runs and aborts as before. */
+void func_00976FD4_lifted(ppu_context* ctx);
+extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
+
+namespace {
+struct TmFreeRec { uint32_t mem, lr, caller, tid; };
+TmFreeRec s_free_ring[262144];
+std::atomic<uint32_t> s_free_seq{0};
+}
+
+static uint32_t tm_frame_caller(const ppu_context* ctx)
+{
+    const uint32_t sp = (uint32_t)ctx->gpr[1];
+    const uint32_t back = sp ? vm_read32(sp + 4) : 0;    /* 64-bit back chain, low word */
+    return back > sp ? vm_read32(back + 0x14) : 0;       /* that frame's saved LR, low word */
+}
+
+void func_00976FD4(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_FREECHECK") ? 1 : 0;
+    const uint32_t m = (uint32_t)ctx->gpr[3], mem = (uint32_t)ctx->gpr[4];
+    if (!on || !mem) { func_00976FD4_lifted(ctx); return; }
+
+    const uint32_t p = mem - 8, least = vm_read32(m + 0x10);
+    const uint32_t head = p >= least ? vm_read32(p + 4) : 0;
+    const uint32_t size = head & ~7u, next = p + size;
+    const uint32_t nhead = next > p ? vm_read32(next + 4) : 0;
+    const char* why = p < least       ? "chunk below the heap"
+                    : !(head & 2u)    ? "chunk not in use (double free?)"
+                    : !(next > p)     ? "size does not move forward"
+                    : !(nhead & 1u)   ? "next chunk says this one is free"
+                    : nullptr;
+    const uint32_t lr = (uint32_t)ctx->lr, caller = tm_frame_caller(ctx);
+    if (why) {
+        static std::atomic<int> said{0};
+        if (said++ < 3) {
+            fprintf(stderr, "[freecheck] %s: mspace=0x%08X mem=0x%08X prev_size=0x%08X head=0x%08X"
+                            " next=0x%08X next_head=0x%08X lr=0x%08X caller=0x%08X tid=%llu\n",
+                    why, m, mem, p >= least ? vm_read32(p) : 0, head, next, nhead, lr, caller,
+                    (unsigned long long)ctx->thread_id);
+            for (uint32_t a = (p - 0x40) & ~15u; a < p + 0x60; a += 16)
+                fprintf(stderr, "[freecheck]   %08X: %08X %08X %08X %08X\n", a,
+                        vm_read32(a), vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12));
+            const uint32_t end = s_free_seq.load();
+            const uint32_t n = end < 262144u ? end : 262144u;
+            for (uint32_t i = 0; i < n; i++) {
+                const TmFreeRec& r = s_free_ring[(end - 1 - i) & 262143u];
+                if (r.mem == mem)
+                    fprintf(stderr, "[freecheck]   freed %u frees ago: lr=0x%08X caller=0x%08X tid=%u\n",
+                            i + 1, r.lr, r.caller, r.tid);
+            }
+            ppu_dump_guest_stack(ctx, "freecheck");
+            fflush(stderr);
+        }
+    }
+    const uint32_t seq = s_free_seq.fetch_add(1);
+    s_free_ring[seq & 262143u] = TmFreeRec{ mem, lr, caller, (uint32_t)ctx->thread_id };
+    func_00976FD4_lifted(ctx);
+}
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* ---------------------------------------------------------------------------
  * Title metadata from PARAM.SFO.
@@ -520,6 +622,9 @@ static void cellVideoOutGetDeviceInfo(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+/* Everything up to the #endif targets BCUS98106 functions by address
+ * (tools/post_lift.py renames them to _lifted). */
+#if TM_US_ADDRESS_HOOKS
 /* ---------------------------------------------------------------------------
  * Guest call tracing (TM_TRACE=1).
  *
@@ -1285,6 +1390,12 @@ void func_0036204C(ppu_context* ctx) { tm_trace("AL::204c", func_0036204C_lifted
 void func_00670C10(ppu_context* ctx) { tm_trace("f_00670C10", func_00670C10_lifted, ctx); }
 void func_00671560(ppu_context* ctx) { tm_trace("f_00671560", func_00671560_lifted, ctx); }
 void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lifted, ctx); }
+#else
+/* Other titles: what the rest of this file expects from the block above. */
+ppu_context* g_tm_main_ctx = nullptr;   /* TEMP: main thread, for TM_MAINSTACK */
+extern "C" ppu_context* g_tm_postfx_ctx = nullptr;   /* set by post_lift.py code on BCUS98106 */
+extern "C" void tm_brb_counters_tick(void) {}
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* ---------------------------------------------------------------------------
  * cellNetCtlGetState (0x8B3EBA69) — report a state instead of an error.
@@ -1378,14 +1489,6 @@ static void cellSpursCreateTask2(ppu_context* ctx)
                                            (void*)(uintptr_t)eaContext,
                                            sizeContext, lsPattern, argument);
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
-}
-
-/* Size of the per-task context save area. The runtime keeps no save area, but
- * the title allocates from this, so a zero would give every task a null
- * context. One SPU local store is the SDK's maximum and always sufficient. */
-static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx)
-{
-    ctx->gpr[3] = 0x40000;
 }
 
 /* Probe: _cellSpursSendSignal (0xE0A6DBE4). The SPU task parks in WAIT_SIGNAL
@@ -1752,8 +1855,19 @@ static void probe_EventFlagWait(ppu_context* ctx)
         (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
 }
 
+/* The Edge decompressor's completion wait, per title: BCUS98106 0x0099790C;
+ * BCES01010 0x0099864C, the only caller of cellSpursEventFlagWait in that
+ * binary, at the same +0xD40 shift as the logger next to it. */
+#if TM_US_ADDRESS_HOOKS
+#define TM_EDGE_WAIT        func_0099790C
+#define TM_EDGE_WAIT_LIFTED func_0099790C_lifted
+#elif defined(TM_TITLE_BCES01010)
+#define TM_EDGE_WAIT        func_0099864C
+#define TM_EDGE_WAIT_LIFTED func_0099864C_lifted
+#endif
+#ifdef TM_EDGE_WAIT
 /* ---------------------------------------------------------------------------
- * The Edge decompressor's completion wait, guest 0x0099790C.
+ * The Edge decompressor's completion wait, guest 0x0099790C (BCUS98106).
  *
  * Decoded from the lifted code: wait(this, request, ...) computes its event-flag
  * bit as `1 << ((request - (this + 0x2C04)) / sizeof(request))`, then loops
@@ -1784,9 +1898,9 @@ extern "C" int tm_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, ui
 extern "C" void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
 extern "C" int tm_inflate_selftest(void);
 
-void func_0099790C_lifted(ppu_context* ctx);
+void TM_EDGE_WAIT_LIFTED(ppu_context* ctx);
 
-void func_0099790C(ppu_context* ctx)
+void TM_EDGE_WAIT(ppu_context* ctx)
 {
     const uint32_t self = (uint32_t)ctx->gpr[3];
     const uint32_t req  = (uint32_t)ctx->gpr[4];
@@ -1928,7 +2042,7 @@ void func_0099790C(ppu_context* ctx)
                 /* Fall through to the lifted body rather than returning: with the
                  * busy flag already clear it skips the event-flag wait but still
                  * runs the post-processing after it, which the caller depends on. */
-                func_0099790C_lifted(ctx);
+                TM_EDGE_WAIT_LIFTED(ctx);
                 return;
             }
             static int warned = 0;
@@ -1939,9 +2053,13 @@ void func_0099790C(ppu_context* ctx)
         }
     }
     (void)self;
-    func_0099790C_lifted(ctx);
+    TM_EDGE_WAIT_LIFTED(ctx);
 }
+#endif /* TM_EDGE_WAIT */
 
+/* BCUS98106 by-address hooks: heap, pool. Meaningless on another binary,
+ * where these addresses are other functions. */
+#if TM_US_ADDRESS_HOOKS
 /* TEMP TM_ALLOCTRACE=<size>: log the guest call chain of memalign requests of
  * exactly that size (the heap fills with 66200-byte blocks). */
 void func_004DBEC4_lifted(ppu_context* ctx);
@@ -2005,12 +2123,14 @@ void func_00676ED8(ppu_context* ctx)
     fflush(stderr);
     func_00676ED8_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 static void tm_pool_dump(const char* why)
 {
     fprintf(stderr, "[pool] %s:", why);
     for (uint32_t o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(0x019307A4u + o));
     fprintf(stderr, "\n"); fflush(stderr);
 }
+#if TM_US_ADDRESS_HOOKS
 void func_00678CE8_lifted(ppu_context* ctx);
 void func_00678CE8(ppu_context* ctx)
 {
@@ -2031,6 +2151,7 @@ void func_00678CE8(ppu_context* ctx)
     }
     func_00678CE8_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
 extern ppu_context* g_tm_main_ctx;
 extern "C" void tm_pool_tick(void)
@@ -2092,6 +2213,7 @@ void tm_toi_nan(ppu_context* ctx)
 
 /* TEMP diag: game frame progress, printed with TM_MAINSTACK. */
 volatile long g_tm_players_upd, g_tm_frame_upd;
+#if TM_US_ADDRESS_HOOKS
 void func_000DB394_lifted(ppu_context* ctx);
 void func_000DB394(ppu_context* ctx) { g_tm_players_upd++; func_000DB394_lifted(ctx); }
 void func_0010C898_lifted(ppu_context* ctx);
@@ -2126,6 +2248,7 @@ void func_0062EB40(ppu_context* ctx)
                 ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3]) : 0, ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3] + 4) : 0);
     func_0062EB40_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* TEMP diag: segment raycast loop in func_00630150 -- t (v28) += step (v27)
  * until t >= tmax (v26). Report the lanes once the loop has clearly run away. */
@@ -2161,7 +2284,13 @@ void tm_seg_probe(ppu_context* ctx)
  * ------------------------------------------------------------------------- */
 #include <condition_variable>
 #include <deque>
+#ifdef _WIN32
 #include <process.h>
+#define TM_JQ_WORKER_FN static unsigned __stdcall
+#else
+#include <pthread.h>
+#define TM_JQ_WORKER_FN static void*
+#endif
 extern "C" int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                                          uint32_t job_ea, uint32_t job_desc_size);
 struct TmJqItem { uint32_t jq, job, size, tag, bin, bin_size; };
@@ -2170,7 +2299,7 @@ static std::condition_variable s_jq_cv, s_jq_done;
 static std::deque<TmJqItem> s_jq_q;
 static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
 extern "C" void spurs_job_set_spu_num(uint32_t n);
-static unsigned __stdcall tm_jq_worker(void* arg)
+TM_JQ_WORKER_FN tm_jq_worker(void* arg)
 {
     spurs_job_set_spu_num((uint32_t)(uintptr_t)arg);   /* one SPU id per worker */
     for (;;) {
@@ -2192,7 +2321,19 @@ static void tm_jq_push_job(ppu_context* ctx)
     std::call_once(once, [] {    /* a job's spu_context + lifted call depth need a big stack */
         const char* e = getenv("TM_JQ_WORKERS"); int nw = e ? atoi(e) : 4;
         if (nw > 6) nw = 6;   /* six SPUs: labels 0x80-0x85, one per SPU */
-        for (int i = 0; i < nw; i++) _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
+        for (int i = 0; i < nw; i++) {
+#ifdef _WIN32
+            _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
+#else
+            pthread_t t;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 16u << 20);
+            if (pthread_create(&t, &attr, tm_jq_worker, (void*)(uintptr_t)i) == 0)
+                pthread_detach(t);
+            pthread_attr_destroy(&attr);
+#endif
+        }
     });
     TmJqItem it;
     it.jq = (uint32_t)ctx->gpr[3]; it.job = (uint32_t)ctx->gpr[4];

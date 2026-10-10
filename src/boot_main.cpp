@@ -153,18 +153,32 @@ extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
  * calling cellGcmTickVBlank()/TickFlip(), which invoke the registered handlers.
  * Without this the game inits, registers its handlers, and then waits forever
  * for a vblank that never comes. */
-typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSysutil.c */
-extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+/* ps3_guest_caller_fn and g_ps3_guest_caller (libs/system/cellSysutil.c) come
+ * from the runtime's header, where a guest callback takes 8 arguments. Declared
+ * here by hand with 4, they left arguments 5 to 8 indeterminate. */
+#include "ps3emu/guest_call.h"
+extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
 /* Mark a vblank+flip tick pending WITHOUT running guest code -- the handlers are
  * delivered on the main guest thread (ppu_gcm_pump at HLE boundaries), serialized
  * with guest execution so the ticker thread never races it. */
 extern "C" void cellGcm_request_tick(void);
+extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" int  cellGcm_take_flip_pending_synced(void);
+extern "C" uint32_t cellGcm_flip_request_count(void);
 
-static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
-{ ppu_guest_call(opd, a0, a1, a2, a3); }
+static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{ ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7); }
+
+/* Frames presented at a guest flip. ps3recomp's smoke title reads this counter
+ * for its verdict; otherwise it says whether the game loop is advancing. */
+#include <atomic>
+static std::atomic<unsigned> g_frames_presented{0};
+extern "C" unsigned ppu_boot_frames_presented(void) { return g_frames_presented.load(); }
+static void tm_count_presented_frame(void) { g_frames_presented.fetch_add(1); }
 
 #ifdef _WIN32
 /* RSX present backend (libs/video/rsx_d3d12_backend.c). Driven on the vblank
@@ -172,8 +186,15 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
-extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
-extern "C" int  cellGcm_take_flip_pending_synced(void);
+
+/* The generic D3D12 backend presents on every tick, so a guest flip is
+ * recognised by the flip request counter moving. */
+static void tm_note_flips(void)
+{
+    static uint32_t last = 0;
+    const uint32_t fc = cellGcm_flip_request_count();
+    if (fc != last) { last = fc; tm_count_presented_frame(); }
+}
 
 /* Live NV4097->D3D12 engine (libs/video/rsx_live_draw.c, from caner /
  * canersaka's Yakuza: Dead Souls port). Selected with RSX_LIVE_DRAW=1. It
@@ -319,6 +340,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * backend's window, so pump that window's messages instead. */
             if ((live ? rsx_null_backend_pump_messages()
                       : rsx_d3d12_backend_pump_messages()) != 0) { rsx_ok = 0; }
+            if (!live) tm_note_flips();
             if (getenv("TM_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
@@ -387,7 +409,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                           }
                           fflush(stderr);
                       } }
-                    if (flipped) rsx_live_draw_present(0);
+                    if (flipped) { rsx_live_draw_present(0); tm_count_presented_frame(); }
                     /* TM_LIVE_DUMP=<secs>,<hex offset>: ask the engine to write
                      * one of its tracked surfaces out, so "is it drawing" is
                      * answerable from its own resources rather than a readback
@@ -539,6 +561,111 @@ static DWORD WINAPI hang_watchdog(LPVOID)
 #define VM_SIZE    0x100010000ull /* full 32-bit guest space + 64K guard (top-edge reads), demand-committed */
 #define STACK_TOP  0x0FF00000u   /* main-thread stack, below the 0x10000000 segment */
 
+#ifndef _WIN32
+#include <pthread.h>
+#include <sys/mman.h>
+#include <time.h>
+
+/* Host stack for the main guest thread. On Windows /STACK:268435456 gives it
+ * to the main thread; here the main thread only has ulimit -s (8 MB by
+ * default), far too little for lifted call chains. Same size as the threads
+ * sys_ppu_thread_create starts (PPU_HOST_STACK_BYTES). */
+#define TM_MAIN_STACK_BYTES (256u * 1024u * 1024u)
+
+/* The RSX backend: Vulkan when the runtime is built with PS3RECOMP_RSX_VULKAN
+ * (its window, guest programs and frame dumps are set by the backend's own
+ * PS3RECOMP_VK_* variables), otherwise the null backend -- no window, headless
+ * software rendering. TM_RSX=null picks the null backend in a Vulkan build. */
+extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_null_backend_present(void);
+extern "C" int  rsx_null_backend_pump_messages(void);
+#if defined(PS3RECOMP_RSX_VULKAN)
+extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_vulkan_backend_present(void);
+extern "C" int  rsx_vulkan_backend_pump_messages(void);
+#endif
+
+struct TmBackend {
+    const char* name;
+    int  (*init)(uint32_t, uint32_t, const char*);
+    void (*present)(void);
+    int  (*pump)(void);
+};
+
+static TmBackend tm_pick_backend(void)
+{
+#if defined(PS3RECOMP_RSX_VULKAN)
+    const char* e = getenv("TM_RSX");
+    if (!e || strcmp(e, "null") != 0)
+        return { "Vulkan", rsx_vulkan_backend_init, rsx_vulkan_backend_present,
+                 rsx_vulkan_backend_pump_messages };
+#endif
+    return { "null", rsx_null_backend_init, rsx_null_backend_present,
+             rsx_null_backend_pump_messages };
+}
+
+static uint64_t tm_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* POSIX vblank clock with vblank_ticker's cadence on Windows: drain the FIFO on
+ * every wake (~1 ms), 60 Hz ticks caught up in bounded bursts and delivered on
+ * the main guest thread (cellGcm_request_tick), present on the game's flip
+ * once the FIFO has drained up to put. */
+static void* tm_frame_clock(void*)
+{
+    uint32_t rsx_w = 1280, rsx_h = 704;
+    if (const char* e = getenv("TM_RSX_W")) rsx_w = (uint32_t)strtoul(e, 0, 0);
+    if (const char* e = getenv("TM_RSX_H")) rsx_h = (uint32_t)strtoul(e, 0, 0);
+    const TmBackend be = tm_pick_backend();
+    int rsx_ok = (be.init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
+    fprintf(stderr, "[rsx] %s backend init %s\n", be.name, rsx_ok ? "OK" : "FAILED");
+
+    uint64_t next_tick = tm_now_ms();
+    for (;;) {
+        const struct timespec one_ms = {0, 1000000};
+        nanosleep(&one_ms, NULL);
+        if (rsx_ok) cellGcm_rsx_process_fifo();
+        tm_fbdump_tick();
+        tm_ef_kick_tick();
+        tm_loaddone_tick();
+        tm_fifowatch_tick();
+        tm_memdump_tick();
+        const uint64_t now = tm_now_ms();
+        int fired = 0;
+        while ((int64_t)(now - next_tick) >= 0 && fired < 240) {
+            cellGcm_request_tick();
+            if (rsx_ok) cellGcm_rsx_process_fifo();
+            next_tick += 16;
+            fired++;
+        }
+        if (fired >= 240) next_tick = now;
+        if (rsx_ok) {
+            if (be.pump() != 0) { rsx_ok = 0; continue; }
+            if (cellGcm_take_flip_pending_synced()) {
+                be.present();
+                tm_count_presented_frame();
+            }
+        }
+    }
+    return nullptr;
+}
+
+extern "C" void tm_gstacks_start(void);   /* src/tm_gstacks.cpp: TM_GSTACKS=<secs> */
+
+struct TmGuestRun { uint32_t entry; int rc; };
+
+static void* tm_guest_main(void* p)
+{
+    TmGuestRun* run = (TmGuestRun*)p;
+    run->rc = ppu_run(run->entry, STACK_TOP);
+    return nullptr;
+}
+#endif
+
 #ifdef _WIN32
 /* Demand-paging for the flat VM: reserve the full 4 GB guest space up front (no
  * commit cost) and commit each 64 KB page on first access. This makes EVERY
@@ -582,6 +709,8 @@ int main(int argc, char** argv)
     { ULONG g=256*1024; SetThreadStackGuarantee(&g); }  /* reserve stack so the SO handler can run */
     signal(SIGABRT, tm_abort_handler);
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: don't lose prints on kill */
+#else
+    setvbuf(stdout, NULL, _IONBF, 0);   /* same: redirected stdout is block-buffered */
 #endif
 
     /* Flat VM: one host buffer, guest addr -> vm_base + addr. This maps the
@@ -599,8 +728,15 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #else
-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
-    ppu_vm_size = 0xE0000000u;
+    /* The same space as on Windows: 4 GB + 64 KB reserved in one block, each
+     * page supplied by the kernel on first touch (MAP_NORESERVE: nothing is
+     * committed up front). Every 32-bit guest address is valid and reads zero. */
+    {
+        void* m = mmap(nullptr, VM_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        vm_base = (m == MAP_FAILED) ? nullptr : (uint8_t*)m;
+    }
+    ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
 
@@ -631,13 +767,42 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
     CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
+#else
+    {
+        pthread_t clock_thread;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 4u * 1024 * 1024);
+        if (pthread_create(&clock_thread, &attr, tm_frame_clock, nullptr) == 0)
+            pthread_detach(clock_thread);
+        else
+            fprintf(stderr, "[boot] frame clock thread could not be created\n");
+        pthread_attr_destroy(&attr);
+    }
+    tm_gstacks_start();
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
-#endif
     int rc = ppu_run(entry, STACK_TOP);
+#else
+    TmGuestRun run = { entry, 0 };
+    {
+        pthread_t guest_thread;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, TM_MAIN_STACK_BYTES);
+        const int err = pthread_create(&guest_thread, &attr, tm_guest_main, &run);
+        pthread_attr_destroy(&attr);
+        if (err != 0) {
+            fprintf(stderr, "[boot] main guest thread could not be created (%d)\n", err);
+            return 1;
+        }
+        pthread_join(guest_thread, nullptr);
+    }
+    int rc = run.rc;
+#endif
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
     return 0;
 }
