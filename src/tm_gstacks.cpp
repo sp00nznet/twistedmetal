@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
+extern "C" ppu_context* volatile g_ppu_main_ctx;   /* ppu_loader.cpp: the main thread */
 
 static void* tm_gstacks_thread(void* arg)
 {
@@ -26,6 +27,7 @@ static void* tm_gstacks_thread(void* arg)
     for (unsigned n = 1;; n++) {
         sleep(period);
         fprintf(stderr, "[gstacks] %us sample\n", n * period);
+        if (g_ppu_main_ctx) ppu_dump_guest_stack(g_ppu_main_ctx, "tid=1 'main'");
         for (int i = 1; i < PPU_THREAD_MAX; i++) {
             ppu_thread_info* t = &g_ppu_threads[i];
             if (t->state != PPU_THREAD_STATE_RUNNING) continue;
