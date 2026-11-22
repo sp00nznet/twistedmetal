@@ -1443,9 +1443,10 @@ void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lift
 #else
 /* Other titles: what the rest of this file expects from the block above. */
 ppu_context* g_tm_main_ctx = nullptr;   /* TEMP: main thread, for TM_MAINSTACK */
-extern "C" ppu_context* g_tm_postfx_ctx = nullptr;   /* set by post_lift.py code on BCUS98106 */
 extern "C" void tm_brb_counters_tick(void) {}
 #endif /* TM_US_ADDRESS_HOOKS */
+/* SpuPostFX thread context for TM_MAINSTACK; only hand-edited lifted code sets it. */
+extern "C" ppu_context* g_tm_postfx_ctx = nullptr;
 
 /* ---------------------------------------------------------------------------
  * cellNetCtlGetState (0x8B3EBA69) — report a state instead of an error.
