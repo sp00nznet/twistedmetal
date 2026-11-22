@@ -2450,6 +2450,7 @@ static std::condition_variable s_jq_cv, s_jq_done;
 static std::deque<TmJqItem> s_jq_q;
 static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
 static std::map<uint32_t, int> s_jq_running;      /* jq -> jobs a worker is running */
+static volatile uint32_t s_jq_cur[6];             /* binary each worker is running, for [jq-stall] */
 extern "C" void spurs_job_set_spu_num(uint32_t n);
 TM_JQ_WORKER_FN tm_jq_worker(void* arg)
 {
@@ -2463,7 +2464,9 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
               return !s_jq_q.empty() && (!s_jq_q.front().sync || s_jq_running[s_jq_q.front().jq] == 0); });
           it = s_jq_q.front(); s_jq_q.pop_front();
           ++s_jq_running[it.jq]; }
+        s_jq_cur[(uintptr_t)arg % 6] = it.bin;
         int ran = spu_workload_dispatch_job(vm_base + it.bin, it.bin_size, it.job, it.size);
+        s_jq_cur[(uintptr_t)arg % 6] = 0;
         if (it.bin == 0x00E3BD80u) { static int k = 0; if (k++ < 6) {  /* TEMP: the cull job */
             fprintf(stderr, "[jq-cull] job=0x%08X ran=%d counter=0x%08X\n", it.job, ran, vm_read32(0x019307D0u)); } }
         { std::lock_guard<std::mutex> lk(s_jq_mx);
@@ -2541,11 +2544,31 @@ static void tm_jq_sync(ppu_context* ctx)
     const uint64_t jq = (uint32_t)ctx->gpr[3];
     const uint32_t mask = (uint32_t)ctx->gpr[4];
     std::unique_lock<std::mutex> lk(s_jq_mx);
-    s_jq_done.wait(lk, [&] {
+    auto done = [&] {
         for (uint32_t t = 0; t < 16; t++)
             if ((mask >> t & 1) && s_jq_pending[(jq << 32) | t] > 0) return false;
         return true;
-    });
+    };
+    /* A sync that has waited 5 s says what it waits for, once per call. */
+    if (!s_jq_done.wait_for(lk, std::chrono::seconds(5), done)) {
+        static int n = 0;
+        if (n++ < 8) {
+            fprintf(stderr, "[jq-stall] sync jq=0x%08X mask=0x%X lr=0x%08X queued=%zu",
+                    (uint32_t)jq, mask, (uint32_t)ctx->lr, s_jq_q.size());
+            if (!s_jq_q.empty())
+                fprintf(stderr, " front={jq=0x%08X tag=%u bin=0x%08X sync=%d}", s_jq_q.front().jq,
+                        s_jq_q.front().tag, s_jq_q.front().bin, (int)s_jq_q.front().sync);
+            for (auto& kv : s_jq_pending)
+                if (kv.second > 0) fprintf(stderr, " pending[jq=0x%08X tag=%u]=%d",
+                                           (uint32_t)(kv.first >> 32), (uint32_t)kv.first, kv.second);
+            for (auto& kv : s_jq_running)
+                if (kv.second > 0) fprintf(stderr, " running[jq=0x%08X]=%d", kv.first, kv.second);
+            for (int w = 0; w < 6; w++)
+                if (s_jq_cur[w]) fprintf(stderr, " worker%d=bin 0x%08X", w, s_jq_cur[w]);
+            fputc(10, stderr);
+        }
+        s_jq_done.wait(lk, done);
+    }
     ctx->gpr[3] = 0;
 }
 /* cellSpursJobQueuePortSync(port) waits for every job pushed through the
