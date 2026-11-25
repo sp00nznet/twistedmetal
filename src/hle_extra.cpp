@@ -2451,6 +2451,16 @@ static std::deque<TmJqItem> s_jq_q;
 static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
 static std::map<uint32_t, int> s_jq_running;      /* jq -> jobs a worker is running */
 static volatile uint32_t s_jq_cur[6];             /* binary each worker is running, for [jq-stall] */
+/* Jobs queued or running, read by the FIFO walker without s_jq_mx. An Edge
+ * geometry job fills a self-JUMP hole in the command buffer with a CALL to its
+ * ring segment; the walker must not give up on a park while one of them can
+ * still do that (ps3recomp's g_gcm_park_hold_hook). */
+static std::atomic<int> s_jq_outstanding{0};
+extern "C" int (*g_gcm_park_hold_hook)(uint32_t park_io, uint32_t put);
+static int tm_jq_park_hold(uint32_t, uint32_t)
+{
+    return s_jq_outstanding.load(std::memory_order_relaxed) > 0;
+}
 extern "C" void spurs_job_set_spu_num(uint32_t n);
 TM_JQ_WORKER_FN tm_jq_worker(void* arg)
 {
@@ -2472,6 +2482,7 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
         { std::lock_guard<std::mutex> lk(s_jq_mx);
           --s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
           --s_jq_running[it.jq]; }
+        s_jq_outstanding.fetch_sub(1, std::memory_order_relaxed);
         s_jq_done.notify_all();
         s_jq_cv.notify_all();      /* a sync job may have been waiting on this one */
     }
@@ -2480,6 +2491,7 @@ static void tm_jq_push(ppu_context* ctx, bool sync)
 {
     static std::once_flag once;
     std::call_once(once, [] {    /* a job's spu_context + lifted call depth need a big stack */
+        g_gcm_park_hold_hook = tm_jq_park_hold;
         const char* e = getenv("TM_JQ_WORKERS"); int nw = e ? atoi(e) : 4;
         if (nw > 6) nw = 6;   /* six SPUs: labels 0x80-0x85, one per SPU */
         for (int i = 0; i < nw; i++) {
@@ -2505,6 +2517,7 @@ static void tm_jq_push(ppu_context* ctx, bool sync)
     it.sync = sync;
     if (it.bin && it.bin_size) {
         { std::lock_guard<std::mutex> lk(s_jq_mx);
+          s_jq_outstanding.fetch_add(1, std::memory_order_relaxed);
           ++s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
           s_jq_q.push_back(it); }
         s_jq_cv.notify_one();
