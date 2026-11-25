@@ -18,6 +18,40 @@ libraries that stand in for the PS3 operating system. Same approach as
 
 **You supply your own disc.** No game binary, asset, or key is committed here.
 
+## This fork: active Windows development
+
+The original repository ([sp00nznet/twistedmetal](https://github.com/sp00nznet/twistedmetal),
+by Ned Heller / sp00nznet) has had no commits since 2026-10-03, and the Linux /
+European-disc work ([#1](https://github.com/sp00nznet/twistedmetal/pull/1), by
+Kurtisone) since 2026-10-22. This fork carries the port on, on Windows, on top of
+both. All of it is offered back upstream as
+[#2](https://github.com/sp00nznet/twistedmetal/pull/2); the runtime fixes go to
+ps3recomp as their own pull requests.
+
+**Where it is (BCUS98106 v1.00, D3D12, clang-cl, i7-9700K / RTX 4060):** boots
+through the legal screens and the menus, picks a vehicle and plays a suburbs match
+with the AI at 31-49 fps (menu 12-18 fps). A match still freezes 30-55 s in: the
+main thread waits on Havok's PPU/SPU semaphore and no SPU sends the wake-up. That
+is the one being worked on.
+
+**Changes on top of the original and #1:**
+- builds and links against current ps3recomp `master` instead of `ydkj-master-bringup`;
+- the 27 JobQueue job binaries dumped with `SPU_DUMP_MISS` and lifted, registered
+  for BCUS98106 (menu from about 1 fps to 15+);
+- the lifted SPU code compiled with AVX2 (`TM_SPU_ISA`): the prebuilt runtime
+  library had dropped its `-msse4.1`, so every SPU helper ran its scalar version;
+- the FIFO walker holds a park while JobQueue jobs are outstanding, so it no
+  longer drops unfilled Edge geometry holes (one of the in-match freezes;
+  needs [ps3recomp#870](https://github.com/sp00nznet/ps3recomp/pull/870));
+- a `[jq-stall]` diagnostic for JobQueue syncs that wait more than 5 s.
+
+Related runtime pull requests: [ps3recomp#848](https://github.com/sp00nznet/ps3recomp/pull/848)
+(SPURS task dispatch race), [ps3recomp#870](https://github.com/sp00nznet/ps3recomp/pull/870)
+(walker park hold). Build and run steps for Windows are in #2's description.
+
+Credit for the port, its tools and its working log below belongs to sp00nznet;
+the Linux and BCES01010 work to Kurtisone. MIT, as the original (see `LICENSE`).
+
 ## Status
 
 Geometry from the title's own draw stream **rasterises**. It boots real game
