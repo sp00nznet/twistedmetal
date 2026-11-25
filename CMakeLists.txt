@@ -191,6 +191,17 @@ extern void spu_begin_image(int image_id);
         set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
             COMPILE_OPTIONS "-w;-ffp-contract=off;${TM_RECOMP_COMPILE_OPTIONS}")
     endif()
+    if(MSVC)
+        # clang-cl links the prebuilt runtime .lib, which drops the runtime's
+        # PUBLIC -msse4.1: the lifted SPU sources, which compile spu_helpers.h's
+        # static inlines themselves, took the scalar shufb, local-store and float
+        # helpers. No contraction: with FMA in the ISA, clang would fuse an SPU
+        # fm + fa the lifter kept apart.
+        set(TM_SPU_ISA "/arch:AVX2" CACHE STRING
+            "ISA for the lifted SPU sources (-msse4.1 = the runtime's own minimum)")
+        set_source_files_properties(${SPU_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "${TM_SPU_ISA};-ffp-contract=off")
+    endif()
 endif()
 
 if(TM_BUILD_SMOKE)
