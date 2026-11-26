@@ -2596,6 +2596,79 @@ static int tm_jq_park_hold(uint32_t, uint32_t)
 {
     return s_jq_outstanding.load(std::memory_order_relaxed) > 0;
 }
+
+/* Which jobs write the image the RSX is about to copy back from main memory
+ * (ps3recomp's g_gcm_blit_wait_hook, cellGcmSys.c nv3089_wait_jobs).
+ *
+ * The final picture is composed by post-FX jobs over main-memory copies of
+ * the frame's layers, and returns to the RSX through an NV3089 copy that
+ * nothing orders after those jobs. Waiting for every job fixed the picture
+ * and cost the frame rate (the next frame's Edge jobs are always there). So
+ * the binaries that write that range are learned: for its first runs each
+ * job binary is bracketed by a sparse checksum of the range, and one whose
+ * runs change it at least half the time is a producer. A binary that merely
+ * ran beside a producer changes it now and then, not half the time. The wait
+ * then covers queued or running jobs of producers -- and of binaries still
+ * being learned, so the picture is right from the first frame. */
+#define TM_JQ_PROD_MAX 64
+#define TM_JQ_PROD_LEARN_RUNS 24u
+struct TmJqProd { uint32_t bin, runs, changed; int state; };   /* 0 learning, 1 producer, 2 not */
+static TmJqProd s_jq_prod[TM_JQ_PROD_MAX];                     /* under s_jq_mx */
+static int s_jq_prod_n;
+static uint32_t s_jq_run_bin[6];                               /* under s_jq_mx: binary each worker runs */
+static std::atomic<uint32_t> s_jq_watch_ea{0}, s_jq_watch_end{0};
+
+/* Under s_jq_mx. NULL when the table is full: such a binary counts as "not". */
+static TmJqProd* tm_jq_prod_find(uint32_t bin, bool add)
+{
+    for (int i = 0; i < s_jq_prod_n; i++) if (s_jq_prod[i].bin == bin) return &s_jq_prod[i];
+    if (!add || s_jq_prod_n >= TM_JQ_PROD_MAX) return nullptr;
+    TmJqProd* e = &s_jq_prod[s_jq_prod_n++];
+    e->bin = bin; e->runs = 0; e->changed = 0; e->state = 0;
+    return e;
+}
+static uint32_t tm_jq_watch_sum(void)
+{
+    const uint32_t ea = s_jq_watch_ea.load(std::memory_order_relaxed);
+    const uint32_t end = s_jq_watch_end.load(std::memory_order_relaxed);
+    uint32_t sum = 0;
+    for (uint32_t a = ea & ~3u; a + 4 <= end; a += 1024) sum = sum * 31u + vm_read32(a);
+    return sum;
+}
+static int tm_jq_blit_wait(uint32_t src_ea, uint32_t bytes)
+{
+    /* The range grows over the strips of one image; a copy from somewhere
+     * else starts the learning over. */
+    if (bytes && bytes <= (16u << 20)) {
+        const uint32_t ea = s_jq_watch_ea.load(std::memory_order_relaxed);
+        const uint32_t end = s_jq_watch_end.load(std::memory_order_relaxed);
+        const uint32_t lo = ea && ea < src_ea ? ea : src_ea;
+        const uint32_t hi = end > src_ea + bytes ? end : src_ea + bytes;
+        if (!ea || hi - lo > (16u << 20)) {
+            std::lock_guard<std::mutex> lk(s_jq_mx);
+            s_jq_watch_ea.store(src_ea, std::memory_order_relaxed);
+            s_jq_watch_end.store(src_ea + bytes, std::memory_order_relaxed);
+            s_jq_prod_n = 0;
+            fprintf(stderr, "[jq-prod] watching main memory 0x%08X..0x%08X for composite jobs\n",
+                    src_ea, src_ea + bytes);
+        } else if (lo != ea || hi != end) {
+            s_jq_watch_ea.store(lo, std::memory_order_relaxed);
+            s_jq_watch_end.store(hi, std::memory_order_relaxed);
+        }
+    }
+    std::lock_guard<std::mutex> lk(s_jq_mx);
+    for (const TmJqItem& q : s_jq_q) {
+        const TmJqProd* e = tm_jq_prod_find(q.bin, false);
+        if (!e ? s_jq_prod_n < TM_JQ_PROD_MAX : e->state != 2) return 1;
+    }
+    for (int w = 0; w < 6; w++) {
+        if (!s_jq_run_bin[w]) continue;
+        const TmJqProd* e = tm_jq_prod_find(s_jq_run_bin[w], false);
+        if (!e ? s_jq_prod_n < TM_JQ_PROD_MAX : e->state != 2) return 1;
+    }
+    return 0;
+}
+extern "C" int (*g_gcm_blit_wait_hook)(uint32_t src_ea, uint32_t bytes);
 extern "C" void spurs_job_set_spu_num(uint32_t n);
 TM_JQ_WORKER_FN tm_jq_worker(void* arg)
 {
@@ -2625,13 +2698,40 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
           long idx = -1;
           s_jq_cv.wait(lk, [&] { return (idx = pick()) >= 0; });
           it = s_jq_q[(size_t)idx]; s_jq_q.erase(s_jq_q.begin() + idx);
+          s_jq_run_bin[(uintptr_t)arg % 6] = it.bin;   /* tm_jq_blit_wait: never between queue and worker */
           ++s_jq_running[it.jq]; }
+        /* Learning which binaries write the watched image (tm_jq_blit_wait). */
+        bool prod_learn = false; uint32_t prod_before = 0;
+        if (s_jq_watch_ea.load(std::memory_order_relaxed)) {
+            { std::lock_guard<std::mutex> lk(s_jq_mx);
+              const TmJqProd* e = tm_jq_prod_find(it.bin, true);
+              prod_learn = e && e->state == 0; }
+            if (prod_learn) prod_before = tm_jq_watch_sum();
+        }
         s_jq_cur[(uintptr_t)arg % 6] = it.bin;
         int ran = spu_workload_dispatch_job(vm_base + it.bin, it.bin_size, it.job, it.size);
         s_jq_cur[(uintptr_t)arg % 6] = 0;
+        const bool prod_changed = prod_learn && tm_jq_watch_sum() != prod_before;
         if (it.bin == 0x00E3BD80u) { static int k = 0; if (k++ < 6) {  /* TEMP: the cull job */
             fprintf(stderr, "[jq-cull] job=0x%08X ran=%d counter=0x%08X\n", it.job, ran, vm_read32(0x019307D0u)); } }
         { std::lock_guard<std::mutex> lk(s_jq_mx);
+          if (prod_learn) {
+              TmJqProd* e = tm_jq_prod_find(it.bin, false);
+              if (e && e->state == 0) {
+                  e->runs++;
+                  if (prod_changed) e->changed++;
+                  if (e->runs >= TM_JQ_PROD_LEARN_RUNS) {
+                      /* any run that changed the image makes it a producer (TM_JQ_PROD_MIN runs out of 24, default 12) */
+                      { static int mn = -1; if (mn < 0) { const char* v = getenv("TM_JQ_PROD_MIN"); mn = v ? atoi(v) : 12; }
+                        e->state = e->changed >= (unsigned)mn ? 1 : 2; }
+                      fprintf(stderr, "[jq-prod] job binary 0x%08X (queue 0x%08X): %u of %u runs changed "
+                                      "the watched image -> %s\n", it.bin, it.jq, e->changed, e->runs,
+                              e->state == 1 ? "composite producer, the copy-back waits for it"
+                                            : "not a producer");
+                  }
+              }
+          }
+          s_jq_run_bin[(uintptr_t)arg % 6] = 0;
           --s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
           --s_jq_running[it.jq]; }
         s_jq_outstanding.fetch_sub(1, std::memory_order_relaxed);
@@ -2647,6 +2747,7 @@ static void tm_jq_push(ppu_context* ctx, bool sync)
     static std::once_flag once;
     std::call_once(once, [] {    /* a job's spu_context + lifted call depth need a big stack */
         g_gcm_park_hold_hook = tm_jq_park_hold;
+        g_gcm_blit_wait_hook = tm_jq_blit_wait;
         const char* e = getenv("TM_JQ_WORKERS"); int nw = e ? atoi(e) : 4;
         if (nw > 6) nw = 6;   /* six SPUs: labels 0x80-0x85, one per SPU */
         for (int i = 0; i < nw; i++) {
