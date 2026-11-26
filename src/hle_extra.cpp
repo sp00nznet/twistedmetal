@@ -1967,6 +1967,8 @@ void func_0077DEC0(ppu_context* ctx)
 #if TM_US_ADDRESS_HOOKS
 #define TM_EDGE_WAIT        func_0099790C
 #define TM_EDGE_WAIT_LIFTED func_0099790C_lifted
+#define TM_EDGE_ISDONE        func_009978F8
+#define TM_EDGE_ISDONE_LIFTED func_009978F8_lifted
 #elif defined(TM_TITLE_BCES01010)
 #define TM_EDGE_WAIT        func_0099864C
 #define TM_EDGE_WAIT_LIFTED func_0099864C_lifted
