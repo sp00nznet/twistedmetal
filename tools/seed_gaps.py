@@ -29,6 +29,8 @@ import sys
 
 # The executable span: .init through the end of .sceStub.text. Past this is
 # .rodata, which must not be lifted as code (it is also what --code-end pins).
+# These are BCUS98106's; --code-lo/--code-hi replace them for another binary
+# (BCES01010: 0x10200..0xC7BD3C, the end of the last executable section).
 CODE_LO, CODE_HI = 0x10200, 0xC79C6C
 
 
@@ -58,13 +60,21 @@ def gaps_of(funcs):
 
 
 def main():
+    global CODE_LO, CODE_HI
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--functions', default='meta/functions.json')
     ap.add_argument('--targets', action='append', default=[],
                     help='file of hex addresses, or a run log (repeatable)')
     ap.add_argument('--out', default='meta/functions.seeded.json')
+    ap.add_argument('--code-lo', type=lambda x: int(x, 0), default=CODE_LO,
+                    help='first executable address (default: 0x%X)' % CODE_LO)
+    ap.add_argument('--code-hi', type=lambda x: int(x, 0), default=CODE_HI,
+                    help='end of the executable span, exclusive; pass the same '
+                         'value as ppu_lifter --code-end (default: 0x%X)' % CODE_HI)
     args = ap.parse_args()
+
+    CODE_LO, CODE_HI = args.code_lo, args.code_hi
 
     orig = json.load(open(args.functions))
     funcs = [(int(f['start'], 16), int(f['end'], 16)) for f in orig]

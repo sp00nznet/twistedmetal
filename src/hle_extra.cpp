@@ -21,13 +21,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <atomic>
 #include <mutex>
+#include <algorithm>
 #include <thread>
 #include <chrono>
 
+/* 1: the lift comes from BCUS98106 and this file's by-address hooks apply.
+ * CMakeLists.txt sets it from TM_TITLE; without it, the original behaviour is
+ * kept. */
+#ifndef TM_US_ADDRESS_HOOKS
+#define TM_US_ADDRESS_HOOKS 1
+#endif
+
 extern "C" {
 void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
-uint32_t vm_read32(uint64_t a);
 void     vm_write32(uint64_t a, uint32_t v);
 uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
@@ -97,20 +105,68 @@ static void cellVideoOutGetDeviceInfo(ppu_context* ctx);
 static void cellNetCtlGetState(ppu_context* ctx);
 static void cellSpursTaskAttribute2Initialize(ppu_context* ctx);
 static void cellSpursCreateTask2(ppu_context* ctx);
-static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx);
 static void probe_cellSpursSendSignal(ppu_context* ctx);
 static void probe_cellGcmGetFlipStatus(ppu_context* ctx);
 static void probe_EventFlagWait(ppu_context* ctx);
 static void tm_jq_push_job(ppu_context* ctx);
 extern "C" ppu_context* g_tm_postfx_ctx;   /* TEMP: SpuPostFX thread (generated code) */
 #pragma comment(linker, "/alternatename:g_tm_postfx_ctx=?g_tm_postfx_ctx@@3PEAUppu_context@@EA")
+static void tm_jq_push_job_list(ppu_context* ctx);
+static void tm_jq_port_push(ppu_context* ctx);
+static void tm_jq_port_sync(ppu_context* ctx);
+static void tm_jq_port_try_sync(ppu_context* ctx);
 static void tm_jq_sync(ppu_context* ctx);
-static void tm_probe_spurs_unk(ppu_context* ctx);
 
 extern "C" void tm_vdec_register(void);   /* src/vdec_hle.cpp */
+extern "C" void ps3_hle_register(unsigned int nid, const char* name, void* handler);
+extern "C" int32_t cellSpursBarrierInitialize(uint64_t taskset, uint64_t barrier, uint32_t total);
+extern "C" int32_t cellSpursGetTasksetInfo(uint64_t taskset, uint64_t info);
+
+/* ---------------------------------------------------------------------------
+ * TM_NO_MLAA=1: skip the game's SPU MLAA (Edge post, edgepost-mlaa-task).
+ *
+ * Each frame the render thread (func_006588D4) calls func_0065EAC0, which
+ * kicks the MLAA SPURS tasks on the context at 0x01928FE0 (set up by
+ * func_0065E950 through Edge's init, func_00C3E9D8) and waits for their
+ * completion word before the frame is published (label 0x42). Its first
+ * instruction reads one byte, 0x00F5B1D8: 0 makes it return at once. The byte
+ * is 1 in the ELF's data and nothing in the game writes it, so it is a build
+ * option, with MLAA's two parameters (0x40, 0x10) right behind it.
+ *
+ * Off by default: frames come out without antialiasing. It is for test runs,
+ * where the lifted SPU MLAA is the slowest part of a frame, and for telling
+ * MLAA apart from the renderer when an image is wrong.
+ * ------------------------------------------------------------------------- */
+#if defined(TM_TITLE_BCES01010)
+static void tm_apply_no_mlaa(void)
+{
+    const char* e = getenv("TM_NO_MLAA");
+    if (!e || !*e || *e == '0') return;
+    static const char path[] = "e:/packages/RT_BCES01010/RTApp/MLAA.cpp";
+    const uint32_t flag = 0x00F5B1D8u, path_ea = 0x00CD81B8u;
+    for (uint32_t i = 0; i < sizeof path - 1; i++)
+        if (vm_read8(path_ea + i) != (uint8_t)path[i]) {
+            fprintf(stderr, "[tm] TM_NO_MLAA: not the expected executable, left alone\n");
+            return;
+        }
+    if (vm_read8(flag) != 1u) {
+        fprintf(stderr, "[tm] TM_NO_MLAA: MLAA flag at 0x%08X is %u, not 1; left alone\n",
+                flag, vm_read8(flag));
+        return;
+    }
+    vm_write8(flag, 0);
+    fprintf(stderr, "[tm] TM_NO_MLAA: SPU MLAA off (0x%08X = 0)\n", flag);
+}
+#else
+static void tm_apply_no_mlaa(void)
+{
+    if (getenv("TM_NO_MLAA")) fprintf(stderr, "[tm] TM_NO_MLAA: only known for BCES01010\n");
+}
+#endif
 
 extern "C" void tm_hle_register_extra(void)
 {
+    tm_apply_no_mlaa();   /* the ELF is loaded; no guest thread runs yet */
     tm_vdec_register();
     ps3_hle_register_ctx(0xA3E3BE68u, "sys_ppu_thread_once",      sys_ppu_thread_once);
     ps3_hle_register_ctx(0x42B23552u, "sys_prx_register_library", sys_prx_register_library);
@@ -131,15 +187,21 @@ extern "C" void tm_hle_register_extra(void)
     ps3_hle_register_ctx(0x8ADADF65u, "_cellSpursTaskAttribute2Initialize",
                          cellSpursTaskAttribute2Initialize);
     ps3_hle_register_ctx(0xE14CA62Du, "cellSpursCreateTask2", cellSpursCreateTask2);
-    ps3_hle_register_ctx(0x9034E538u, "cellSpursTaskGetContextSaveAreaSize",
-                         cellSpursTaskGetContextSaveAreaSize);
     ps3_hle_register_ctx(0xE0A6DBE4u, "_cellSpursSendSignal", probe_cellSpursSendSignal);
     ps3_hle_register_ctx(0x72A577CEu, "cellGcmGetFlipStatus", probe_cellGcmGetFlipStatus);
     ps3_hle_register_ctx(0x373523D4u, "cellSpursEventFlagWait", probe_EventFlagWait);
     ps3_hle_register_ctx(0x90E392CFu, "cellSpursJq push job", tm_jq_push_job);
     ps3_hle_register_ctx(0x9396BE1Du, "cellSpursJq sync", tm_jq_sync);
-    ps3_hle_register_ctx(0x7FDF4FEFu, "cellSpurs unk 7FDF4FEF", tm_probe_spurs_unk);
-    ps3_hle_register_ctx(0x9FCB567Bu, "cellSpurs unk 9FCB567B", tm_probe_spurs_unk);
+    ps3_hle_register_ctx(0x4E1A17A6u, "cellSpursJq port push", tm_jq_port_push);
+    ps3_hle_register_ctx(0x1B6EEA7Eu, "cellSpursJq push job list", tm_jq_push_job_list);
+    ps3_hle_register_ctx(0x634B1502u, "cellSpursJobQueuePortSync", tm_jq_port_sync);
+    ps3_hle_register_ctx(0x80A0264Cu, "cellSpursJobQueuePortTrySync", tm_jq_port_try_sync);
+    /* The post-FX library init creates its taskset, a barrier for its six
+     * tasks and the tasks themselves, then reads the taskset's workload id
+     * back. Neither call is in the generated table. */
+    ps3_hle_register(0x7FDF4FEFu, "cellSpursBarrierInitialize",
+                     (void*)cellSpursBarrierInitialize);
+    ps3_hle_register(0x9FCB567Bu, "cellSpursGetTasksetInfo", (void*)cellSpursGetTasksetInfo);
 }
 
 /* ---------------------------------------------------------------------------
@@ -195,7 +257,6 @@ static void sys_lwcond_create(ppu_context* ctx)
  * ------------------------------------------------------------------------- */
 extern "C" int32_t cellSpursCreateTaskset(void* spurs, void* taskset, uint64_t args,
                                           const void* priority, uint32_t maxContention);
-extern "C" uint64_t vm_read64(uint64_t a);
 
 /* CellSpursTasksetAttribute2, 512 bytes:
  *   +0x00 revision  +0x04 name  +0x08 args  +0x10 priority[8]
@@ -270,14 +331,6 @@ static void cellSpursCreateTaskset2(ppu_context* ctx)
     fprintf(stderr, "[cellSpurs] CreateTaskset2 -> rc=0x%08X lr=0x%08X\n", (uint32_t)rc, (uint32_t)ctx->lr);  /* TEMP */
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
-/* TEMP: two cellSpurs imports the post-FX init calls that nothing registers. */
-static void tm_probe_spurs_unk(ppu_context* ctx)
-{
-    fprintf(stderr, "[cellSpurs] unk import r3=0x%08X r4=0x%08X r5=0x%08X lr=0x%08X\n",
-            (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5], (uint32_t)ctx->lr);
-    ctx->gpr[3] = 0;
-}
-
 /* cellSpursAttributeEnableSystemWorkload(attr, priority[8], maxSpu, isPreemptible[8]).
  * Reserves an SPU for the system workload. The runtime schedules workloads on
  * the host, so there is nothing to reserve — acknowledging is the whole job. */
@@ -389,6 +442,7 @@ static void tm_game_log(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+#if TM_US_ADDRESS_HOOKS
 /* Replaces the lifted body, which tools/post_lift.py renames to _lifted. The
  * lifter emits direct C++ calls, so a rename is the only way to intercept one;
  * ppu_register_function redirects indirect dispatch only. */
@@ -425,6 +479,104 @@ void func_004740EC(ppu_context* ctx)
     if (on) tm_game_log(ctx);
     func_004740EC_lifted(ctx);
 }
+#elif defined(TM_TITLE_BCES01010)
+/* The same three loggers in BCES01010, found through the format strings they
+ * are passed; tools/post_lift.py --title BCES01010 renames their bodies. */
+void func_0034AE6C(ppu_context* ctx)   /* BCUS98106 0x0034ACAC */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    ctx->gpr[3] = 0;
+}
+
+void func_00981860_lifted(ppu_context* ctx);
+
+void func_00981860(ppu_context* ctx)   /* BCUS98106 0x00980B20 */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_00981860_lifted(ctx);
+}
+
+void func_004747BC_lifted(ppu_context* ctx);
+
+void func_004747BC(ppu_context* ctx)   /* BCUS98106 0x004740EC */
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_GAMELOG") ? 1 : 0;
+    if (on) tm_game_log(ctx);
+    func_004747BC_lifted(ctx);
+}
+
+/* TM_FREECHECK=1: the title's dlmalloc free(mspace, mem). The lifted body
+ * aborts on a chunk below the heap, a chunk not marked in use, a size that
+ * does not move forward, or a next chunk that says this one is free -- a
+ * double free or an overwritten header. Linux runs end in that abort, from
+ * several FIOS paths, so check the same conditions first and, when one would
+ * fail, print the chunk, its neighbourhood, the caller chain and every recent
+ * free of the same address. The body then runs and aborts as before. */
+void func_00976FD4_lifted(ppu_context* ctx);
+extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
+
+namespace {
+struct TmFreeRec { uint32_t mem, lr, caller, tid; };
+TmFreeRec s_free_ring[262144];
+std::atomic<uint32_t> s_free_seq{0};
+}
+
+static uint32_t tm_frame_caller(const ppu_context* ctx)
+{
+    const uint32_t sp = (uint32_t)ctx->gpr[1];
+    const uint32_t back = sp ? vm_read32(sp + 4) : 0;    /* 64-bit back chain, low word */
+    return back > sp ? vm_read32(back + 0x14) : 0;       /* that frame's saved LR, low word */
+}
+
+void func_00976FD4(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TM_FREECHECK") ? 1 : 0;
+    const uint32_t m = (uint32_t)ctx->gpr[3], mem = (uint32_t)ctx->gpr[4];
+    if (!on || !mem) { func_00976FD4_lifted(ctx); return; }
+
+    const uint32_t p = mem - 8, least = vm_read32(m + 0x10);
+    const uint32_t head = p >= least ? vm_read32(p + 4) : 0;
+    const uint32_t size = head & ~7u, next = p + size;
+    const uint32_t nhead = next > p ? vm_read32(next + 4) : 0;
+    const char* why = p < least       ? "chunk below the heap"
+                    : !(head & 2u)    ? "chunk not in use (double free?)"
+                    : !(next > p)     ? "size does not move forward"
+                    : !(nhead & 1u)   ? "next chunk says this one is free"
+                    : nullptr;
+    const uint32_t lr = (uint32_t)ctx->lr, caller = tm_frame_caller(ctx);
+    if (why) {
+        static std::atomic<int> said{0};
+        if (said++ < 3) {
+            fprintf(stderr, "[freecheck] %s: mspace=0x%08X mem=0x%08X prev_size=0x%08X head=0x%08X"
+                            " next=0x%08X next_head=0x%08X lr=0x%08X caller=0x%08X tid=%llu\n",
+                    why, m, mem, p >= least ? vm_read32(p) : 0, head, next, nhead, lr, caller,
+                    (unsigned long long)ctx->thread_id);
+            for (uint32_t a = (p - 0x40) & ~15u; a < p + 0x60; a += 16)
+                fprintf(stderr, "[freecheck]   %08X: %08X %08X %08X %08X\n", a,
+                        vm_read32(a), vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12));
+            const uint32_t end = s_free_seq.load();
+            const uint32_t n = end < 262144u ? end : 262144u;
+            for (uint32_t i = 0; i < n; i++) {
+                const TmFreeRec& r = s_free_ring[(end - 1 - i) & 262143u];
+                if (r.mem == mem)
+                    fprintf(stderr, "[freecheck]   freed %u frees ago: lr=0x%08X caller=0x%08X tid=%u\n",
+                            i + 1, r.lr, r.caller, r.tid);
+            }
+            ppu_dump_guest_stack(ctx, "freecheck");
+            fflush(stderr);
+        }
+    }
+    const uint32_t seq = s_free_seq.fetch_add(1);
+    s_free_ring[seq & 262143u] = TmFreeRec{ mem, lr, caller, (uint32_t)ctx->thread_id };
+    func_00976FD4_lifted(ctx);
+}
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* ---------------------------------------------------------------------------
  * Title metadata from PARAM.SFO.
@@ -520,6 +672,9 @@ static void cellVideoOutGetDeviceInfo(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+/* Everything up to the #endif targets BCUS98106 functions by address
+ * (tools/post_lift.py renames them to _lifted). */
+#if TM_US_ADDRESS_HOOKS
 /* ---------------------------------------------------------------------------
  * Guest call tracing (TM_TRACE=1).
  *
@@ -1285,6 +1440,13 @@ void func_0036204C(ppu_context* ctx) { tm_trace("AL::204c", func_0036204C_lifted
 void func_00670C10(ppu_context* ctx) { tm_trace("f_00670C10", func_00670C10_lifted, ctx); }
 void func_00671560(ppu_context* ctx) { tm_trace("f_00671560", func_00671560_lifted, ctx); }
 void func_006A9430(ppu_context* ctx) { tm_trace("f_006A9430", func_006A9430_lifted, ctx); }
+#else
+/* Other titles: what the rest of this file expects from the block above. */
+ppu_context* g_tm_main_ctx = nullptr;   /* TEMP: main thread, for TM_MAINSTACK */
+extern "C" void tm_brb_counters_tick(void) {}
+#endif /* TM_US_ADDRESS_HOOKS */
+/* SpuPostFX thread context for TM_MAINSTACK; only hand-edited lifted code sets it. */
+extern "C" ppu_context* g_tm_postfx_ctx = nullptr;
 
 /* ---------------------------------------------------------------------------
  * cellNetCtlGetState (0x8B3EBA69) — report a state instead of an error.
@@ -1378,14 +1540,6 @@ static void cellSpursCreateTask2(ppu_context* ctx)
                                            (void*)(uintptr_t)eaContext,
                                            sizeContext, lsPattern, argument);
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
-}
-
-/* Size of the per-task context save area. The runtime keeps no save area, but
- * the title allocates from this, so a zero would give every task a null
- * context. One SPU local store is the SDK's maximum and always sufficient. */
-static void cellSpursTaskGetContextSaveAreaSize(ppu_context* ctx)
-{
-    ctx->gpr[3] = 0x40000;
 }
 
 /* Probe: _cellSpursSendSignal (0xE0A6DBE4). The SPU task parks in WAIT_SIGNAL
@@ -1752,8 +1906,187 @@ static void probe_EventFlagWait(ppu_context* ctx)
         (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
 }
 
+#if TM_US_ADDRESS_HOOKS
 /* ---------------------------------------------------------------------------
- * The Edge decompressor's completion wait, guest 0x0099790C.
+ * One JobQueue of BCUS98106 is not served by the tm_jq_* hooks: SPURS' own job
+ * policy module (pm_B3523C4B17650EF8, image 41) runs it on the spurs_pm_worker
+ * threads. Its jobs are whole SPU ELFs: the module GETs the load segment (for
+ * the one at file 0x00E5DB80, EA 0x00E6DC00 and 0x22800 bytes) to LS 0x4000
+ * and branches into it. Those ELFs are lifted, at their link address 0x4000,
+ * but nothing said the bytes the module had just loaded were one of those
+ * images, so every branch into them missed the lifted lookup and the job ran
+ * in the interpreter: 16 million steps a second, 40% of all the CPU the
+ * port used in the menus and in a match (SPU_INTERP_STATS).
+ * TM_BIGJOB_LIFT=0 leaves it interpreted.
+ * ------------------------------------------------------------------------- */
+extern "C" void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_id);
+static const int s_tm_bigjob_lift = [] {
+    const char* e = getenv("TM_BIGJOB_LIFT");
+    if (e && atoi(e) == 0) return 0;
+    /* The five SPU ELFs linked at 0x4000 (entry 0x4080), images 7-11 of
+     * src/gen/spu_workloads.c: load-segment EA, its memory size, image. */
+    static const struct { uint32_t ea, span; int image; } jobs[] = {
+        { 0x00E58F00u, 0x15780u, 7 },    /* spu_0006_at_00E48E80 */
+        { 0x00E6DC00u, 0x22800u, 8 },    /* spu_0007_at_00E5DB80 */
+        { 0x00E8F580u, 0x1E300u, 9 },    /* spu_0008_at_00E7F500 */
+        { 0x00EACB00u, 0x1AB00u, 10 },   /* spu_0009_at_00E9CA80 */
+        { 0x00EC7180u, 0x07C00u, 11 },   /* spu_0010_at_00EB7100 */
+    };
+    for (const auto& j : jobs) spu_overlay_register_region(j.ea, j.span, j.image);
+    return 1;
+}();
+#endif
+
+#if defined(TM_TITLE_BCES01010) || TM_US_ADDRESS_HOOKS
+#if TM_US_ADDRESS_HOOKS
+#define TM_GCM_FLUSH        func_0077D180
+#define TM_GCM_FLUSH_LIFTED func_0077D180_lifted
+#else
+#define TM_GCM_FLUSH        func_0077DEC0
+#define TM_GCM_FLUSH_LIFTED func_0077DEC0_lifted
+#endif
+/* ---------------------------------------------------------------------------
+ * The title's command-buffer flush, guest 0x0077DEC0 (BCES01010) / 0x0077D180
+ * (BCUS98106, the same function 0xD40 lower): a sync, then
+ * put = offset of ctx->current. Nothing else in its frame loop waits for the
+ * RSX to take that put, because an idle RSX parked at the old put follows it
+ * within microseconds.
+ *
+ * The title runs two ring segments. Each ends, at put, with a JUMP to the other
+ * one; the flush that moves put into the other segment is what releases it, and
+ * right after it the title starts writing the next frame over the segment it
+ * just left. Our walker drains every millisecond or so, and a small boot frame
+ * is written in less: about one run in three it covered the JUMP before the
+ * walker took it, the walker read vertex-program words as commands and ended up
+ * in unmapped IO at 0x0FD00000 (captures/tl-1, 2026-10-16).
+ *
+ * So, when the flush moves put while the walker is parked at the old one, wait
+ * for the walker to leave it, as the RSX would have. The walker's thread also
+ * builds Vulkan pipelines, so it can take tens of milliseconds to get there
+ * when a frame brings new shaders: 5 ms left the boot desync at 5 runs in 12,
+ * 100 ms took it to 0 in 12 with no change in frame rate. Bounded by
+ * TM_FLUSH_SYNC_MS (default 100; 0 turns it off), because with
+ * GCM_SEMA_ACQUIRE=1 the walker can be waiting on a label this very thread
+ * writes later. A walker that is busy elsewhere is not waited for.
+ *
+ * BCUS98106 on Windows loses the same race: the drain there woke from a
+ * Sleep(1). The frame it skips to put is the first one that carries the
+ * NV4097_NOTIFY the SpuPostFX thread starts its pass on, and that thread
+ * counts its passes itself (a ring of four parameter blocks): one lost notify
+ * and every later frame is composed from another frame's block, and label
+ * 0x420 never again holds the value the RSX acquires.
+ * ------------------------------------------------------------------------- */
+extern "C" void* cellGcm_fifo_kick_event(void);
+extern "C" int SetEvent(void* h);
+extern "C" int tm_flush_kick_on(void);
+/* The second way to lose the segment: a walker that is BUSY in it. A frame ends
+ * with its flush leaving put on a JUMP to the start of the other segment, and
+ * the next thing the title writes is the frame after next, over that other
+ * segment. On the console the RSX has long left it. Here a frame can take the
+ * walker hundreds of milliseconds (a new shader, the 0x420 acquire), the title
+ * gets two frames ahead, and the walker goes on reading a segment that now
+ * holds a later frame: no bad word, no resync, just the rest of frame N+2 in
+ * the place of frame N's -- its NOTIFY and acquire with it, which leaves the
+ * SpuPostFX thread two passes off for good (seen as the NOTIFY of frame 0x18
+ * followed by the acquire of frame 0x1A).
+ *
+ * So the end-of-frame flush waits until the walker is out of the segment the
+ * title writes next. TM_FLUSH_FRAME_MS bounds it (default 10000; 0 = off). */
+extern "C" uint32_t cellGcm_fifo_walker_offset(void);   /* get, or the return offset inside a CALL */
+static bool tm_flush_in_seg(uint32_t io, uint32_t seg) { return io >= seg && io - seg < 0x00600000u; }
+static void tm_flush_frame_wait(uint32_t lr)
+{
+    static int ms = -1;
+    if (ms < 0) { const char* e = getenv("TM_FLUSH_FRAME_MS"); ms = e ? atoi(e) : 10000; }
+    if (ms <= 0) return;
+    const uint32_t put = vm_read32(GCM_CONTROL_EA + 0);
+    if (put < 0x0F100000u || put >= 0x0FD00000u) return;
+#if TM_US_ADDRESS_HOOKS
+    /* BCUS98106: a frame is flushed three times (0x0066114C, 0x006611E0, then
+     * 0x006757AC from the end of the frame), and only its small boot frames
+     * leave the JUMP at put. The call site says which flush this is. */
+    if (lr != 0x006757ACu) return;
+    const uint32_t next = put >= 0x0F700000u ? 0x0F100000u : 0x0F700000u;   /* segment written next */
+#else
+    (void)lr;
+    const uint32_t w = vm_read32(put + 0x40000000u);            /* io 0x0F100000 is ea 0x4F100000 */
+    if ((w & 0xE0000003u) != 0x20000000u) return;               /* not the end of a frame */
+    const uint32_t tgt = w & 0x1FFFFFFCu;
+    const uint32_t next = tgt >= 0x0F700000u ? 0x0F700000u : 0x0F100000u;   /* segment written next */
+    if (tgt < 0x0F100000u || tgt >= 0x0FD00000u || tm_flush_in_seg(put, next)) return;
+#endif
+    if (!tm_flush_in_seg(cellGcm_fifo_walker_offset(), next)) return;
+    static unsigned long long n_wait, n_late, total_us;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool late = false;
+    while (tm_flush_in_seg(cellGcm_fifo_walker_offset(), next)) {
+        if (std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(ms)) { late = true; break; }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    n_wait++;
+    total_us += (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (late && n_late++ < 8)
+        fprintf(stderr, "[tm-flush] frame end at put 0x%08X: walker still in segment 0x%08X (get 0x%08X) after %d ms\n",
+                put, next, cellGcm_fifo_walker_offset(), ms);
+    if (n_wait == 1 || (n_wait & 255) == 0)
+        fprintf(stderr, "[tm-flush] %llu frame ends waited for the walker to leave the next segment, %.1f ms each, %llu gave up\n",
+                n_wait, (double)total_us / 1000.0 / (double)n_wait, n_late);
+}
+
+void TM_GCM_FLUSH_LIFTED(ppu_context* ctx);
+static void tm_gcm_flush_sync(ppu_context* ctx);
+void TM_GCM_FLUSH(ppu_context* ctx)
+{
+    tm_gcm_flush_sync(ctx);
+    tm_flush_frame_wait((uint32_t)ctx->lr);
+}
+static void tm_gcm_flush_sync(ppu_context* ctx)
+{
+    const uint32_t old_put = vm_read32(GCM_CONTROL_EA + 0);
+    TM_GCM_FLUSH_LIFTED(ctx);
+    /* Wake the walker the moment put moves (boot_main.cpp, TM_FLUSH_KICK). */
+    if (tm_flush_kick_on() && vm_read32(GCM_CONTROL_EA + 0) != old_put)
+        SetEvent(cellGcm_fifo_kick_event());
+    static int ms = -1;
+    if (ms < 0) { const char* e = getenv("TM_FLUSH_SYNC_MS"); ms = e ? atoi(e) : 100; }
+    if (ms <= 0) return;
+    if (vm_read32(GCM_CONTROL_EA + 0) == old_put) return;      /* put did not move */
+    if (vm_read32(GCM_CONTROL_EA + 4) != old_put) return;      /* walker not parked there */
+    const auto t0 = std::chrono::steady_clock::now();
+    static unsigned long long n_wait, n_late;
+    n_wait++;
+    for (;;) {
+        if (vm_read32(GCM_CONTROL_EA + 4) != old_put) break;
+        if (std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(ms)) {
+            if (n_late++ < 4) fprintf(stderr, "[tm-flush] walker still at old put 0x%08X after %d ms\n", old_put, ms);
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (n_wait == 1 || (n_wait & 4095) == 0)
+        fprintf(stderr, "[tm-flush] %llu flushes waited for the walker to leave the old put, %llu gave up (%d ms)\n",
+                n_wait, n_late, ms);
+}
+#endif
+
+/* The Edge decompressor's completion wait, per title: BCUS98106 0x0099790C;
+ * BCES01010 0x0099864C, the only caller of cellSpursEventFlagWait in that
+ * binary, at the same +0xD40 shift as the logger next to it. */
+#if TM_US_ADDRESS_HOOKS
+#define TM_EDGE_WAIT        func_0099790C
+#define TM_EDGE_WAIT_LIFTED func_0099790C_lifted
+#define TM_EDGE_ISDONE        func_009978F8
+#define TM_EDGE_ISDONE_LIFTED func_009978F8_lifted
+#elif defined(TM_TITLE_BCES01010)
+#define TM_EDGE_WAIT        func_0099864C
+#define TM_EDGE_WAIT_LIFTED func_0099864C_lifted
+#define TM_EDGE_ISDONE        func_00998638
+#define TM_EDGE_ISDONE_LIFTED func_00998638_lifted
+#endif
+#ifdef TM_EDGE_WAIT
+/* ---------------------------------------------------------------------------
+ * The Edge decompressor's completion wait, guest 0x0099790C (BCUS98106).
  *
  * Decoded from the lifted code: wait(this, request, ...) computes its event-flag
  * bit as `1 << ((request - (this + 0x2C04)) / sizeof(request))`, then loops
@@ -1771,6 +2104,9 @@ static void probe_EventFlagWait(ppu_context* ctx)
 #define REQ_DSTLEN  0x18
 #define REQ_BUF     0x14
 #define REQ_DSTLEN2 0x24
+#define REQ_PART_DST 0x1C   /* no in-place buffer: copy a slice of the block here */
+#define REQ_PART_OFF 0x20   /* ...starting this far into the inflated block */
+#define REQ_PART_LEN 0x24   /* ...this many bytes */
 #define REQ_BUSY    0x28
 
 extern "C" int tm_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, uint32_t src_len);
@@ -1784,55 +2120,18 @@ extern "C" int tm_inflate(uint8_t* out, uint32_t out_cap, const uint8_t* src, ui
 extern "C" void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
 extern "C" int tm_inflate_selftest(void);
 
-void func_0099790C_lifted(ppu_context* ctx);
+void TM_EDGE_WAIT_LIFTED(ppu_context* ctx);
 
-void func_0099790C(ppu_context* ctx)
+/* Inflate a queued request on the host and clear its busy flag. Returns 1 if
+ * it did. Both the completion wait and isDone() land here, from the main
+ * thread and from FIOS's, so serialize: the inflate is in place and a second
+ * pass over the same request would read its own output as the source. */
+static int tm_edge_service(uint32_t req)
 {
-    const uint32_t self = (uint32_t)ctx->gpr[3];
-    const uint32_t req  = (uint32_t)ctx->gpr[4];
-
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("TM_EDGE_HLE"); on = e ? atoi(e) : 1; }
-
-    { static long long dumped = 0;
-      if (getenv("TM_REQDUMP") && req && dumped++ < 4) {
-          fprintf(stderr, "[edge] request 0x%08X raw:' + B + 'n", req);
-          for (uint32_t o = 0; o < 0x40; o += 0x10)
-              fprintf(stderr, "    +%02X: %08X %08X %08X %08X' + B + 'n", o,
-                      vm_read32(req + o), vm_read32(req + o + 4),
-                      vm_read32(req + o + 8), vm_read32(req + o + 12));
-      } }
-
-    { static long long calls = 0;
-      if (getenv("TM_REQDUMP") && calls++ < 40)
-          fprintf(stderr, "[edge] enter #%lld req=0x%08X busy=%u dst=0x%08X src=0x%08X "
-                          "srclen=%u dstlen=%u/%u\n", calls, req,
-                  req ? vm_read32(req + REQ_BUSY) : 0,
-                  req ? vm_read32(req + REQ_DST) : 0,
-                  req ? vm_read32(req + REQ_SRC) : 0,
-                  req ? vm_read32(req + REQ_SRCLEN) : 0,
-                  req ? vm_read32(req + REQ_DSTLEN) : 0,
-                  req ? vm_read32(req + REQ_DSTLEN2) : 0); }
-
-    if (req && getenv("TM_SPU_KICK")) {
-        const char* ms = getenv("TM_SPU_KICK_MS");
-        const int spins = (ms ? atoi(ms) : 200) / 5;
-        /* Signalling a taskset with nothing parked is a no-op, so poke them all
-         * rather than guess which one owns the Edge task. */
-        for (int i = 0; i < g_ntasksets; i++)
-            for (uint32_t t = 0; t < 4; t++)
-                spu_taskset_signal_task(g_tasksets[i], t);
-        for (int i = 0; i < spins && vm_read32(req + REQ_BUSY); i++)
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        if (!vm_read32(req + REQ_BUSY)) {
-            static int said = 0;
-            if (said++ < 4) fprintf(stderr, "[edge] SPU task serviced request 0x%08X\n", req);
-            ctx->gpr[3] = 0;
-            return;
-        }
-    }
-
-    if (on && req) {
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    if (!req || !vm_read32(req + REQ_BUSY)) return 0;
+    {
         const uint32_t dst    = vm_read32(req + REQ_DST);
         const uint32_t src    = vm_read32(req + REQ_SRC);
         const uint32_t srclen = vm_read32(req + REQ_SRCLEN);
@@ -1875,9 +2174,19 @@ void func_0099790C(ppu_context* ctx)
               if (ghi && n > 0 && d0 < ghi && d0 + (uint32_t)n > glo)
                   fprintf(stderr, "[guard] edge inflate req=0x%08X writes 0x%08X..0x%08X (%d bytes, inplace=%d dstlen=%u)\n",
                           req, d0, d0 + (uint32_t)n, n, inplace ? 1 : 0, dstlen); }
+            /* A request with no in-place buffer wants a slice of the block:
+             * FIOS streaming an archive member (suburbs.pgm) asks for one 64K
+             * block per request and keeps only [+0x20, +0x20 + +0x24), copied
+             * to +0x1C. +0x00 is then a fixed scratch address in the title's
+             * data, not the destination -- writing the whole block there
+             * clobbered it and left the streamed geometry unloaded. */
+            const uint32_t pdst = inplace ? 0 : vm_read32(req + REQ_PART_DST);
+            const uint32_t poff = vm_read32(req + REQ_PART_OFF);
+            const uint32_t plen = vm_read32(req + REQ_PART_LEN);
             if (n >= 0) {
-                if (inplace) memcpy(vm_base + inplace, tmp, (size_t)n);
-                else         memcpy(vm_base + dst,     tmp, (size_t)n);
+                if (inplace)     memcpy(vm_base + inplace, tmp, (size_t)n);
+                else if (pdst) { if (poff < (uint32_t)n) memcpy(vm_base + pdst, tmp + poff, std::min<size_t>(plen, (size_t)n - poff)); }
+                else             memcpy(vm_base + dst,     tmp, (size_t)n);
             }
             free(tmp);
             static long long done = 0;
@@ -1928,8 +2237,7 @@ void func_0099790C(ppu_context* ctx)
                 /* Fall through to the lifted body rather than returning: with the
                  * busy flag already clear it skips the event-flag wait but still
                  * runs the post-processing after it, which the caller depends on. */
-                func_0099790C_lifted(ctx);
-                return;
+                return 1;
             }
             static int warned = 0;
             if (warned++ < 4)
@@ -1938,10 +2246,82 @@ void func_0099790C(ppu_context* ctx)
                         req, src, srclen, dst, dstlen);
         }
     }
-    (void)self;
-    func_0099790C_lifted(ctx);
+    return 0;
 }
 
+void TM_EDGE_WAIT(ppu_context* ctx)
+{
+    const uint32_t self = (uint32_t)ctx->gpr[3];
+    const uint32_t req  = (uint32_t)ctx->gpr[4];
+
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("TM_EDGE_HLE"); on = e ? atoi(e) : 1; }
+
+    { static long long dumped = 0;
+      if (getenv("TM_REQDUMP") && req && dumped++ < 4) {
+          fprintf(stderr, "[edge] request 0x%08X raw:' + B + 'n", req);
+          for (uint32_t o = 0; o < 0x40; o += 0x10)
+              fprintf(stderr, "    +%02X: %08X %08X %08X %08X' + B + 'n", o,
+                      vm_read32(req + o), vm_read32(req + o + 4),
+                      vm_read32(req + o + 8), vm_read32(req + o + 12));
+      } }
+
+    { static long long calls = 0;
+      if (getenv("TM_REQDUMP") && calls++ < 40)
+          fprintf(stderr, "[edge] enter #%lld req=0x%08X busy=%u dst=0x%08X src=0x%08X "
+                          "srclen=%u dstlen=%u/%u\n", calls, req,
+                  req ? vm_read32(req + REQ_BUSY) : 0,
+                  req ? vm_read32(req + REQ_DST) : 0,
+                  req ? vm_read32(req + REQ_SRC) : 0,
+                  req ? vm_read32(req + REQ_SRCLEN) : 0,
+                  req ? vm_read32(req + REQ_DSTLEN) : 0,
+                  req ? vm_read32(req + REQ_DSTLEN2) : 0); }
+
+    if (req && getenv("TM_SPU_KICK")) {
+        const char* ms = getenv("TM_SPU_KICK_MS");
+        const int spins = (ms ? atoi(ms) : 200) / 5;
+        /* Signalling a taskset with nothing parked is a no-op, so poke them all
+         * rather than guess which one owns the Edge task. */
+        for (int i = 0; i < g_ntasksets; i++)
+            for (uint32_t t = 0; t < 4; t++)
+                spu_taskset_signal_task(g_tasksets[i], t);
+        for (int i = 0; i < spins && vm_read32(req + REQ_BUSY); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!vm_read32(req + REQ_BUSY)) {
+            static int said = 0;
+            if (said++ < 4) fprintf(stderr, "[edge] SPU task serviced request 0x%08X\n", req);
+            ctx->gpr[3] = 0;
+            return;
+        }
+    }
+
+    if (on && req && tm_edge_service(req)) {
+        TM_EDGE_WAIT_LIFTED(ctx);
+        return;
+    }
+    (void)self;
+    TM_EDGE_WAIT_LIFTED(ctx);
+}
+
+/* isDone(this, request), BCES01010 0x00998638: returns busy == 0. FIOS's
+ * archive reader polls it instead of calling the wait, so a request it
+ * queued was never inflated: its streamed geometry (suburbs.pgm) stayed
+ * whatever the buffer held before. Service the request here too. */
+#ifdef TM_EDGE_ISDONE
+void TM_EDGE_ISDONE_LIFTED(ppu_context* ctx);
+void TM_EDGE_ISDONE(ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("TM_EDGE_HLE"); on = e ? atoi(e) : 1; }
+    if (on) tm_edge_service((uint32_t)ctx->gpr[4]);
+    TM_EDGE_ISDONE_LIFTED(ctx);
+}
+#endif
+#endif /* TM_EDGE_WAIT */
+
+/* BCUS98106 by-address hooks: heap, pool. Meaningless on another binary,
+ * where these addresses are other functions. */
+#if TM_US_ADDRESS_HOOKS
 /* TEMP TM_ALLOCTRACE=<size>: log the guest call chain of memalign requests of
  * exactly that size (the heap fills with 66200-byte blocks). */
 void func_004DBEC4_lifted(ppu_context* ctx);
@@ -2005,12 +2385,14 @@ void func_00676ED8(ppu_context* ctx)
     fflush(stderr);
     func_00676ED8_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 static void tm_pool_dump(const char* why)
 {
     fprintf(stderr, "[pool] %s:", why);
     for (uint32_t o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(0x019307A4u + o));
     fprintf(stderr, "\n"); fflush(stderr);
 }
+#if TM_US_ADDRESS_HOOKS
 void func_00678CE8_lifted(ppu_context* ctx);
 void func_00678CE8(ppu_context* ctx)
 {
@@ -2031,6 +2413,139 @@ void func_00678CE8(ppu_context* ctx)
     }
     func_00678CE8_lifted(ctx);
 }
+
+/* ---------------------------------------------------------------------------
+ * Havok hkJobQueue mode change, guest 0x00A23140 (BCUS98106): (jq, mode) ->
+ * old mode. The physics step calls it with 0 at 0x00B55F68 and puts the old
+ * mode back at 0x00B57454. Going to mode <= 0 it takes jq's lock (lwmutex at
+ * jq+0x10, then the CellSyncMutex at jq+0 the SPU tasks use), wakes every
+ * waiter, and zeroes, in the DynamicData block at [jq+0x30],
+ * numRunningSpuTasks (+0x34) and lane 0 of record[t].running / .idle
+ * (+0x40 / +0x50 + 48t, t < 0x13).
+ * An SPU task still in its idle wait at that point owns one count in each:
+ * when it gives up it decrements them (image 5 at LS 0x4950/0x3170, image 3 at
+ * 0x3ED8) and leaves -1. The master (image 5, 0x43C4/0x37D0) and the PPU
+ * (0x00A28208) only start a worker for a queue whose idle count is 0, so a
+ * later job in queue 1 is never taken and the main thread waits at 0x00A285D4
+ * for good (freeze A). The runtime's decrementer makes that idle wait far
+ * longer than on hardware, which is why the reset meets live tasks here.
+ * TM_HAVOK_RESET_WAIT=<ms> (default 5; 0 = lifted body only):
+ *  1. outside the lock, wait up to <ms> for the tasks to go quiet
+ *     (+0x34 <= 0 and no idle count > 0);
+ *  2. take jq's lock the way the guest does, snapshot the counts and run the
+ *     lifted body (it finds its own thread as owner and only bumps the depth,
+ *     so the reset happens inside this same lock);
+ *  3. if the snapshot was not quiet, put back what live tasks still own:
+ *     negatives stay 0, positives are kept, so their exit decrements land on
+ *     0 and not -1. A stale positive kept this way is cleared by the next
+ *     quiet reset; a positive running count does not block a launch (0x37D0
+ *     and 0x00A28208 test idle), a negative idle count does. */
+void func_00A23140_lifted(ppu_context* ctx);
+
+static inline void tm_guest_call(ppu_context* ctx, void (*fn)(ppu_context*), uint64_t lr)
+{
+    ctx->lr = lr; fn(ctx);
+    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf((void*)ctx); }
+}
+
+/* jq's lock as 0x00A231E4 takes it: owner tid (u64) at jq+8, depth at jq+4. */
+static void tm_jq_lock(ppu_context* ctx, uint32_t jq)
+{
+    tm_guest_call(ctx, func_00A2DEB4, 0x00A231ECull);
+    const uint64_t tid = ctx->gpr[3];
+    if (vm_read64(jq + 0x8) == tid) { vm_write32(jq + 0x4, vm_read32(jq + 0x4) + 1); return; }
+    ctx->gpr[3] = jq + 0x10; ctx->gpr[4] = 0;
+    tm_guest_call(ctx, func_00C79304, 0x00A23214ull);            /* sys_lwmutex_lock */
+    for (;;) {
+        ctx->gpr[3] = jq;
+        tm_guest_call(ctx, func_00C78EDC, 0x00A23228ull);        /* cellSyncMutexTryLock */
+        if ((int32_t)ctx->gpr[3] == 0) break;
+        std::this_thread::yield();
+    }
+    vm_write64(jq + 0x8, tid);
+    vm_write32(jq + 0x4, 1);
+}
+
+static void tm_jq_unlock(ppu_context* ctx, uint32_t jq)
+{
+    const int32_t d = (int32_t)vm_read32(jq + 0x4) - 1;
+    vm_write32(jq + 0x4, (uint32_t)d);
+    if (d > 0) return;
+    vm_write64(jq + 0x8, ~0ull);
+    ctx->gpr[3] = jq;
+    tm_guest_call(ctx, func_00C78E6C, 0x00A2331Cull);            /* cellSyncMutexUnlock */
+    ctx->gpr[3] = jq + 0x10;
+    tm_guest_call(ctx, func_00C7933C, 0x00A2332Cull);            /* sys_lwmutex_unlock */
+}
+
+void func_00A23140(ppu_context* ctx)
+{
+    static int wait_ms = -1;
+    if (wait_ms < 0) {
+        const char* e = getenv("TM_HAVOK_RESET_WAIT");
+        wait_ms = e ? atoi(e) : 5;
+        if (wait_ms < 0) wait_ms = 0;
+        fprintf(stderr, "[havok-reset] %s (TM_HAVOK_RESET_WAIT=%d ms)\n", wait_ms ? "on" : "off", wait_ms);
+    }
+    const uint32_t jq = (uint32_t)ctx->gpr[3];
+    const int32_t mode = (int32_t)ctx->gpr[4];
+    /* Only the mode <= 0 change resets; everything else is a plain store. */
+    if (!wait_ms || mode > 0 || (int32_t)vm_read32(jq + 0x78) == mode) { func_00A23140_lifted(ctx); return; }
+
+    enum { NT = 0x13 };
+    const uint32_t blk = vm_read32(jq + 0x30);
+    auto quiet = [blk]() {
+        if ((int32_t)vm_read32(blk + 0x34) > 0) return false;
+        for (uint32_t t = 0; t < NT; t++)
+            if ((int32_t)vm_read32(blk + 0x50 + 0x30 * t) > 0) return false;
+        return true;
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto deadline = t0 + std::chrono::milliseconds(wait_ms);
+    while (!quiet() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    const long waited_us = (long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    const uint64_t lr = ctx->lr, r2 = ctx->gpr[2], r4 = ctx->gpr[4];
+    const uint32_t cr = ctx->cr;
+    tm_jq_lock(ctx, jq);
+    int32_t n34 = (int32_t)vm_read32(blk + 0x34), run[NT], idl[NT];
+    bool live = n34 > 0;
+    for (uint32_t t = 0; t < NT; t++) {
+        run[t] = (int32_t)vm_read32(blk + 0x40 + 0x30 * t);
+        idl[t] = (int32_t)vm_read32(blk + 0x50 + 0x30 * t);
+        if (idl[t] > 0) live = true;
+    }
+    ctx->gpr[3] = jq; ctx->gpr[4] = r4;
+    tm_guest_call(ctx, func_00A23140_lifted, lr);
+    const uint64_t ret = ctx->gpr[3];
+    if (live) {
+        int32_t keep34 = n34 > 0 ? n34 : 0, sum = 0;
+        for (uint32_t t = 0; t < NT; t++) {
+            const int32_t i = idl[t] > 0 ? idl[t] : 0;
+            const int32_t r = run[t] > i ? run[t] : i;
+            vm_write32(blk + 0x50 + 0x30 * t, (uint32_t)i);
+            vm_write32(blk + 0x40 + 0x30 * t, (uint32_t)r);
+            sum += i;
+        }
+        if (keep34 < sum) keep34 = sum;
+        vm_write32(blk + 0x34, (uint32_t)keep34);
+    }
+    tm_jq_unlock(ctx, jq);
+    ctx->gpr[3] = ret; ctx->gpr[2] = r2; ctx->cr = cr; ctx->lr = lr;
+
+    static unsigned n_all = 0, n_live = 0;
+    n_all++;
+    if (live && ++n_live <= 8)
+        fprintf(stderr, "[havok-reset] reset %u: tasks alive after %ld us, counts kept: +34=%d "
+                        "run[0]=%d idle[0]=%d run[1]=%d idle[1]=%d\n",
+                n_all, waited_us, n34, run[0], idl[0], run[1], idl[1]);
+    if (n_all == 1 || (n_all & 1023) == 0)
+        fprintf(stderr, "[havok-reset] %u reset(s), %u with live tasks (last wait %ld us)\n",
+                n_all, n_live, waited_us);
+}
+#endif /* TM_US_ADDRESS_HOOKS */
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
 extern ppu_context* g_tm_main_ctx;
 extern "C" void tm_pool_tick(void)
@@ -2092,6 +2607,7 @@ void tm_toi_nan(ppu_context* ctx)
 
 /* TEMP diag: game frame progress, printed with TM_MAINSTACK. */
 volatile long g_tm_players_upd, g_tm_frame_upd;
+#if TM_US_ADDRESS_HOOKS
 void func_000DB394_lifted(ppu_context* ctx);
 void func_000DB394(ppu_context* ctx) { g_tm_players_upd++; func_000DB394_lifted(ctx); }
 void func_0010C898_lifted(ppu_context* ctx);
@@ -2126,6 +2642,7 @@ void func_0062EB40(ppu_context* ctx)
                 ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3]) : 0, ctx->gpr[3] ? vm_read32((uint32_t)ctx->gpr[3] + 4) : 0);
     func_0062EB40_lifted(ctx);
 }
+#endif /* TM_US_ADDRESS_HOOKS */
 
 /* TEMP diag: segment raycast loop in func_00630150 -- t (v28) += step (v27)
  * until t >= tmax (v26). Report the lanes once the loop has clearly run away. */
@@ -2161,38 +2678,211 @@ void tm_seg_probe(ppu_context* ctx)
  * ------------------------------------------------------------------------- */
 #include <condition_variable>
 #include <deque>
+#include <set>
+#ifdef _WIN32
 #include <process.h>
+#define TM_JQ_WORKER_FN static unsigned __stdcall
+#else
+#include <pthread.h>
+#define TM_JQ_WORKER_FN static void*
+#endif
 extern "C" int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                                          uint32_t job_ea, uint32_t job_desc_size);
-struct TmJqItem { uint32_t jq, job, size, tag, bin, bin_size; };
+struct TmJqItem { uint32_t jq, job, size, tag, bin, bin_size; bool sync; };
 static std::mutex s_jq_mx;
 static std::condition_variable s_jq_cv, s_jq_done;
 static std::deque<TmJqItem> s_jq_q;
 static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
-extern "C" void spurs_job_set_spu_num(uint32_t n);
-static unsigned __stdcall tm_jq_worker(void* arg)
+static std::map<uint32_t, int> s_jq_running;      /* jq -> jobs a worker is running */
+static volatile uint32_t s_jq_cur[16];             /* binary each worker is running, for [jq-stall] */
+/* Jobs queued or running, read by the FIFO walker without s_jq_mx. An Edge
+ * geometry job fills a self-JUMP hole in the command buffer with a CALL to its
+ * ring segment; the walker must not give up on a park while one of them can
+ * still do that (ps3recomp's g_gcm_park_hold_hook). */
+static std::atomic<int> s_jq_outstanding{0};
+extern "C" int (*g_gcm_park_hold_hook)(uint32_t park_io, uint32_t put);
+static int tm_jq_park_hold(uint32_t, uint32_t)
 {
-    spurs_job_set_spu_num((uint32_t)(uintptr_t)arg);   /* one SPU id per worker */
+    return s_jq_outstanding.load(std::memory_order_relaxed) > 0;
+}
+
+/* Which jobs write the image the RSX is about to copy back from main memory
+ * (ps3recomp's g_gcm_blit_wait_hook, cellGcmSys.c nv3089_wait_jobs).
+ *
+ * The final picture is composed by post-FX jobs over main-memory copies of
+ * the frame's layers, and returns to the RSX through an NV3089 copy that
+ * nothing orders after those jobs. Waiting for every job fixed the picture
+ * and cost the frame rate (the next frame's Edge jobs are always there). So
+ * the binaries that write that range are learned: for its first runs each
+ * job binary is bracketed by a sparse checksum of the range, and one whose
+ * runs change it at least half the time is a producer. A binary that merely
+ * ran beside a producer changes it now and then, not half the time. The wait
+ * then covers queued or running jobs of producers -- and of binaries still
+ * being learned, so the picture is right from the first frame. */
+#define TM_JQ_PROD_MAX 64
+#define TM_JQ_PROD_LEARN_RUNS 24u
+struct TmJqProd { uint32_t bin, runs, changed; int state; };   /* 0 learning, 1 producer, 2 not */
+static TmJqProd s_jq_prod[TM_JQ_PROD_MAX];                     /* under s_jq_mx */
+static int s_jq_prod_n;
+static uint32_t s_jq_run_bin[16];                               /* under s_jq_mx: binary each worker runs */
+static std::atomic<uint32_t> s_jq_watch_ea{0}, s_jq_watch_end{0};
+
+/* Under s_jq_mx. NULL when the table is full: such a binary counts as "not". */
+static TmJqProd* tm_jq_prod_find(uint32_t bin, bool add)
+{
+    for (int i = 0; i < s_jq_prod_n; i++) if (s_jq_prod[i].bin == bin) return &s_jq_prod[i];
+    if (!add || s_jq_prod_n >= TM_JQ_PROD_MAX) return nullptr;
+    TmJqProd* e = &s_jq_prod[s_jq_prod_n++];
+    e->bin = bin; e->runs = 0; e->changed = 0; e->state = 0;
+    return e;
+}
+static uint32_t tm_jq_watch_sum(void)
+{
+    const uint32_t ea = s_jq_watch_ea.load(std::memory_order_relaxed);
+    const uint32_t end = s_jq_watch_end.load(std::memory_order_relaxed);
+    uint32_t sum = 0;
+    for (uint32_t a = ea & ~3u; a + 4 <= end; a += 1024) sum = sum * 31u + vm_read32(a);
+    return sum;
+}
+static int tm_jq_blit_wait(uint32_t src_ea, uint32_t bytes)
+{
+    /* The range grows over the strips of one image; a copy from somewhere
+     * else starts the learning over. */
+    if (bytes && bytes <= (16u << 20)) {
+        const uint32_t ea = s_jq_watch_ea.load(std::memory_order_relaxed);
+        const uint32_t end = s_jq_watch_end.load(std::memory_order_relaxed);
+        const uint32_t lo = ea && ea < src_ea ? ea : src_ea;
+        const uint32_t hi = end > src_ea + bytes ? end : src_ea + bytes;
+        if (!ea || hi - lo > (16u << 20)) {
+            std::lock_guard<std::mutex> lk(s_jq_mx);
+            s_jq_watch_ea.store(src_ea, std::memory_order_relaxed);
+            s_jq_watch_end.store(src_ea + bytes, std::memory_order_relaxed);
+            s_jq_prod_n = 0;
+            fprintf(stderr, "[jq-prod] watching main memory 0x%08X..0x%08X for composite jobs\n",
+                    src_ea, src_ea + bytes);
+        } else if (lo != ea || hi != end) {
+            s_jq_watch_ea.store(lo, std::memory_order_relaxed);
+            s_jq_watch_end.store(hi, std::memory_order_relaxed);
+        }
+    }
+    std::lock_guard<std::mutex> lk(s_jq_mx);
+    for (const TmJqItem& q : s_jq_q) {
+        const TmJqProd* e = tm_jq_prod_find(q.bin, false);
+        if (!e ? s_jq_prod_n < TM_JQ_PROD_MAX : e->state != 2) return 1;
+    }
+    for (int w = 0; w < 6; w++) {
+        if (!s_jq_run_bin[w]) continue;
+        const TmJqProd* e = tm_jq_prod_find(s_jq_run_bin[w], false);
+        if (!e ? s_jq_prod_n < TM_JQ_PROD_MAX : e->state != 2) return 1;
+    }
+    return 0;
+}
+extern "C" int (*g_gcm_blit_wait_hook)(uint32_t src_ea, uint32_t bytes);
+extern "C" void spurs_job_set_spu_num(uint32_t n);
+TM_JQ_WORKER_FN tm_jq_worker(void* arg)
+{
+    /* Workers 0-5 stand for the six SPUs. TM_JQ_EXTRA adds workers 6.. that
+     * take any job except the Edge geometry ones, whose output rings and
+     * labels are per SPU; they borrow an SPU number in 0-5. The post-FX
+     * pass is ~0.7 CPU-seconds of jobs a frame and the walker waits for it:
+     * two more workers took the menus from 6.2 to 7.3 fps on eight cores. */
+    const bool tm_extra = (uintptr_t)arg >= 6;
+    spurs_job_set_spu_num((uint32_t)((uintptr_t)arg % 6));
     for (;;) {
         TmJqItem it;
         { std::unique_lock<std::mutex> lk(s_jq_mx);
-          s_jq_cv.wait(lk, [] { return !s_jq_q.empty(); });
-          it = s_jq_q.front(); s_jq_q.pop_front(); }
+          /* A sync job starts once every job pushed before it on its queue
+           * has finished: the queue is FIFO, so those are the ones running. */
+          /* FIFO per queue, not across queues: a sync job waiting on its own
+           * queue must not hold back the other queues' jobs behind it (a
+           * DeferredLighting gate stalled 127 Edge and post-FX jobs while the
+           * Edge job it waited on spun on ring space only they could free).
+           * Returns the index of the first runnable job, or -1. */
+          auto pick = [tm_extra] {
+              uint32_t blocked[16]; int nb = 0;
+              for (size_t i = 0; i < s_jq_q.size(); i++) {
+                  const TmJqItem& q = s_jq_q[i];
+                  bool skip = false;
+                  for (int b = 0; b < nb; b++) if (blocked[b] == q.jq) { skip = true; break; }
+                  if (skip) continue;
+                  if (q.sync && s_jq_running[q.jq] > 0) { if (nb < 16) blocked[nb++] = q.jq; continue; }
+                  /* an extra worker leaves the Edge queue alone, in order */
+                  if (tm_extra && (q.jq == 0x4001B280u || q.bin == 0x00D53000u)) { if (nb < 16) blocked[nb++] = q.jq; continue; }
+                  return (long)i;
+              }
+              return -1L;
+          };
+          long idx = -1;
+          s_jq_cv.wait(lk, [&] { return (idx = pick()) >= 0; });
+          it = s_jq_q[(size_t)idx]; s_jq_q.erase(s_jq_q.begin() + idx);
+          s_jq_run_bin[(uintptr_t)arg % 16] = it.bin;   /* tm_jq_blit_wait: never between queue and worker */
+          ++s_jq_running[it.jq]; }
+        /* Learning which binaries write the watched image (tm_jq_blit_wait). */
+        bool prod_learn = false; uint32_t prod_before = 0;
+        if (s_jq_watch_ea.load(std::memory_order_relaxed)) {
+            { std::lock_guard<std::mutex> lk(s_jq_mx);
+              const TmJqProd* e = tm_jq_prod_find(it.bin, true);
+              prod_learn = e && e->state == 0; }
+            if (prod_learn) prod_before = tm_jq_watch_sum();
+        }
+        s_jq_cur[(uintptr_t)arg % 16] = it.bin;
         int ran = spu_workload_dispatch_job(vm_base + it.bin, it.bin_size, it.job, it.size);
+        s_jq_cur[(uintptr_t)arg % 16] = 0;
+        const bool prod_changed = prod_learn && tm_jq_watch_sum() != prod_before;
         if (it.bin == 0x00E3BD80u) { static int k = 0; if (k++ < 6) {  /* TEMP: the cull job */
             fprintf(stderr, "[jq-cull] job=0x%08X ran=%d counter=0x%08X\n", it.job, ran, vm_read32(0x019307D0u)); } }
         { std::lock_guard<std::mutex> lk(s_jq_mx);
-          --s_jq_pending[((uint64_t)it.jq << 32) | it.tag]; }
+          if (prod_learn) {
+              TmJqProd* e = tm_jq_prod_find(it.bin, false);
+              if (e && e->state == 0) {
+                  e->runs++;
+                  if (prod_changed) e->changed++;
+                  if (e->runs >= TM_JQ_PROD_LEARN_RUNS) {
+                      /* any run that changed the image makes it a producer (TM_JQ_PROD_MIN runs out of 24, default 12) */
+                      { static int mn = -1; if (mn < 0) { const char* v = getenv("TM_JQ_PROD_MIN"); mn = v ? atoi(v) : 12; }
+                        e->state = e->changed >= (unsigned)mn ? 1 : 2; }
+                      fprintf(stderr, "[jq-prod] job binary 0x%08X (queue 0x%08X): %u of %u runs changed "
+                                      "the watched image -> %s\n", it.bin, it.jq, e->changed, e->runs,
+                              e->state == 1 ? "composite producer, the copy-back waits for it"
+                                            : "not a producer");
+                  }
+              }
+          }
+          s_jq_run_bin[(uintptr_t)arg % 16] = 0;
+          --s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
+          --s_jq_running[it.jq]; }
+        s_jq_outstanding.fetch_sub(1, std::memory_order_relaxed);
         s_jq_done.notify_all();
+        s_jq_cv.notify_all();      /* a sync job may have been waiting on this one */
     }
 }
-static void tm_jq_push_job(ppu_context* ctx)
+/* Queues whose next pushed job must wait for every earlier job of that queue
+ * (a _cellSpursJobQueuePortPushSync seen, see tm_jq_sync). Under s_jq_mx. */
+static std::set<uint32_t> s_jq_sync_next;
+static void tm_jq_push(ppu_context* ctx, bool sync)
 {
     static std::once_flag once;
     std::call_once(once, [] {    /* a job's spu_context + lifted call depth need a big stack */
+        g_gcm_park_hold_hook = tm_jq_park_hold;
+        g_gcm_blit_wait_hook = tm_jq_blit_wait;
         const char* e = getenv("TM_JQ_WORKERS"); int nw = e ? atoi(e) : 4;
         if (nw > 6) nw = 6;   /* six SPUs: labels 0x80-0x85, one per SPU */
-        for (int i = 0; i < nw; i++) _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
+        { const char* x = getenv("TM_JQ_EXTRA"); int ne = x ? atoi(x) : 0;
+          if (ne < 0) ne = 0; if (ne > 10) ne = 10;
+          if (nw == 6) nw += ne; }
+        for (int i = 0; i < nw; i++) {
+#ifdef _WIN32
+            _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
+#else
+            pthread_t t;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 16u << 20);
+            if (pthread_create(&t, &attr, tm_jq_worker, (void*)(uintptr_t)i) == 0)
+                pthread_detach(t);
+            pthread_attr_destroy(&attr);
+#endif
+        }
     });
     TmJqItem it;
     it.jq = (uint32_t)ctx->gpr[3]; it.job = (uint32_t)ctx->gpr[4];
@@ -2200,11 +2890,43 @@ static void tm_jq_push_job(ppu_context* ctx)
     it.tag = (uint32_t)ctx->gpr[6] & 15;
     it.bin = (uint32_t)(vm_read64(it.job + 0) & ~1ull);
     it.bin_size = (uint32_t)vm_read16(it.job + 8) << 4;
+    it.sync = sync;
     if (it.bin && it.bin_size) {
         { std::lock_guard<std::mutex> lk(s_jq_mx);
+          /* A PortPushSync before this push (tm_jq_sync): this job is the barrier. */
+          if (s_jq_sync_next.erase(it.jq)) it.sync = true;
+          s_jq_outstanding.fetch_add(1, std::memory_order_relaxed);
           ++s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
           s_jq_q.push_back(it); }
         s_jq_cv.notify_one();
+    }
+    ctx->gpr[3] = 0;
+}
+static void tm_jq_push_job(ppu_context* ctx) { tm_jq_push(ctx, false); }
+/* _cellSpursJobQueuePortPushBody: the arguments read as PortPushJobBody2's
+ * (port, job, sizeDesc, tag), then isSync in r7. Twisted Metal passes 1 in
+ * both r6 and r7. */
+static void tm_jq_port_push(ppu_context* ctx) { tm_jq_push(ctx, ctx->gpr[7] != 0); }
+/* _cellSpursJobQueuePortPushJobListBody(port, CellSpursJobList* list, ?, tag,
+ * isSync): a CellSpursJobList is { u32 numJobs; u32 sizeOfJob; u64 eaJobList },
+ * numJobs descriptors of sizeOfJob bytes laid end to end. Each goes through the
+ * single-job push, keyed on the same port and tag, so the port's sync waits for
+ * all of them. Twisted Metal's post-FX (SpuPostFX.cpp) pushes its passes this
+ * way, lists of 16 to 64 jobs over the image, the bloom and the depth copied
+ * out to main memory; unhandled, the call faked CELL_OK and none of them ran. */
+static void tm_jq_push_job_list(ppu_context* ctx)
+{
+    const uint32_t list = (uint32_t)ctx->gpr[4];
+    const uint32_t n = vm_read32(list + 0), stride = vm_read32(list + 4);
+    const uint32_t first = (uint32_t)vm_read64(list + 8);
+    const uint64_t port = ctx->gpr[3], tag = ctx->gpr[6];
+    const bool sync = ctx->gpr[7] != 0;
+    for (uint32_t i = 0; i < n && stride; i++) {
+        ctx->gpr[3] = port;
+        ctx->gpr[4] = first + i * stride;
+        ctx->gpr[5] = stride;
+        ctx->gpr[6] = tag;
+        tm_jq_push(ctx, sync && i == 0);   /* the list waits as a whole, its jobs run side by side */
     }
     ctx->gpr[3] = 0;
 }
@@ -2212,11 +2934,101 @@ static void tm_jq_sync(ppu_context* ctx)
 {
     const uint64_t jq = (uint32_t)ctx->gpr[3];
     const uint32_t mask = (uint32_t)ctx->gpr[4];
+    /* NID 0x9396BE1D is _cellSpursJobQueuePortPushSync: on hardware a barrier
+     * pushed INTO the queue, returning at once. Blocking the PPU here (as this
+     * used to) keeps it from the cellGcmFlush right after (DeferredLighting,
+     * lr 0x00647D6C), so the RSX never reaches the Edge holes, never frees ring
+     * space, and the Edge jobs the sync waits for spin forever (mode B).
+     * TM_JQ_PUSHSYNC=0 restores the blocking wait. */
+    { static int on = -1; if (on < 0) { const char* e = getenv("TM_JQ_PUSHSYNC"); on = e ? atoi(e) : 1; }
+      if (on && (uint32_t)ctx->lr == 0x00647D6Cu) {   /* only the DeferredLighting gate: other callers reuse static descriptors */
+          std::lock_guard<std::mutex> lk(s_jq_mx);
+          s_jq_sync_next.insert((uint32_t)jq);
+          ctx->gpr[3] = 0;
+          return;
+      } }
     std::unique_lock<std::mutex> lk(s_jq_mx);
-    s_jq_done.wait(lk, [&] {
+    auto done = [&] {
         for (uint32_t t = 0; t < 16; t++)
             if ((mask >> t & 1) && s_jq_pending[(jq << 32) | t] > 0) return false;
         return true;
-    });
+    };
+    /* A sync that has waited 5 s says what it waits for, once per call. */
+    if (!s_jq_done.wait_for(lk, std::chrono::seconds(5), done)) {
+        static int n = 0;
+        if (n++ < 8) {
+            fprintf(stderr, "[jq-stall] sync jq=0x%08X mask=0x%X lr=0x%08X queued=%zu",
+                    (uint32_t)jq, mask, (uint32_t)ctx->lr, s_jq_q.size());
+            if (!s_jq_q.empty())
+                fprintf(stderr, " front={jq=0x%08X tag=%u bin=0x%08X sync=%d}", s_jq_q.front().jq,
+                        s_jq_q.front().tag, s_jq_q.front().bin, (int)s_jq_q.front().sync);
+            for (auto& kv : s_jq_pending)
+                if (kv.second > 0) fprintf(stderr, " pending[jq=0x%08X tag=%u]=%d",
+                                           (uint32_t)(kv.first >> 32), (uint32_t)kv.first, kv.second);
+            for (auto& kv : s_jq_running)
+                if (kv.second > 0) fprintf(stderr, " running[jq=0x%08X]=%d", kv.first, kv.second);
+            for (int w = 0; w < 6; w++)
+                if (s_jq_cur[w]) fprintf(stderr, " worker%d=bin 0x%08X", w, s_jq_cur[w]);
+            fputc(10, stderr);
+        }
+        s_jq_done.wait(lk, done);
+    }
     ctx->gpr[3] = 0;
+}
+/* cellSpursJobQueuePortSync(port) waits for every job pushed through the
+ * port, whatever its tag; PortTrySync(port) answers without waiting. Twisted
+ * Metal polls TrySync (sleeping while the answer is non-zero), then calls
+ * PortSync. Both were unregistered and faked CELL_OK, so the title never
+ * waited for its jobs. */
+static bool tm_jq_port_idle(uint64_t port)
+{
+    for (uint32_t t = 0; t < 16; t++)
+        if (s_jq_pending[(port << 32) | t] > 0) return false;
+    return true;
+}
+static void tm_jq_port_sync(ppu_context* ctx)
+{
+    const uint64_t port = (uint32_t)ctx->gpr[3];
+    std::unique_lock<std::mutex> lk(s_jq_mx);
+    s_jq_done.wait(lk, [&] { return tm_jq_port_idle(port); });
+    ctx->gpr[3] = 0;
+}
+/* put = offset of the title's CellGcmContextData.current (guest pointer to the
+ * context at 0x01A222C0), when the walker sits idle at the current put. */
+extern "C" int32_t cellGcmAddressToOffset(uint32_t address, uint32_t* offset);
+static void tm_jq_publish_put(void)
+{
+    const uint32_t gctx = vm_read32(0x01A222C0u);
+    if (!gctx) return;
+    const uint32_t begin = vm_read32(gctx + 0), end = vm_read32(gctx + 4), cur = vm_read32(gctx + 8);
+    if (!begin || cur < begin || cur > end) return;
+    uint32_t off = 0;
+    if (cellGcmAddressToOffset(cur, &off) != 0) return;
+    const uint32_t put = vm_read32(GCM_CONTROL_EA + 0), get = vm_read32(GCM_CONTROL_EA + 4);
+    if (off == put || get != put) return;
+    /* Only forward within the segment the walker is in (the title runs two
+     * 1 MB command segments); anything else is a context this is not. */
+    if ((off >> 20) != (put >> 20) || off < put) return;
+    vm_write32(GCM_CONTROL_EA + 0, off);
+    static unsigned long n = 0;
+    if (++n <= 6 || (n & 1023) == 0)
+        fprintf(stderr, "[jq-flush] PPU waits on jobs: put 0x%08X -> 0x%08X (#%lu)\n", put, off, n);
+}
+static void tm_jq_port_try_sync(ppu_context* ctx)
+{
+    const uint64_t port = (uint32_t)ctx->gpr[3];
+    std::lock_guard<std::mutex> lk(s_jq_mx);
+    /* CELL_SPURS_JQ_ERROR_BUSY as ps3recomp's cellSpursJq.h names it; the
+     * title only tests for non-zero. */
+    ctx->gpr[3] = tm_jq_port_idle(port) ? 0 : 0x80410A05u;
+    /* The title polls TrySync while it waits for its frame's jobs, without a
+     * cellGcmFlush first. Edge jobs among them wait for ring space that only
+     * the RSX frees, and our walker is idle at the old put, so the RSX never
+     * reaches their holes. On hardware the RSX would already be running
+     * behind a recent put. Publish put = the context's current while the PPU
+     * waits and the walker is idle (TM_JQ_WAIT_FLUSH=0 turns it off). */
+    if (ctx->gpr[3]) {
+        static int on = -1; if (on < 0) { const char* e = getenv("TM_JQ_WAIT_FLUSH"); on = e ? atoi(e) : 1; }
+        if (on) tm_jq_publish_put();
+    }
 }

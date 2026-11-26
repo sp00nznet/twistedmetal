@@ -32,8 +32,6 @@
 
 extern "C" {
 void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
-uint32_t vm_read32(uint64_t a);
-uint64_t vm_read64(uint64_t a);
 void     vm_write8(uint64_t a, uint8_t v);
 void     vm_write32(uint64_t a, uint32_t v);
 void     vm_write64(uint64_t a, uint64_t v);

@@ -127,6 +127,139 @@ an OPD descriptor pointing back into the image, which noise never does.
 - [ps3recomp](https://github.com/sp00nznet/ps3recomp) checked out at `../ps3recomp`
 - 7-Zip (reads the UDF image)
 
+## Building on Linux
+
+The harness also builds and boots on Linux (checked on a Steam Deck,
+SteamOS, GCC 15.2). Off Windows, CMake builds the runtime from
+`PS3RECOMP_DIR` itself, so it needs SDL2 (plus Vulkan headers and glslang
+for `-DPS3RECOMP_RSX_VULKAN=ON`), and a ps3recomp tree that has both
+`ydkj-master-bringup` and master's POSIX fixes.
+
+Without any game data, `twistedmetal_smoke` boots this harness on
+ps3recomp's synthetic smoke title:
+
+```bash
+cmake -S . -B build-smoke -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DTM_BUILD_GAME=OFF -DTM_BUILD_SMOKE=ON
+cmake --build build-smoke --target twistedmetal_smoke
+./build-smoke/twistedmetal_smoke build-smoke/smoke/smoke.elf   # [smoke] PASS
+```
+
+The European disc, `BCES01010`, is a different binary from `BCUS98106`:
+its TOC, code end and hooked functions sit at other addresses, which
+`TM_TITLE` and `post_lift.py --title` select.
+
+```bash
+P=../ps3recomp/tools
+python $P/find_functions.py input/EBOOT.ELF --output meta/functions.json
+python tools/seed_gaps.py --code-hi 0xC7BD3C
+python $P/ppu_loader.py input/EBOOT.ELF -o meta/
+python $P/ppu_lifter.py input/EBOOT.ELF \
+       --functions meta/functions.seeded.json --hle-stubs meta/EBOOT.imports.json \
+       --toc 0xF21968 --code-end 0xC7BD3C --chunk-lines 150000 --output src/recomp -j 3
+python tools/post_lift.py --title BCES01010
+python $P/extract_spu_images.py input/EBOOT.ELF --output meta/spu
+python $P/build_spu_workloads.py --images meta/spu --lifted src/spu_gen \
+       --out src/gen/spu_workloads.c --register-fn tm_spu_register_all \
+       --constructor --title twistedmetal
+cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DTM_TITLE=BCES01010 \
+      -DTM_RECOMP_COMPILE_OPTIONS=-O1 -DCMAKE_C_FLAGS=-march=x86-64-v3
+cmake --build build-linux -j2
+PS3_VFS_ROOT=<writable dir holding PS3_GAME> ./build-linux/twistedmetal input/EBOOT.ELF
+```
+
+The JobQueue jobs and the audio mixer's SPURS policy module are not in the
+EBOOT: the title loads them from its data. Dump them at run time, lift them,
+and configure again; for a title other than BCUS98106, CMake registers every
+`src/spu_gen/job_<fingerprint>` and `pm_<fingerprint>` it finds.
+
+```bash
+SPU_DUMP_MISS=$PWD/meta/jobs PS3_VFS_ROOT=... ./build-linux/twistedmetal input/EBOOT.ELF
+# A job runs at LS 0. The policy module ("[cellSpurs] wid=0 PM dumped") runs at
+# LS 0xA00: use base=0xA00 and the pm_ prefix and directory for that one.
+fp=<fingerprint>; base=0x0; kind=job
+python $P/wrap_spu_elf.py meta/jobs/spujob_${fp}_*.bin --entry $base --base $base \
+       --out meta/spu/${kind}_$fp.elf
+python $P/spu_lifter.py meta/spu/${kind}_$fp.elf --auto-functions meta/spu/${kind}_$fp.elf \
+       --symbol-prefix ${kind}_${fp}_ -o src/spu_gen/${kind}_$fp
+cmake build-linux && cmake --build build-linux -j2
+```
+
+- `-march=x86-64-v3` (AVX2, FMA) is for the C side, the runtime and the
+  lifted SPU jobs: it enables the runtime's SSE4.1 shuffles and, with
+  ps3recomp's `perf/spu-float-avx2`, four SPU float lanes at a time. The
+  menu's post-FX jobs then run at about 2.5 frames per second instead of
+  0.9. Leave it out for a CPU without AVX2.
+- GCC needs about 2 GB per 240k-line chunk at `-O1`. `--chunk-lines`
+  (ps3recomp's `ppu_lifter.py`) keeps each chunk small enough for a 16 GB
+  machine; without it, chunks are 600k lines.
+- The VFS root must be writable: `/dev_hdd0` maps into it, and the title
+  installs its game data there on first boot. A read-only disc tree can be
+  symlinked in as `PS3_GAME`.
+- `TM_GAMELOG=1` prints the game's own log, as on Windows.
+- With `-DPS3RECOMP_RSX_VULKAN=ON` the harness presents through the Vulkan
+  backend (`PS3RECOMP_VK_GUEST_PROGRAMS=1` runs the title's own programs,
+  `PS3RECOMP_VK_WINDOW=1` opens a window); `TM_RSX=null` keeps the null one.
+- `TM_GSTACKS=<seconds>` prints every guest thread's call chain that often.
+
+On Linux the title boots through all of its legal screens (`UiLegal_1`
+through `UiLegal_havok`, about 45 s), with the UI archive inflated on the
+host, in 10 of 10 runs. It then shows its "EXIT GAME NETWORK" dialog
+(`UiNetShutdown`). Without the dumped jobs and the mixer's policy module it
+stayed there (200 s in one run). With them lifted, the dialog closed after
+75 to 87 s in 3 of 3 runs (it does not always close: one run stayed on it
+for 170 s), and the title goes on to `MainMenu`. On Vulkan the main menu's
+items and button hints render ("ONE PLAYER", "MULTI-PLAYER", "QUICK ONLINE
+ACTION", "OPTIONS", "PREV/NEXT", "SELECT"); that needs ps3recomp's
+`fix/gcm-resolve-main-io`, without which the menu's fragment programs were
+read out of VRAM. The deferred 3D scene behind the menu (shadow atlas,
+four-target G-buffer, HDR lighting, bloom) draws too. That took ps3recomp's
+`fix/spu-disasm-orbi` (re-lift the jobs and images after it -- job
+0x29F5F1C692D71C34 runs four `orbi` every menu frame),
+`feat/spurs-barrier-tasksetinfo` and `fix/spurs-taskset-native-fields` for
+the post-FX tasks, `fix/spurs-job-stack-frame` for Sweet Tooth himself, and
+`fix/engine-fp16-transfer-read` for the bloom and the flames the post-FX
+copies out. The menu's colours come from that SPU post-FX: the image it
+shows is copied back from main memory after the post-FX JobQueue jobs ran
+over it. Those jobs are 13 more binaries to dump and lift as above, and the
+RSX has to wait for the post-FX frame label: `boot_main` sets
+`GCM_SEMA_ACQUIRE=1 GCM_SEMA_ACQUIRE_MS=5000` for BCES01010 unless the
+environment does (200 ms is too short for the lifted jobs).
+Without the wait the copy takes the raw light accumulation in most frames,
+which is the saturated orange menu; with it the menu matched an RPCS3
+reference (natural light, the flames on Sweet Tooth's head) in 24 of 24
+late frames over 3 runs. Until ps3recomp's `fix/lwmutex-posix`, every `sys_lwmutex`
+was a no-op on POSIX, and about one run in three aborted in the guest
+allocator (`TM_FREECHECK=1` shows such a double free). On Vulkan (RADV,
+Steam Deck) the loading indicator, the boot logo, the legal screens and
+that dialog render through the title's own programs. That needs ps3recomp's
+`fix/b8-component-remap`, `fix/engine-unnorm-coords`,
+`feat/vk-rgba16f-targets`, `fix/engine-display-buffers-flips`,
+`feat/engine-nv3089-coherence` and, for the 4608x704 target the 3D scene
+uses, `feat/vk-max-image-dim`. All of them are in its `linux/integration`
+branch. The legal screens present at two to three frames per second for
+now.
+
+On Linux a Challenge match (Sunsprings, six bots) now runs with its HUD, sky
+and level geometry. It takes six more JobQueue jobs, all in the EBOOT, so
+they can be carved by fingerprint instead of dumped:
+`6BA1F6CD43D6005F`, `A25123E89486EAD5`, `FD1877A6E25051E0`,
+`0C7C7294454D5F48` (the cull job), `3641D05246E29D20` and
+`56170BA0CB0F6E31`. The level streams its paged geometry (`suburbs.pgm`,
+inside `levels/suburbs.psarc`) through FIOS, which hands the Edge
+decompressor one 64 KB block per request and keeps a slice of it: no
+in-place buffer at +0x14, the slice's destination at +0x1C, its offset into
+the inflated block at +0x20 and its length at +0x24. FIOS polls the
+decompressor's `isDone` (0x00998638) instead of calling its wait, so the
+host inflate serves requests from both. Before that, the streamed records
+held stale UI data, the Edge geometry jobs asserted on them, filled their
+segment rings and the frame deadlocked behind the JobQueue sync.
+Lift the PPU with ps3recomp at a470b79 or later: an older lifter turned a
+mid-function spill reload of r16 (`ld r16,0x100(r1)` at 0x0068A224) into
+the register's value at entry, and about a minute into the match the
+category insert `func_00683E6C` walked a NULL list and spun forever. With
+a current lift the match has run for ten minutes.
+
 ## Project structure
 
 ```
@@ -146,6 +279,7 @@ twistedmetal/
 │   ├── boot_main.cpp       # ps3recomp boot harness, rebranded for this title
 │   ├── hle_extra.cpp       # imports this title reaches that the runtime lacks
 │   ├── tm_inflate.cpp      # self-contained RFC 1951 inflater for the SPU decompressor
+│   ├── smoke_stubs.cpp     # empty game hooks for twistedmetal_smoke
 │   ├── compat/             # <dirent.h>/<unistd.h> Win32 shims
 │   ├── gen/                # generated HLE NID table (committed)
 │   ├── spu_gen/            # lifted SPU images, 19 MB (gitignored; regenerate)
