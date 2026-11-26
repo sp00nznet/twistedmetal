@@ -288,6 +288,17 @@ static const uint8_t* tm_live_guest_ptr(void* user, uint32_t location,
     return (const uint8_t*)vm_base + ea;
 }
 
+/* The walker waits on cellGcm's kick event instead of a 1 ms Sleep: the title's
+ * flush sets it when put moves (hle_extra.cpp, TM_GCM_FLUSH), so an idle walker
+ * takes the new put at once. TM_FLUSH_KICK=0 brings the sleep back. */
+extern "C" void cellGcm_fifo_kick_wait(unsigned ms);
+static int s_flush_kick = -1;
+extern "C" int tm_flush_kick_on(void)
+{
+    if (s_flush_kick < 0) { const char* e = getenv("TM_FLUSH_KICK"); s_flush_kick = e ? atoi(e) != 0 : 1; }
+    return s_flush_kick;
+}
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     /* Size the backend to the surface the GAME renders, not to the video mode.
@@ -339,7 +350,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     tm_present_each_flip_init();
     ULONGLONG next_tick = GetTickCount64();
     for (;;) {
-        Sleep(1);
+        if (tm_flush_kick_on()) cellGcm_fifo_kick_wait(1); else Sleep(1);
         /* Drain the GCM FIFO as fast as we wake (~1ms), decoupled from the 60Hz
          * present/flip tick. The game's _jsGcmFifoFinish reference-wait spins on
          * control->ref expecting the RSX to advance it promptly; draining only at

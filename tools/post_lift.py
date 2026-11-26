@@ -63,6 +63,7 @@ TRACE = {
     '007556B4': 'fios object base ctor (writes the "FIOS obj ...." tag)',
     '0099790C': 'edge decompressor wait(this, request, ...) -- dumps the request',
     '009978F8': 'edge decompressor isDone(this, request), polled by FIOS -- services the request on the host',
+    '0077D180': "the title's command-buffer flush (put = ctx->current): waits for the RSX walker to take the new put",
     '0020C26C': 'WorldLoader::loadGame',
     '0020C33C': 'WorldLoader::loadUi',
     '0020C478': 'WorldLoader::loadCinema',

@@ -1906,9 +1906,17 @@ static void probe_EventFlagWait(ppu_context* ctx)
         (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
 }
 
-#if defined(TM_TITLE_BCES01010)
+#if defined(TM_TITLE_BCES01010) || TM_US_ADDRESS_HOOKS
+#if TM_US_ADDRESS_HOOKS
+#define TM_GCM_FLUSH        func_0077D180
+#define TM_GCM_FLUSH_LIFTED func_0077D180_lifted
+#else
+#define TM_GCM_FLUSH        func_0077DEC0
+#define TM_GCM_FLUSH_LIFTED func_0077DEC0_lifted
+#endif
 /* ---------------------------------------------------------------------------
- * The title's command-buffer flush, guest 0x0077DEC0 (BCES01010): a sync, then
+ * The title's command-buffer flush, guest 0x0077DEC0 (BCES01010) / 0x0077D180
+ * (BCUS98106, the same function 0xD40 lower): a sync, then
  * put = offset of ctx->current. Nothing else in its frame loop waits for the
  * RSX to take that put, because an idle RSX parked at the old put follows it
  * within microseconds.
@@ -1929,15 +1937,83 @@ static void probe_EventFlagWait(ppu_context* ctx)
  * TM_FLUSH_SYNC_MS (default 100; 0 turns it off), because with
  * GCM_SEMA_ACQUIRE=1 the walker can be waiting on a label this very thread
  * writes later. A walker that is busy elsewhere is not waited for.
+ *
+ * BCUS98106 on Windows loses the same race: the drain there woke from a
+ * Sleep(1). The frame it skips to put is the first one that carries the
+ * NV4097_NOTIFY the SpuPostFX thread starts its pass on, and that thread
+ * counts its passes itself (a ring of four parameter blocks): one lost notify
+ * and every later frame is composed from another frame's block, and label
+ * 0x420 never again holds the value the RSX acquires.
  * ------------------------------------------------------------------------- */
 extern "C" void* cellGcm_fifo_kick_event(void);
 extern "C" int SetEvent(void* h);
 extern "C" int tm_flush_kick_on(void);
-void func_0077DEC0_lifted(ppu_context* ctx);
-void func_0077DEC0(ppu_context* ctx)
+/* The second way to lose the segment: a walker that is BUSY in it. A frame ends
+ * with its flush leaving put on a JUMP to the start of the other segment, and
+ * the next thing the title writes is the frame after next, over that other
+ * segment. On the console the RSX has long left it. Here a frame can take the
+ * walker hundreds of milliseconds (a new shader, the 0x420 acquire), the title
+ * gets two frames ahead, and the walker goes on reading a segment that now
+ * holds a later frame: no bad word, no resync, just the rest of frame N+2 in
+ * the place of frame N's -- its NOTIFY and acquire with it, which leaves the
+ * SpuPostFX thread two passes off for good (seen as the NOTIFY of frame 0x18
+ * followed by the acquire of frame 0x1A).
+ *
+ * So the end-of-frame flush waits until the walker is out of the segment the
+ * title writes next. TM_FLUSH_FRAME_MS bounds it (default 10000; 0 = off). */
+extern "C" uint32_t cellGcm_fifo_walker_offset(void);   /* get, or the return offset inside a CALL */
+static bool tm_flush_in_seg(uint32_t io, uint32_t seg) { return io >= seg && io - seg < 0x00600000u; }
+static void tm_flush_frame_wait(uint32_t lr)
+{
+    static int ms = -1;
+    if (ms < 0) { const char* e = getenv("TM_FLUSH_FRAME_MS"); ms = e ? atoi(e) : 10000; }
+    if (ms <= 0) return;
+    const uint32_t put = vm_read32(GCM_CONTROL_EA + 0);
+    if (put < 0x0F100000u || put >= 0x0FD00000u) return;
+#if TM_US_ADDRESS_HOOKS
+    /* BCUS98106: a frame is flushed three times (0x0066114C, 0x006611E0, then
+     * 0x006757AC from the end of the frame), and only its small boot frames
+     * leave the JUMP at put. The call site says which flush this is. */
+    if (lr != 0x006757ACu) return;
+    const uint32_t next = put >= 0x0F700000u ? 0x0F100000u : 0x0F700000u;   /* segment written next */
+#else
+    (void)lr;
+    const uint32_t w = vm_read32(put + 0x40000000u);            /* io 0x0F100000 is ea 0x4F100000 */
+    if ((w & 0xE0000003u) != 0x20000000u) return;               /* not the end of a frame */
+    const uint32_t tgt = w & 0x1FFFFFFCu;
+    const uint32_t next = tgt >= 0x0F700000u ? 0x0F700000u : 0x0F100000u;   /* segment written next */
+    if (tgt < 0x0F100000u || tgt >= 0x0FD00000u || tm_flush_in_seg(put, next)) return;
+#endif
+    if (!tm_flush_in_seg(cellGcm_fifo_walker_offset(), next)) return;
+    static unsigned long long n_wait, n_late, total_us;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool late = false;
+    while (tm_flush_in_seg(cellGcm_fifo_walker_offset(), next)) {
+        if (std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(ms)) { late = true; break; }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    n_wait++;
+    total_us += (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (late && n_late++ < 8)
+        fprintf(stderr, "[tm-flush] frame end at put 0x%08X: walker still in segment 0x%08X (get 0x%08X) after %d ms\n",
+                put, next, cellGcm_fifo_walker_offset(), ms);
+    if (n_wait == 1 || (n_wait & 255) == 0)
+        fprintf(stderr, "[tm-flush] %llu frame ends waited for the walker to leave the next segment, %.1f ms each, %llu gave up\n",
+                n_wait, (double)total_us / 1000.0 / (double)n_wait, n_late);
+}
+
+void TM_GCM_FLUSH_LIFTED(ppu_context* ctx);
+static void tm_gcm_flush_sync(ppu_context* ctx);
+void TM_GCM_FLUSH(ppu_context* ctx)
+{
+    tm_gcm_flush_sync(ctx);
+    tm_flush_frame_wait((uint32_t)ctx->lr);
+}
+static void tm_gcm_flush_sync(ppu_context* ctx)
 {
     const uint32_t old_put = vm_read32(GCM_CONTROL_EA + 0);
-    func_0077DEC0_lifted(ctx);
+    TM_GCM_FLUSH_LIFTED(ctx);
     /* Wake the walker the moment put moves (boot_main.cpp, TM_FLUSH_KICK). */
     if (tm_flush_kick_on() && vm_read32(GCM_CONTROL_EA + 0) != old_put)
         SetEvent(cellGcm_fifo_kick_event());
@@ -1946,18 +2022,20 @@ void func_0077DEC0(ppu_context* ctx)
     if (ms <= 0) return;
     if (vm_read32(GCM_CONTROL_EA + 0) == old_put) return;      /* put did not move */
     if (vm_read32(GCM_CONTROL_EA + 4) != old_put) return;      /* walker not parked there */
-    struct timespec t0, t; clock_gettime(CLOCK_MONOTONIC, &t0);
+    const auto t0 = std::chrono::steady_clock::now();
+    static unsigned long long n_wait, n_late;
+    n_wait++;
     for (;;) {
-        if (vm_read32(GCM_CONTROL_EA + 4) != old_put) return;
-        clock_gettime(CLOCK_MONOTONIC, &t);
-        if ((t.tv_sec - t0.tv_sec) * 1000L + (t.tv_nsec - t0.tv_nsec) / 1000000L >= ms) {
-            static int n = 0;
-            if (n++ < 4) fprintf(stderr, "[tm-flush] walker still at old put 0x%08X after %d ms\n", old_put, ms);
-            return;
+        if (vm_read32(GCM_CONTROL_EA + 4) != old_put) break;
+        if (std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(ms)) {
+            if (n_late++ < 4) fprintf(stderr, "[tm-flush] walker still at old put 0x%08X after %d ms\n", old_put, ms);
+            break;
         }
-        struct timespec ts = { 0, 20000 };
-        nanosleep(&ts, nullptr);
+        std::this_thread::yield();
     }
+    if (n_wait == 1 || (n_wait & 4095) == 0)
+        fprintf(stderr, "[tm-flush] %llu flushes waited for the walker to leave the old put, %llu gave up (%d ms)\n",
+                n_wait, n_late, ms);
 }
 #endif
 
