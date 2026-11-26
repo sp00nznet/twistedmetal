@@ -41,6 +41,7 @@ OVERRIDES = {
     '00676ED8': 'TEMP diag: particle-pool init (logs that it ran)',
     '00678CE8': 'TEMP diag: particle-pool drain wait (dumps the pool once)',
     '009BBFB8': "BRB list append: skip a node already in the list (TM_SKIP_BANKUNLOAD re-registers banks)",
+    '00A23140': "Havok hkJobQueue mode change: reset of the SPU task counters waits for, then keeps, the tasks still alive (TM_HAVOK_RESET_WAIT)",
 }
 
 # Guest functions to WRAP rather than replace: the lifted body is renamed the

@@ -2304,6 +2304,138 @@ void func_00678CE8(ppu_context* ctx)
     }
     func_00678CE8_lifted(ctx);
 }
+
+/* ---------------------------------------------------------------------------
+ * Havok hkJobQueue mode change, guest 0x00A23140 (BCUS98106): (jq, mode) ->
+ * old mode. The physics step calls it with 0 at 0x00B55F68 and puts the old
+ * mode back at 0x00B57454. Going to mode <= 0 it takes jq's lock (lwmutex at
+ * jq+0x10, then the CellSyncMutex at jq+0 the SPU tasks use), wakes every
+ * waiter, and zeroes, in the DynamicData block at [jq+0x30],
+ * numRunningSpuTasks (+0x34) and lane 0 of record[t].running / .idle
+ * (+0x40 / +0x50 + 48t, t < 0x13).
+ * An SPU task still in its idle wait at that point owns one count in each:
+ * when it gives up it decrements them (image 5 at LS 0x4950/0x3170, image 3 at
+ * 0x3ED8) and leaves -1. The master (image 5, 0x43C4/0x37D0) and the PPU
+ * (0x00A28208) only start a worker for a queue whose idle count is 0, so a
+ * later job in queue 1 is never taken and the main thread waits at 0x00A285D4
+ * for good (freeze A). The runtime's decrementer makes that idle wait far
+ * longer than on hardware, which is why the reset meets live tasks here.
+ * TM_HAVOK_RESET_WAIT=<ms> (default 5; 0 = lifted body only):
+ *  1. outside the lock, wait up to <ms> for the tasks to go quiet
+ *     (+0x34 <= 0 and no idle count > 0);
+ *  2. take jq's lock the way the guest does, snapshot the counts and run the
+ *     lifted body (it finds its own thread as owner and only bumps the depth,
+ *     so the reset happens inside this same lock);
+ *  3. if the snapshot was not quiet, put back what live tasks still own:
+ *     negatives stay 0, positives are kept, so their exit decrements land on
+ *     0 and not -1. A stale positive kept this way is cleared by the next
+ *     quiet reset; a positive running count does not block a launch (0x37D0
+ *     and 0x00A28208 test idle), a negative idle count does. */
+void func_00A23140_lifted(ppu_context* ctx);
+
+static inline void tm_guest_call(ppu_context* ctx, void (*fn)(ppu_context*), uint64_t lr)
+{
+    ctx->lr = lr; fn(ctx);
+    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf((void*)ctx); }
+}
+
+/* jq's lock as 0x00A231E4 takes it: owner tid (u64) at jq+8, depth at jq+4. */
+static void tm_jq_lock(ppu_context* ctx, uint32_t jq)
+{
+    tm_guest_call(ctx, func_00A2DEB4, 0x00A231ECull);
+    const uint64_t tid = ctx->gpr[3];
+    if (vm_read64(jq + 0x8) == tid) { vm_write32(jq + 0x4, vm_read32(jq + 0x4) + 1); return; }
+    ctx->gpr[3] = jq + 0x10; ctx->gpr[4] = 0;
+    tm_guest_call(ctx, func_00C79304, 0x00A23214ull);            /* sys_lwmutex_lock */
+    for (;;) {
+        ctx->gpr[3] = jq;
+        tm_guest_call(ctx, func_00C78EDC, 0x00A23228ull);        /* cellSyncMutexTryLock */
+        if ((int32_t)ctx->gpr[3] == 0) break;
+        std::this_thread::yield();
+    }
+    vm_write64(jq + 0x8, tid);
+    vm_write32(jq + 0x4, 1);
+}
+
+static void tm_jq_unlock(ppu_context* ctx, uint32_t jq)
+{
+    const int32_t d = (int32_t)vm_read32(jq + 0x4) - 1;
+    vm_write32(jq + 0x4, (uint32_t)d);
+    if (d > 0) return;
+    vm_write64(jq + 0x8, ~0ull);
+    ctx->gpr[3] = jq;
+    tm_guest_call(ctx, func_00C78E6C, 0x00A2331Cull);            /* cellSyncMutexUnlock */
+    ctx->gpr[3] = jq + 0x10;
+    tm_guest_call(ctx, func_00C7933C, 0x00A2332Cull);            /* sys_lwmutex_unlock */
+}
+
+void func_00A23140(ppu_context* ctx)
+{
+    static int wait_ms = -1;
+    if (wait_ms < 0) {
+        const char* e = getenv("TM_HAVOK_RESET_WAIT");
+        wait_ms = e ? atoi(e) : 5;
+        if (wait_ms < 0) wait_ms = 0;
+        fprintf(stderr, "[havok-reset] %s (TM_HAVOK_RESET_WAIT=%d ms)\n", wait_ms ? "on" : "off", wait_ms);
+    }
+    const uint32_t jq = (uint32_t)ctx->gpr[3];
+    const int32_t mode = (int32_t)ctx->gpr[4];
+    /* Only the mode <= 0 change resets; everything else is a plain store. */
+    if (!wait_ms || mode > 0 || (int32_t)vm_read32(jq + 0x78) == mode) { func_00A23140_lifted(ctx); return; }
+
+    enum { NT = 0x13 };
+    const uint32_t blk = vm_read32(jq + 0x30);
+    auto quiet = [blk]() {
+        if ((int32_t)vm_read32(blk + 0x34) > 0) return false;
+        for (uint32_t t = 0; t < NT; t++)
+            if ((int32_t)vm_read32(blk + 0x50 + 0x30 * t) > 0) return false;
+        return true;
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto deadline = t0 + std::chrono::milliseconds(wait_ms);
+    while (!quiet() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    const long waited_us = (long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    const uint64_t lr = ctx->lr, r2 = ctx->gpr[2], r4 = ctx->gpr[4];
+    const uint32_t cr = ctx->cr;
+    tm_jq_lock(ctx, jq);
+    int32_t n34 = (int32_t)vm_read32(blk + 0x34), run[NT], idl[NT];
+    bool live = n34 > 0;
+    for (uint32_t t = 0; t < NT; t++) {
+        run[t] = (int32_t)vm_read32(blk + 0x40 + 0x30 * t);
+        idl[t] = (int32_t)vm_read32(blk + 0x50 + 0x30 * t);
+        if (idl[t] > 0) live = true;
+    }
+    ctx->gpr[3] = jq; ctx->gpr[4] = r4;
+    tm_guest_call(ctx, func_00A23140_lifted, lr);
+    const uint64_t ret = ctx->gpr[3];
+    if (live) {
+        int32_t keep34 = n34 > 0 ? n34 : 0, sum = 0;
+        for (uint32_t t = 0; t < NT; t++) {
+            const int32_t i = idl[t] > 0 ? idl[t] : 0;
+            const int32_t r = run[t] > i ? run[t] : i;
+            vm_write32(blk + 0x50 + 0x30 * t, (uint32_t)i);
+            vm_write32(blk + 0x40 + 0x30 * t, (uint32_t)r);
+            sum += i;
+        }
+        if (keep34 < sum) keep34 = sum;
+        vm_write32(blk + 0x34, (uint32_t)keep34);
+    }
+    tm_jq_unlock(ctx, jq);
+    ctx->gpr[3] = ret; ctx->gpr[2] = r2; ctx->cr = cr; ctx->lr = lr;
+
+    static unsigned n_all = 0, n_live = 0;
+    n_all++;
+    if (live && ++n_live <= 8)
+        fprintf(stderr, "[havok-reset] reset %u: tasks alive after %ld us, counts kept: +34=%d "
+                        "run[0]=%d idle[0]=%d run[1]=%d idle[1]=%d\n",
+                n_all, waited_us, n34, run[0], idl[0], run[1], idl[1]);
+    if (n_all == 1 || (n_all & 1023) == 0)
+        fprintf(stderr, "[havok-reset] %u reset(s), %u with live tasks (last wait %ld us)\n",
+                n_all, n_live, waited_us);
+}
 #endif /* TM_US_ADDRESS_HOOKS */
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
 extern ppu_context* g_tm_main_ctx;
