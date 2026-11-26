@@ -110,21 +110,13 @@ if(TM_BUILD_GAME)
     file(GLOB_RECURSE SPU_SOURCES "src/spu_gen/*.c")
     # spu_jobs.c registers the SPU jobs lifted under src/spu_gen and cannot link
     # without them. A first boot does not need them.
-    set(TM_HAVE_US_JOBS ON)
-    file(STRINGS "src/gen/spu_jobs.c" TM_US_JOB_LINES REGEX "spu_begin_image\\([0-9]+\\); job_")
-    foreach(line IN LISTS TM_US_JOB_LINES)
-        string(REGEX MATCH "job_[0-9A-F]+" job "${line}")
-        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/spu_gen/${job}")
-            set(TM_HAVE_US_JOBS OFF)
-        endif()
-    endforeach()
     if(NOT SPU_SOURCES OR NOT TM_LINK_SPU_JOBS)
         list(FILTER GEN_SOURCES EXCLUDE REGEX "/spu_jobs\\.c$")
         message(STATUS "twistedmetal: spu_jobs.c left out (no lifted SPU code, or TM_LINK_SPU_JOBS=OFF)")
-    elseif(NOT TM_TITLE STREQUAL "BCUS98106" OR NOT TM_HAVE_US_JOBS)
-        # spu_jobs.c names BCUS98106's fifteen jobs, some of them in-match only,
-        # so a front-end dump does not have them all. Without them, or for
-        # another title, CMake registers the
+    else()
+        # spu_jobs.c names only fifteen of the jobs BCUS98106 runs (it runs at
+        # least 29 plus the audio mixer's policy module), so every title,
+        # BCUS98106 included, registers the
         # jobs it has lifted, one src/spu_gen/job_<fingerprint> directory each,
         # the way spu_jobs.c does: by fingerprint, image ids from 13. A SPURS
         # policy module (pm_<fingerprint>) runs at LS 0xA00, so it is lifted
