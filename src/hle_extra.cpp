@@ -2437,6 +2437,7 @@ void tm_seg_probe(ppu_context* ctx)
  * ------------------------------------------------------------------------- */
 #include <condition_variable>
 #include <deque>
+#include <set>
 #ifdef _WIN32
 #include <process.h>
 #define TM_JQ_WORKER_FN static unsigned __stdcall
@@ -2472,9 +2473,26 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
         { std::unique_lock<std::mutex> lk(s_jq_mx);
           /* A sync job starts once every job pushed before it on its queue
            * has finished: the queue is FIFO, so those are the ones running. */
-          s_jq_cv.wait(lk, [] {
-              return !s_jq_q.empty() && (!s_jq_q.front().sync || s_jq_running[s_jq_q.front().jq] == 0); });
-          it = s_jq_q.front(); s_jq_q.pop_front();
+          /* FIFO per queue, not across queues: a sync job waiting on its own
+           * queue must not hold back the other queues' jobs behind it (a
+           * DeferredLighting gate stalled 127 Edge and post-FX jobs while the
+           * Edge job it waited on spun on ring space only they could free).
+           * Returns the index of the first runnable job, or -1. */
+          auto pick = [] {
+              uint32_t blocked[16]; int nb = 0;
+              for (size_t i = 0; i < s_jq_q.size(); i++) {
+                  const TmJqItem& q = s_jq_q[i];
+                  bool skip = false;
+                  for (int b = 0; b < nb; b++) if (blocked[b] == q.jq) { skip = true; break; }
+                  if (skip) continue;
+                  if (q.sync && s_jq_running[q.jq] > 0) { if (nb < 16) blocked[nb++] = q.jq; continue; }
+                  return (long)i;
+              }
+              return -1L;
+          };
+          long idx = -1;
+          s_jq_cv.wait(lk, [&] { return (idx = pick()) >= 0; });
+          it = s_jq_q[(size_t)idx]; s_jq_q.erase(s_jq_q.begin() + idx);
           ++s_jq_running[it.jq]; }
         s_jq_cur[(uintptr_t)arg % 6] = it.bin;
         int ran = spu_workload_dispatch_job(vm_base + it.bin, it.bin_size, it.job, it.size);
@@ -2489,6 +2507,9 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
         s_jq_cv.notify_all();      /* a sync job may have been waiting on this one */
     }
 }
+/* Queues whose next pushed job must wait for every earlier job of that queue
+ * (a _cellSpursJobQueuePortPushSync seen, see tm_jq_sync). Under s_jq_mx. */
+static std::set<uint32_t> s_jq_sync_next;
 static void tm_jq_push(ppu_context* ctx, bool sync)
 {
     static std::once_flag once;
@@ -2519,6 +2540,8 @@ static void tm_jq_push(ppu_context* ctx, bool sync)
     it.sync = sync;
     if (it.bin && it.bin_size) {
         { std::lock_guard<std::mutex> lk(s_jq_mx);
+          /* A PortPushSync before this push (tm_jq_sync): this job is the barrier. */
+          if (s_jq_sync_next.erase(it.jq)) it.sync = true;
           s_jq_outstanding.fetch_add(1, std::memory_order_relaxed);
           ++s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
           s_jq_q.push_back(it); }
@@ -2558,6 +2581,19 @@ static void tm_jq_sync(ppu_context* ctx)
 {
     const uint64_t jq = (uint32_t)ctx->gpr[3];
     const uint32_t mask = (uint32_t)ctx->gpr[4];
+    /* NID 0x9396BE1D is _cellSpursJobQueuePortPushSync: on hardware a barrier
+     * pushed INTO the queue, returning at once. Blocking the PPU here (as this
+     * used to) keeps it from the cellGcmFlush right after (DeferredLighting,
+     * lr 0x00647D6C), so the RSX never reaches the Edge holes, never frees ring
+     * space, and the Edge jobs the sync waits for spin forever (mode B).
+     * TM_JQ_PUSHSYNC=0 restores the blocking wait. */
+    { static int on = -1; if (on < 0) { const char* e = getenv("TM_JQ_PUSHSYNC"); on = e ? atoi(e) : 1; }
+      if (on && (uint32_t)ctx->lr == 0x00647D6Cu) {   /* only the DeferredLighting gate: other callers reuse static descriptors */
+          std::lock_guard<std::mutex> lk(s_jq_mx);
+          s_jq_sync_next.insert((uint32_t)jq);
+          ctx->gpr[3] = 0;
+          return;
+      } }
     std::unique_lock<std::mutex> lk(s_jq_mx);
     auto done = [&] {
         for (uint32_t t = 0; t < 16; t++)
@@ -2604,6 +2640,27 @@ static void tm_jq_port_sync(ppu_context* ctx)
     s_jq_done.wait(lk, [&] { return tm_jq_port_idle(port); });
     ctx->gpr[3] = 0;
 }
+/* put = offset of the title's CellGcmContextData.current (guest pointer to the
+ * context at 0x01A222C0), when the walker sits idle at the current put. */
+extern "C" int32_t cellGcmAddressToOffset(uint32_t address, uint32_t* offset);
+static void tm_jq_publish_put(void)
+{
+    const uint32_t gctx = vm_read32(0x01A222C0u);
+    if (!gctx) return;
+    const uint32_t begin = vm_read32(gctx + 0), end = vm_read32(gctx + 4), cur = vm_read32(gctx + 8);
+    if (!begin || cur < begin || cur > end) return;
+    uint32_t off = 0;
+    if (cellGcmAddressToOffset(cur, &off) != 0) return;
+    const uint32_t put = vm_read32(GCM_CONTROL_EA + 0), get = vm_read32(GCM_CONTROL_EA + 4);
+    if (off == put || get != put) return;
+    /* Only forward within the segment the walker is in (the title runs two
+     * 1 MB command segments); anything else is a context this is not. */
+    if ((off >> 20) != (put >> 20) || off < put) return;
+    vm_write32(GCM_CONTROL_EA + 0, off);
+    static unsigned long n = 0;
+    if (++n <= 6 || (n & 1023) == 0)
+        fprintf(stderr, "[jq-flush] PPU waits on jobs: put 0x%08X -> 0x%08X (#%lu)\n", put, off, n);
+}
 static void tm_jq_port_try_sync(ppu_context* ctx)
 {
     const uint64_t port = (uint32_t)ctx->gpr[3];
@@ -2611,4 +2668,14 @@ static void tm_jq_port_try_sync(ppu_context* ctx)
     /* CELL_SPURS_JQ_ERROR_BUSY as ps3recomp's cellSpursJq.h names it; the
      * title only tests for non-zero. */
     ctx->gpr[3] = tm_jq_port_idle(port) ? 0 : 0x80410A05u;
+    /* The title polls TrySync while it waits for its frame's jobs, without a
+     * cellGcmFlush first. Edge jobs among them wait for ring space that only
+     * the RSX frees, and our walker is idle at the old put, so the RSX never
+     * reaches their holes. On hardware the RSX would already be running
+     * behind a recent put. Publish put = the context's current while the PPU
+     * waits and the walker is idle (TM_JQ_WAIT_FLUSH=0 turns it off). */
+    if (ctx->gpr[3]) {
+        static int on = -1; if (on < 0) { const char* e = getenv("TM_JQ_WAIT_FLUSH"); on = e ? atoi(e) : 1; }
+        if (on) tm_jq_publish_put();
+    }
 }
