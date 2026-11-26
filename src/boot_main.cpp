@@ -167,6 +167,30 @@ extern "C" void cellGcmTickFlip(void);
 extern "C" void cellGcm_request_tick(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" int  cellGcm_take_flip_pending_synced(void);
+/* GCM_PRESENT_EACH_FLIP (default 1): the walker stops at every flip in the
+ * FIFO and the loops below present it, instead of presenting only when the
+ * FIFO happens to be drained to put (3-5 scenes drawn per one shown).
+ * 0 = the old gate. cellGcmSys.c, cellGcm_set_present_each_flip. */
+extern "C" void cellGcm_set_present_each_flip(int on);
+extern "C" int  cellGcm_take_flip_pending_each(void);
+/* GCM_PRESENT_SNAPSHOT (default 0, kept as an option): the walker is left
+ * alone; at each flip the renderer records a copy of the flipped buffer and
+ * the loop below presents the newest copy. Off by default: half of the flips
+ * it shows are buffers the title's composite has not reached yet (run87).
+ * GCM_PRESENT_EACH_FLIP also defaults to 0: stopping the walker at each flip
+ * showed every frame but broke the composite (run83/86). */
+extern "C" void cellGcm_set_present_snapshot(int on);
+extern "C" int  rsx_live_draw_present_snapshot(void);
+static int s_tm_present_snapshot;
+static void tm_present_each_flip_init(void)
+{
+    const char* e = getenv("GCM_PRESENT_EACH_FLIP");
+    const int each = e ? atoi(e) != 0 : 0;
+    const char* sn = getenv("GCM_PRESENT_SNAPSHOT");
+    s_tm_present_snapshot = !each && (sn ? atoi(sn) != 0 : 0);
+    cellGcm_set_present_each_flip(each);
+    cellGcm_set_present_snapshot(s_tm_present_snapshot);
+}
 extern "C" uint32_t cellGcm_flip_request_count(void);
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
@@ -312,6 +336,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * window DXGI Present throttles hard, which previously stalled these ticks and
      * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
      * and catch up in a bounded burst so present latency never slows the game. */
+    tm_present_each_flip_init();
     ULONGLONG next_tick = GetTickCount64();
     for (;;) {
         Sleep(1);
@@ -366,7 +391,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                      * take_flip_pending_synced() is true only once the drain has
                      * consumed everything up to put, i.e. the FIFO holds exactly
                      * one completed frame. */
-                    const int flipped = cellGcm_take_flip_pending_synced();
+                    const int flipped = cellGcm_take_flip_pending_each();
                     /* Dump BEFORE presenting. At this point the FIFO has been
                      * drained to put, so the frame's draws are complete and the
                      * next frame has not cleared anything yet -- every earlier
@@ -409,7 +434,12 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                           }
                           fflush(stderr);
                       } }
-                    if (flipped) { rsx_live_draw_present(0); tm_count_presented_frame(); }
+                    if (s_tm_present_snapshot) {
+                        /* The gate above still runs (its bookkeeping is the
+                         * walker's old behaviour); what is shown is the newest
+                         * flip snapshot, whenever there is a new one. */
+                        if (rsx_live_draw_present_snapshot()) tm_count_presented_frame();
+                    } else if (flipped) { rsx_live_draw_present(0); tm_count_presented_frame(); }
                     /* TM_LIVE_DUMP=<secs>,<hex offset>: ask the engine to write
                      * one of its tracked surfaces out, so "is it drawing" is
                      * answerable from its own resources rather than a readback
@@ -693,7 +723,7 @@ static void tm_present_if_flipped(const TmBackend& be, bool split)
 {
     {
         TmRsxLock l(split);
-        if (!cellGcm_take_flip_pending_synced()) return;
+        if (!cellGcm_take_flip_pending_each()) return;
         if (split) be.present_begin();
         else       be.present();
     }
@@ -721,6 +751,7 @@ static void* tm_frame_clock(void*)
     int rsx_ok = (be.init(rsx_w, rsx_h, "Twisted Metal (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", be.name, rsx_ok ? "OK" : "FAILED");
     const bool split = be.present_begin && be.present_finish && tm_env_int("TM_PRESENT_THREAD", 1);
+    tm_present_each_flip_init();
     s_flush_kick = tm_env_int("TM_FLUSH_KICK", split ? 1 : 0);
 
     if (split) {
