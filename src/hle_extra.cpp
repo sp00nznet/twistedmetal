@@ -1906,6 +1906,37 @@ static void probe_EventFlagWait(ppu_context* ctx)
         (void*)(uintptr_t)ea, (void*)(uintptr_t)b, mode);
 }
 
+#if TM_US_ADDRESS_HOOKS
+/* ---------------------------------------------------------------------------
+ * One JobQueue of BCUS98106 is not served by the tm_jq_* hooks: SPURS' own job
+ * policy module (pm_B3523C4B17650EF8, image 41) runs it on the spurs_pm_worker
+ * threads. Its jobs are whole SPU ELFs: the module GETs the load segment (for
+ * the one at file 0x00E5DB80, EA 0x00E6DC00 and 0x22800 bytes) to LS 0x4000
+ * and branches into it. Those ELFs are lifted, at their link address 0x4000,
+ * but nothing said the bytes the module had just loaded were one of those
+ * images, so every branch into them missed the lifted lookup and the job ran
+ * in the interpreter: 16 million steps a second, 40% of all the CPU the
+ * port used in the menus and in a match (SPU_INTERP_STATS).
+ * TM_BIGJOB_LIFT=0 leaves it interpreted.
+ * ------------------------------------------------------------------------- */
+extern "C" void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_id);
+static const int s_tm_bigjob_lift = [] {
+    const char* e = getenv("TM_BIGJOB_LIFT");
+    if (e && atoi(e) == 0) return 0;
+    /* The five SPU ELFs linked at 0x4000 (entry 0x4080), images 7-11 of
+     * src/gen/spu_workloads.c: load-segment EA, its memory size, image. */
+    static const struct { uint32_t ea, span; int image; } jobs[] = {
+        { 0x00E58F00u, 0x15780u, 7 },    /* spu_0006_at_00E48E80 */
+        { 0x00E6DC00u, 0x22800u, 8 },    /* spu_0007_at_00E5DB80 */
+        { 0x00E8F580u, 0x1E300u, 9 },    /* spu_0008_at_00E7F500 */
+        { 0x00EACB00u, 0x1AB00u, 10 },   /* spu_0009_at_00E9CA80 */
+        { 0x00EC7180u, 0x07C00u, 11 },   /* spu_0010_at_00EB7100 */
+    };
+    for (const auto& j : jobs) spu_overlay_register_region(j.ea, j.span, j.image);
+    return 1;
+}();
+#endif
+
 #if defined(TM_TITLE_BCES01010) || TM_US_ADDRESS_HOOKS
 #if TM_US_ADDRESS_HOOKS
 #define TM_GCM_FLUSH        func_0077D180
