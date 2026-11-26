@@ -2663,7 +2663,7 @@ static std::condition_variable s_jq_cv, s_jq_done;
 static std::deque<TmJqItem> s_jq_q;
 static std::map<uint64_t, int> s_jq_pending;      /* (jq << 32 | tag) -> jobs queued or running */
 static std::map<uint32_t, int> s_jq_running;      /* jq -> jobs a worker is running */
-static volatile uint32_t s_jq_cur[6];             /* binary each worker is running, for [jq-stall] */
+static volatile uint32_t s_jq_cur[16];             /* binary each worker is running, for [jq-stall] */
 /* Jobs queued or running, read by the FIFO walker without s_jq_mx. An Edge
  * geometry job fills a self-JUMP hole in the command buffer with a CALL to its
  * ring segment; the walker must not give up on a park while one of them can
@@ -2693,7 +2693,7 @@ static int tm_jq_park_hold(uint32_t, uint32_t)
 struct TmJqProd { uint32_t bin, runs, changed; int state; };   /* 0 learning, 1 producer, 2 not */
 static TmJqProd s_jq_prod[TM_JQ_PROD_MAX];                     /* under s_jq_mx */
 static int s_jq_prod_n;
-static uint32_t s_jq_run_bin[6];                               /* under s_jq_mx: binary each worker runs */
+static uint32_t s_jq_run_bin[16];                               /* under s_jq_mx: binary each worker runs */
 static std::atomic<uint32_t> s_jq_watch_ea{0}, s_jq_watch_end{0};
 
 /* Under s_jq_mx. NULL when the table is full: such a binary counts as "not". */
@@ -2750,7 +2750,13 @@ extern "C" int (*g_gcm_blit_wait_hook)(uint32_t src_ea, uint32_t bytes);
 extern "C" void spurs_job_set_spu_num(uint32_t n);
 TM_JQ_WORKER_FN tm_jq_worker(void* arg)
 {
-    spurs_job_set_spu_num((uint32_t)(uintptr_t)arg);   /* one SPU id per worker */
+    /* Workers 0-5 stand for the six SPUs. TM_JQ_EXTRA adds workers 6.. that
+     * take any job except the Edge geometry ones, whose output rings and
+     * labels are per SPU; they borrow an SPU number in 0-5. The post-FX
+     * pass is ~0.7 CPU-seconds of jobs a frame and the walker waits for it:
+     * two more workers took the menus from 6.2 to 7.3 fps on eight cores. */
+    const bool tm_extra = (uintptr_t)arg >= 6;
+    spurs_job_set_spu_num((uint32_t)((uintptr_t)arg % 6));
     for (;;) {
         TmJqItem it;
         { std::unique_lock<std::mutex> lk(s_jq_mx);
@@ -2761,7 +2767,7 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
            * DeferredLighting gate stalled 127 Edge and post-FX jobs while the
            * Edge job it waited on spun on ring space only they could free).
            * Returns the index of the first runnable job, or -1. */
-          auto pick = [] {
+          auto pick = [tm_extra] {
               uint32_t blocked[16]; int nb = 0;
               for (size_t i = 0; i < s_jq_q.size(); i++) {
                   const TmJqItem& q = s_jq_q[i];
@@ -2769,6 +2775,8 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
                   for (int b = 0; b < nb; b++) if (blocked[b] == q.jq) { skip = true; break; }
                   if (skip) continue;
                   if (q.sync && s_jq_running[q.jq] > 0) { if (nb < 16) blocked[nb++] = q.jq; continue; }
+                  /* an extra worker leaves the Edge queue alone, in order */
+                  if (tm_extra && (q.jq == 0x4001B280u || q.bin == 0x00D53000u)) { if (nb < 16) blocked[nb++] = q.jq; continue; }
                   return (long)i;
               }
               return -1L;
@@ -2776,7 +2784,7 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
           long idx = -1;
           s_jq_cv.wait(lk, [&] { return (idx = pick()) >= 0; });
           it = s_jq_q[(size_t)idx]; s_jq_q.erase(s_jq_q.begin() + idx);
-          s_jq_run_bin[(uintptr_t)arg % 6] = it.bin;   /* tm_jq_blit_wait: never between queue and worker */
+          s_jq_run_bin[(uintptr_t)arg % 16] = it.bin;   /* tm_jq_blit_wait: never between queue and worker */
           ++s_jq_running[it.jq]; }
         /* Learning which binaries write the watched image (tm_jq_blit_wait). */
         bool prod_learn = false; uint32_t prod_before = 0;
@@ -2786,9 +2794,9 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
               prod_learn = e && e->state == 0; }
             if (prod_learn) prod_before = tm_jq_watch_sum();
         }
-        s_jq_cur[(uintptr_t)arg % 6] = it.bin;
+        s_jq_cur[(uintptr_t)arg % 16] = it.bin;
         int ran = spu_workload_dispatch_job(vm_base + it.bin, it.bin_size, it.job, it.size);
-        s_jq_cur[(uintptr_t)arg % 6] = 0;
+        s_jq_cur[(uintptr_t)arg % 16] = 0;
         const bool prod_changed = prod_learn && tm_jq_watch_sum() != prod_before;
         if (it.bin == 0x00E3BD80u) { static int k = 0; if (k++ < 6) {  /* TEMP: the cull job */
             fprintf(stderr, "[jq-cull] job=0x%08X ran=%d counter=0x%08X\n", it.job, ran, vm_read32(0x019307D0u)); } }
@@ -2809,7 +2817,7 @@ TM_JQ_WORKER_FN tm_jq_worker(void* arg)
                   }
               }
           }
-          s_jq_run_bin[(uintptr_t)arg % 6] = 0;
+          s_jq_run_bin[(uintptr_t)arg % 16] = 0;
           --s_jq_pending[((uint64_t)it.jq << 32) | it.tag];
           --s_jq_running[it.jq]; }
         s_jq_outstanding.fetch_sub(1, std::memory_order_relaxed);
@@ -2828,6 +2836,9 @@ static void tm_jq_push(ppu_context* ctx, bool sync)
         g_gcm_blit_wait_hook = tm_jq_blit_wait;
         const char* e = getenv("TM_JQ_WORKERS"); int nw = e ? atoi(e) : 4;
         if (nw > 6) nw = 6;   /* six SPUs: labels 0x80-0x85, one per SPU */
+        { const char* x = getenv("TM_JQ_EXTRA"); int ne = x ? atoi(x) : 0;
+          if (ne < 0) ne = 0; if (ne > 10) ne = 10;
+          if (nw == 6) nw += ne; }
         for (int i = 0; i < nw; i++) {
 #ifdef _WIN32
             _beginthreadex(nullptr, 16u << 20, tm_jq_worker, (void*)(uintptr_t)i, 0, nullptr);
